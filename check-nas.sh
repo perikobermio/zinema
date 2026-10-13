@@ -29,6 +29,9 @@ set +a
 [ -r "$MOVIES_PATH" ] || fail "Docker/este usuario no puede leer: $MOVIES_PATH"
 [ -d "$SERIES_PATH" ] || fail "No existe la carpeta de series: $SERIES_PATH"
 [ -r "$SERIES_PATH" ] || fail "Docker/este usuario no puede leer: $SERIES_PATH"
+if [ -z "${TMDB_ACCESS_TOKEN:-}" ]; then
+    printf 'AVISO: falta TMDB_ACCESS_TOKEN; el escaneo funcionará, pero la sincronización de metadata no.\n'
+fi
 
 cd "$PROJECT_DIR"
 docker compose config -q || fail "La configuración de Docker Compose no es válida."

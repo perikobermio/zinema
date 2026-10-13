@@ -1,18 +1,24 @@
 from __future__ import annotations
 
-import hashlib
+import json
 import mimetypes
 import os
 import secrets
 import sqlite3
+import threading
+import time
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from pydantic import BaseModel
-from starlette.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from starlette.responses import FileResponse, Response, StreamingResponse
+
+from app.catalog import scan_catalog
+from app.tmdb import apply_tmdb_id, enrich_pending
 
 MEDIA_ROOTS = {
     "movies": Path(os.getenv("MOVIES_ROOT", "/library/movies")).resolve(),
@@ -20,11 +26,15 @@ MEDIA_ROOTS = {
 }
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/zinema.sqlite3"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+TMDB_ACCESS_TOKEN = os.getenv("TMDB_ACCESS_TOKEN", "")
+TMDB_LANGUAGE = os.getenv("TMDB_LANGUAGE", "es-ES")
+TMDB_SYNC_INTERVAL_HOURS = max(1, int(os.getenv("TMDB_SYNC_INTERVAL_HOURS", "24")))
+TMDB_SYNC_BATCH_SIZE = max(1, int(os.getenv("TMDB_SYNC_BATCH_SIZE", "100")))
+TMDB_REQUEST_DELAY_SECONDS = max(0.0, float(os.getenv("TMDB_REQUEST_DELAY_SECONDS", "0.25")))
+ARTWORK_DIR = DATABASE_PATH.parent / "artwork"
 CHUNK_SIZE = 1024 * 1024
-VIDEO_EXTENSIONS = {
-    ".avi", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg",
-    ".mts", ".ts", ".vob", ".webm", ".wmv",
-}
+SYNC_LOCK = threading.Lock()
+SCHEDULER_STARTED = False
 
 app = FastAPI(title="Zinema Server", version="0.1.0")
 
@@ -37,12 +47,32 @@ class LibraryItem(BaseModel):
     extension: str
     size_bytes: int
     modified_at: str
+    node_id: str | None = None
+    series_id: str | None = None
+    season_number: int | None = None
+    episode_number: int | None = None
+    metadata_title: str | None = None
+    overview: str | None = None
+    year: int | None = None
+    genres: list[str] = Field(default_factory=list)
+    poster_url: str | None = None
 
 
 class ScanResult(BaseModel):
     scanned: int
+    nodes: int = 0
     marked_unavailable: int
     completed_at: str
+
+
+class SyncJob(BaseModel):
+    id: str
+    status: str
+    stage: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    result: dict | None = None
+    error: str | None = None
 
 
 def database() -> sqlite3.Connection:
@@ -71,6 +101,55 @@ def database() -> sqlite3.Connection:
         connection.execute(
             "ALTER TABLE library_items ADD COLUMN library TEXT NOT NULL DEFAULT 'movies'"
         )
+    for name, sql_type in (
+        ("node_id", "TEXT"), ("series_node_id", "TEXT"),
+        ("season_number", "INTEGER"), ("episode_number", "INTEGER"),
+    ):
+        if name not in columns:
+            connection.execute(f"ALTER TABLE library_items ADD COLUMN {name} {sql_type}")
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS catalog_nodes (
+            id TEXT PRIMARY KEY,
+            library TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            parent_id TEXT,
+            title TEXT NOT NULL,
+            season_number INTEGER,
+            source_year INTEGER,
+            metadata_title TEXT,
+            original_title TEXT,
+            overview TEXT,
+            year INTEGER,
+            genres TEXT NOT NULL DEFAULT '[]',
+            tmdb_id INTEGER,
+            imdb_id TEXT,
+            poster_file TEXT,
+            backdrop_file TEXT,
+            metadata_status TEXT NOT NULL DEFAULT 'pending',
+            metadata_source TEXT,
+            metadata_checked_at TEXT,
+            metadata_candidates TEXT,
+            metadata_error TEXT,
+            scanned_at TEXT NOT NULL,
+            available INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(library, kind, relative_path)
+        )"""
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_catalog_parent ON catalog_nodes(library, parent_id, kind, title COLLATE NOCASE)"
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS sync_runs (
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            result TEXT,
+            error TEXT
+        )"""
+    )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_library_title ON library_items(title COLLATE NOCASE)"
     )
@@ -90,7 +169,90 @@ def display_title(path: Path) -> str:
 
 
 def item_from_row(row: sqlite3.Row) -> LibraryItem:
-    return LibraryItem(**dict(row))
+    data = dict(row)
+    data["genres"] = json.loads(data.pop("genres_json", "[]") or "[]")
+    metadata_node_id = data.pop("metadata_node_id", None)
+    poster_file = data.pop("poster_file", None)
+    if metadata_node_id and poster_file:
+        data["poster_url"] = f"/api/v1/catalog/{metadata_node_id}/images/poster"
+    return LibraryItem(**data)
+
+
+def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
+    node = dict(row)
+    genres = json.loads(node.pop("genres", "[]") or "[]")
+    node["display_title"] = node.pop("metadata_title", None) or node["title"]
+    node["genres"] = genres
+    node["poster_available"] = bool(node.get("poster_file")) or node["kind"] == "season"
+    node["poster_url"] = (
+        f"/api/v1/catalog/{node['id']}/images/poster" if node["poster_available"] else None
+    )
+    node["backdrop_url"] = (
+        f"/api/v1/catalog/{node['id']}/images/backdrop" if node.get("backdrop_file") else None
+    )
+    node.pop("metadata_candidates", None)
+    node.pop("poster_file", None)
+    node.pop("backdrop_file", None)
+    node.pop("metadata_error", None)
+
+    child_rows = connection.execute(
+        """SELECT id, kind, title, metadata_title, poster_file, season_number
+           FROM catalog_nodes WHERE parent_id=? AND available=1
+           ORDER BY CASE kind WHEN 'collection' THEN 0 WHEN 'series' THEN 1
+                              WHEN 'season' THEN 2 ELSE 3 END,
+                    title COLLATE NOCASE""",
+        (node["id"],),
+    ).fetchall()
+    node["children"] = [
+        {"id": child["id"], "kind": child["kind"],
+         "title": child["metadata_title"] or child["title"],
+         "season_number": child["season_number"],
+         "poster_url": (f"/api/v1/catalog/{child['id']}/images/poster"
+                        if child["poster_file"] or child["kind"] == "season" else None),
+         "poster_available": bool(child["poster_file"]) or child["kind"] == "season"}
+        for child in child_rows
+    ]
+    file_rows = connection.execute(
+        """SELECT id, title, relative_path, extension, size_bytes, season_number,
+                  episode_number
+           FROM library_items WHERE node_id=? AND available=1
+           ORDER BY season_number, episode_number, title COLLATE NOCASE""",
+        (node["id"],),
+    ).fetchall()
+    node["files"] = [
+        {**dict(media), "stream_url": f"/api/v1/items/{media['id']}/stream"}
+        for media in file_rows
+    ]
+    node["mosaic_images"] = []
+    if node["kind"] == "collection":
+        artwork_rows = connection.execute(
+            """WITH RECURSIVE descendants(id) AS (
+                   SELECT id FROM catalog_nodes WHERE parent_id=? AND available=1
+                   UNION ALL
+                   SELECT child.id FROM catalog_nodes child
+                   JOIN descendants parent ON child.parent_id=parent.id
+                   WHERE child.available=1
+               )
+               SELECT id FROM catalog_nodes
+               WHERE id IN (SELECT id FROM descendants) AND poster_file IS NOT NULL
+               ORDER BY kind, title COLLATE NOCASE LIMIT 4""",
+            (node["id"],),
+        ).fetchall()
+        node["mosaic_images"] = [
+            f"/api/v1/catalog/{art['id']}/images/poster" for art in artwork_rows
+        ]
+    return node
+
+
+def _item_select() -> str:
+    return """SELECT li.id, li.library, li.title, li.relative_path, li.extension,
+                     li.size_bytes, li.modified_at, li.node_id,
+                     li.series_node_id AS series_id, li.season_number, li.episode_number,
+                     n.metadata_title, n.overview, n.year, n.genres AS genres_json,
+                     n.id AS metadata_node_id, n.poster_file
+              FROM library_items li
+              LEFT JOIN catalog_nodes n ON n.id=COALESCE(li.series_node_id, li.node_id)
+              WHERE li.available=1"""
 
 
 def get_media_file(item_id: str) -> tuple[Path, sqlite3.Row]:
@@ -127,10 +289,107 @@ def file_chunks(path: Path, start: int, length: int):
             yield chunk
 
 
+def _update_sync_job(job_id: str, **values: object) -> None:
+    if not values:
+        return
+    assignments = ", ".join(f"{key}=?" for key in values)
+    with closing(database()) as connection:
+        connection.execute(
+            f"UPDATE sync_runs SET {assignments} WHERE id=?",
+            (*values.values(), job_id),
+        )
+        connection.commit()
+
+
+def _run_sync_job(job_id: str) -> None:
+    try:
+        started = datetime.now(timezone.utc).isoformat()
+        _update_sync_job(job_id, status="running", stage="scan", started_at=started)
+        with closing(database()) as connection:
+            scan_result = scan_catalog(connection, MEDIA_ROOTS)
+        _update_sync_job(job_id, stage="metadata")
+        metadata_result = {"matched": 0, "needs_review": 0, "not_found": 0,
+                           "errors": 0, "processed": 0}
+        while True:
+            with closing(database()) as connection:
+                batch = enrich_pending(
+                    connection, TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, ARTWORK_DIR,
+                    batch_size=TMDB_SYNC_BATCH_SIZE,
+                    minimum_delay=TMDB_REQUEST_DELAY_SECONDS,
+                )
+            for key, value in batch.items():
+                metadata_result[key] += value
+            _update_sync_job(job_id, stage=f"metadata:{metadata_result['processed']}")
+            if batch["processed"] < TMDB_SYNC_BATCH_SIZE:
+                break
+        result = {"catalog": scan_result, "metadata": metadata_result}
+        _update_sync_job(
+            job_id, status="completed", stage="complete",
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            result=json.dumps(result, ensure_ascii=False), error=None,
+        )
+    except Exception as exc:
+        _update_sync_job(
+            job_id, status="failed", stage="failed",
+            completed_at=datetime.now(timezone.utc).isoformat(), error=str(exc)[:1000],
+        )
+    finally:
+        SYNC_LOCK.release()
+
+
+def _start_sync_job() -> str | None:
+    if not TMDB_ACCESS_TOKEN or not SYNC_LOCK.acquire(blocking=False):
+        return None
+    job_id = uuid4().hex
+    try:
+        with closing(database()) as connection:
+            connection.execute(
+                "INSERT INTO sync_runs (id, status, stage, started_at) VALUES (?, 'queued', 'queued', ?)",
+                (job_id, datetime.now(timezone.utc).isoformat()),
+            )
+            connection.commit()
+        threading.Thread(target=_run_sync_job, args=(job_id,), daemon=True,
+                         name=f"zinema-sync-{job_id[:8]}").start()
+    except Exception:
+        SYNC_LOCK.release()
+        raise
+    return job_id
+
+
+def _daily_sync_loop() -> None:
+    interval = TMDB_SYNC_INTERVAL_HOURS * 3600
+    while True:
+        time.sleep(min(interval, 3600))
+        if not TMDB_ACCESS_TOKEN or SYNC_LOCK.locked():
+            continue
+        with closing(database()) as connection:
+            row = connection.execute(
+                "SELECT completed_at FROM sync_runs WHERE status='completed' ORDER BY completed_at DESC LIMIT 1"
+            ).fetchone()
+        if row is None or not row["completed_at"]:
+            continue
+        try:
+            last_sync = datetime.fromisoformat(row["completed_at"])
+        except ValueError:
+            continue
+        if datetime.now(timezone.utc) - last_sync >= timedelta(seconds=interval):
+            _start_sync_job()
+
+
+def _sync_job_payload(row: sqlite3.Row) -> SyncJob:
+    values = dict(row)
+    values["result"] = json.loads(values["result"]) if values.get("result") else None
+    return SyncJob(**values)
+
+
 @app.on_event("startup")
 def initialize_database() -> None:
+    global SCHEDULER_STARTED
     with closing(database()) as connection:
         connection.commit()
+    if not SCHEDULER_STARTED:
+        threading.Thread(target=_daily_sync_loop, daemon=True, name="zinema-daily-sync").start()
+        SCHEDULER_STARTED = True
 
 
 @app.get("/health")
@@ -144,14 +403,14 @@ def list_items(
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[LibraryItem]:
-    sql = ("SELECT id, library, title, relative_path, extension, size_bytes, modified_at "
-           "FROM library_items WHERE available = 1")
+    sql = _item_select()
     parameters: list[object] = []
     if q:
-        sql += " AND title LIKE ? ESCAPE '!' COLLATE NOCASE"
+        sql += " AND (li.title LIKE ? ESCAPE '!' COLLATE NOCASE OR n.title LIKE ? ESCAPE '!' COLLATE NOCASE " \
+               "OR n.metadata_title LIKE ? ESCAPE '!' COLLATE NOCASE)"
         escaped = q.replace("!", "!!").replace("%", "!%").replace("_", "!_")
-        parameters.append(f"%{escaped}%")
-    sql += " ORDER BY title COLLATE NOCASE LIMIT ? OFFSET ?"
+        parameters.extend((f"%{escaped}%", f"%{escaped}%", f"%{escaped}%"))
+    sql += " ORDER BY COALESCE(n.metadata_title, n.title, li.title) COLLATE NOCASE LIMIT ? OFFSET ?"
     parameters.extend((limit, offset))
     with closing(database()) as connection:
         rows = connection.execute(sql, parameters).fetchall()
@@ -162,13 +421,151 @@ def list_items(
 def get_item(item_id: str) -> LibraryItem:
     with closing(database()) as connection:
         row = connection.execute(
-            "SELECT id, library, title, relative_path, extension, size_bytes, modified_at "
-            "FROM library_items WHERE id = ?",
+            _item_select().replace("WHERE li.available=1", "WHERE li.available=1 AND li.id=?"),
             (item_id,),
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Item not found")
     return item_from_row(row)
+
+
+@app.get("/api/v1/catalog")
+def list_catalog(
+    library: str = Query(pattern="^(movies|series)$"),
+    parent_id: str | None = None,
+) -> list[dict]:
+    with closing(database()) as connection:
+        if parent_id is not None:
+            parent = connection.execute(
+                "SELECT id FROM catalog_nodes WHERE id=? AND library=? AND available=1",
+                (parent_id, library),
+            ).fetchone()
+            if parent is None:
+                raise HTTPException(status_code=404, detail="Catalog node not found")
+            rows = connection.execute(
+                "SELECT * FROM catalog_nodes WHERE library=? AND parent_id=? AND available=1 "
+                "ORDER BY CASE kind WHEN 'collection' THEN 0 WHEN 'series' THEN 1 "
+                "WHEN 'season' THEN 2 ELSE 3 END, title COLLATE NOCASE",
+                (library, parent_id),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT * FROM catalog_nodes WHERE library=? AND parent_id IS NULL AND available=1 "
+                "ORDER BY CASE kind WHEN 'collection' THEN 0 WHEN 'series' THEN 1 "
+                "WHEN 'season' THEN 2 ELSE 3 END, title COLLATE NOCASE",
+                (library,),
+            ).fetchall()
+        return [_node_payload(row, connection) for row in rows]
+
+
+@app.get("/api/v1/catalog/{node_id}")
+def get_catalog_node(node_id: str) -> dict:
+    with closing(database()) as connection:
+        row = connection.execute(
+            "SELECT * FROM catalog_nodes WHERE id=? AND available=1", (node_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Catalog node not found")
+        return _node_payload(row, connection)
+
+
+@app.get("/api/v1/catalog/{node_id}/images/{image_type}")
+def get_catalog_image(node_id: str, image_type: str):
+    if image_type not in {"poster", "backdrop"}:
+        raise HTTPException(status_code=404, detail="Image type not found")
+    with closing(database()) as connection:
+        row = connection.execute(
+            "SELECT kind, season_number, poster_file, backdrop_file FROM catalog_nodes "
+            "WHERE id=? AND available=1", (node_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Catalog node not found")
+    filename = row["poster_file"] if image_type == "poster" else row["backdrop_file"]
+    if filename:
+        image_path = (ARTWORK_DIR / filename).resolve()
+        try:
+            image_path.relative_to(ARTWORK_DIR.resolve())
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Image not found") from None
+        if image_path.is_file():
+            return FileResponse(image_path)
+    if image_type == "poster" and row["kind"] == "season":
+        season = int(row["season_number"] or 0)
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 900">'
+            '<defs><linearGradient id="g" x2="0" y2="1">'
+            '<stop stop-color="#29334b"/><stop offset="1" stop-color="#111827"/>'
+            '</linearGradient></defs><rect width="600" height="900" fill="url(#g)"/>'
+            '<text x="300" y="390" text-anchor="middle" fill="#9ca3af" '
+            'font-family="sans-serif" font-size="36">TEMPORADA</text>'
+            f'<text x="300" y="550" text-anchor="middle" fill="white" '
+            f'font-family="sans-serif" font-weight="700" font-size="180">{season:02d}</text>'
+            '</svg>'
+        )
+        return Response(content=svg, media_type="image/svg+xml")
+    raise HTTPException(status_code=404, detail="Image not found")
+
+
+@app.post("/api/v1/admin/sync", status_code=202, dependencies=[Depends(require_admin)])
+def start_catalog_sync() -> dict[str, str]:
+    if not TMDB_ACCESS_TOKEN:
+        raise HTTPException(status_code=503, detail="Set TMDB_ACCESS_TOKEN in .env first")
+    job_id = _start_sync_job()
+    if job_id is None:
+        raise HTTPException(status_code=409, detail="A catalog sync is already running")
+    return {"id": job_id, "status": "queued", "status_url": f"/api/v1/admin/sync/{job_id}"}
+
+
+@app.get("/api/v1/admin/sync", dependencies=[Depends(require_admin)])
+def latest_catalog_sync() -> SyncJob | dict[str, str]:
+    with closing(database()) as connection:
+        row = connection.execute(
+            "SELECT * FROM sync_runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+    return _sync_job_payload(row) if row else {"status": "never_run"}
+
+
+@app.get("/api/v1/admin/sync/{job_id}", dependencies=[Depends(require_admin)])
+def get_catalog_sync(job_id: str) -> SyncJob:
+    with closing(database()) as connection:
+        row = connection.execute("SELECT * FROM sync_runs WHERE id=?", (job_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Sync job not found")
+    return _sync_job_payload(row)
+
+
+@app.post("/api/v1/admin/catalog/{node_id}/match", dependencies=[Depends(require_admin)])
+def set_catalog_match(node_id: str, tmdb_id: Annotated[int, Query(gt=0)]) -> dict[str, object]:
+    if not TMDB_ACCESS_TOKEN:
+        raise HTTPException(status_code=503, detail="Set TMDB_ACCESS_TOKEN in .env first")
+    with closing(database()) as connection:
+        node = connection.execute(
+            "SELECT * FROM catalog_nodes WHERE id=? AND kind IN ('movie', 'series') AND available=1",
+            (node_id,),
+        ).fetchone()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Movie or series not found")
+        try:
+            apply_tmdb_id(connection, node, tmdb_id, TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, ARTWORK_DIR)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"TMDb match failed: {exc}") from None
+        updated = connection.execute("SELECT * FROM catalog_nodes WHERE id=?", (node_id,)).fetchone()
+        return _node_payload(updated, connection)
+
+
+@app.get("/api/v1/admin/metadata/review", dependencies=[Depends(require_admin)])
+def metadata_review_queue() -> list[dict[str, object]]:
+    with closing(database()) as connection:
+        rows = connection.execute(
+            """SELECT id, library, kind, title, source_year, metadata_candidates, metadata_error
+               FROM catalog_nodes WHERE available=1 AND metadata_status='needs_review'
+               ORDER BY library, title COLLATE NOCASE"""
+        ).fetchall()
+    return [
+        {**{key: row[key] for key in ("id", "library", "kind", "title", "source_year", "metadata_error")},
+         "candidates": json.loads(row["metadata_candidates"] or "[]")}
+        for row in rows
+    ]
 
 
 @app.get("/api/v1/items/{item_id}/stream")
@@ -220,51 +617,9 @@ def stream_item(item_id: str, request: Request):
 
 @app.post("/api/v1/admin/scan", response_model=ScanResult, dependencies=[Depends(require_admin)])
 def scan_library() -> ScanResult:
-    for library, root in MEDIA_ROOTS.items():
-        if not root.is_dir():
-            raise HTTPException(status_code=503, detail=f"{library.title()} library is not mounted")
-
-    now = datetime.now(timezone.utc).isoformat()
-    found: list[tuple[str, str, str, str, str, int, str, str]] = []
-    for library, root in MEDIA_ROOTS.items():
-        for path in root.rglob("*"):
-            try:
-                if path.is_symlink() or not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
-                    continue
-                stat = path.stat()
-            except OSError:
-                continue
-            relative = path.relative_to(root).as_posix()
-            item_id = hashlib.sha256(f"{library}:{relative}".encode()).hexdigest()[:32]
-            found.append((item_id, library, display_title(path), relative, path.suffix.lower(),
-                          stat.st_size, datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(), now))
-
-    with closing(database()) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS scan_paths (relative_path TEXT PRIMARY KEY)"
-        )
-        connection.execute("DELETE FROM scan_paths")
-        connection.executemany(
-            "INSERT INTO scan_paths (relative_path) VALUES (?)",
-            [(f"{row[1]}:{row[3]}",) for row in found],
-        )
-        connection.executemany(
-            """INSERT INTO library_items
-               (id, library, title, relative_path, extension, size_bytes, modified_at, scanned_at, available)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-               ON CONFLICT(id) DO UPDATE SET
-                 library=excluded.library, title=excluded.title,
-                 relative_path=excluded.relative_path, extension=excluded.extension,
-                 size_bytes=excluded.size_bytes, modified_at=excluded.modified_at,
-                 scanned_at=excluded.scanned_at, available=1""",
-            found,
-        )
-        unavailable = connection.execute(
-            """UPDATE library_items SET available = 0
-               WHERE available = 1 AND (library || ':' || relative_path) NOT IN
-                 (SELECT relative_path FROM scan_paths)"""
-        ).rowcount
-        connection.commit()
-
-    return ScanResult(scanned=len(found), marked_unavailable=unavailable, completed_at=now)
+    try:
+        with closing(database()) as connection:
+            result = scan_catalog(connection, MEDIA_ROOTS)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+    return ScanResult(**result)

@@ -1,78 +1,116 @@
 # Zinema Server
 
-Servidor propio para catalogar y reproducir archivos de vídeo guardados en el NAS. En esta versión no necesita Jellyfin: escanea las dos carpetas configuradas, mantiene el catálogo en SQLite y entrega los vídeos por HTTP con soporte de rangos, necesario para buscar dentro del vídeo y reanudar reproducción.
+Servidor para catalogar y reproducir vídeo del NAS. Escanea las carpetas de películas y series, organiza el catálogo según su estructura y guarda metadata y carátulas en SQLite y `./data/artwork`. El cliente consulta Zinema; la clave de TMDb solo vive en el servidor.
 
-## Instalar en el equipo que tiene acceso al NAS
+## Estructura de carpetas
 
-Requisitos: Docker Engine con Docker Compose v2 y acceso de lectura a estas rutas del host:
+La exploración admite carpetas de colección a cualquier profundidad:
 
-- Películas: `/d/NAS/Pelikulek`
-- Series: `/d/NAS/Serijek`
-
-Desde `/home/projects/zinema` ya está preparado un `.env` local con las dos rutas y un token aleatorio. Si partes de un clone limpio, créalo así y cambia `ADMIN_TOKEN` por un secreto largo:
-
-```sh
-cp .env.example .env
+```text
+Peliculas/
+  Coleccion/
+    Titulo de pelicula (2024)/
+      pelicula.mkv
+Series/
+  Coleccion/
+    Nombre de serie/
+      Season 00/
+        episodio S00E01.mkv
 ```
 
-En el NAS, configura `MOVIES_PATH` y `SERIES_PATH` con las rutas reales de sus carpetas compartidas. Antes de arrancar, puedes validar Docker, el `.env` y los permisos con:
+Los directorios anteriores a la carpeta de película o serie aparecen como colecciones. La API devuelve hasta cuatro carátulas descendientes en `mosaic_images` para que el cliente dibuje el mosaico. Las temporadas tienen una imagen de póster generada con su número. Los episodios se enlazan a la serie y temporada cuando están en una carpeta `Season NN`; los patrones `SxxEyy` y `xxXyy` se usan para identificar el número del episodio.
+
+## Configurar y arrancar
+
+Requisitos: Docker Engine con Docker Compose v2, `curl` y acceso de lectura del host a las dos rutas del NAS.
+
+1. En el NAS, clona el proyecto y crea su configuración:
+
+   ```sh
+   git clone https://github.com/perikobermio/zinema.git ~/apps/zinema
+   cd ~/apps/zinema
+   cp .env.example .env
+   nano .env
+   ```
+
+2. Configura `MOVIES_PATH`, `SERIES_PATH` y un `ADMIN_TOKEN` propio. En tu cuenta de TMDb solicita el **API Read Access Token** y guárdalo en `TMDB_ACCESS_TOKEN`. No lo pongas en el cliente ni lo subas a Git. `TMDB_LANGUAGE` controla el idioma preferido de los resultados; por defecto es `es-ES`.
+
+3. Valida las rutas y arranca el servidor:
+
+   ```sh
+   ./check-nas.sh
+   docker compose up --build -d
+   docker compose ps
+   docker compose logs -f zinema
+   ```
+
+El NAS y SQLite se montan de forma persistente en `./data`; las carpetas de medios se montan en solo lectura. La API está en el puerto `8180` del host.
+
+## Lanzar la sincronización inicial
+
+La sincronización vuelve a escanear las carpetas y busca metadata de películas y series en TMDb. Se ejecuta como trabajo en segundo plano:
 
 ```sh
-./check-nas.sh
-```
-
-Para arrancar el servicio y comprobar salud, escaneo, catálogo y streaming por rangos:
-
-```sh
-./smoke-test.sh
-```
-
-El escaneo recorre ambas bibliotecas, por lo que puede tardar si contienen muchos vídeos. Para comprobar un servicio que escucha en otra dirección, indica la URL, por ejemplo `API_BASE_URL=http://192.168.1.20:8180 ./smoke-test.sh`.
-
-Las rutas están configuradas con las que has proporcionado. Comprueba que Docker puede leer ambas carpetas y luego ejecuta:
-
-```sh
-docker compose up --build -d
-docker compose ps
-docker compose logs -f zinema
-```
-
-El catálogo se conserva en `./data`; el NAS se monta en modo solo lectura. La API queda disponible en el puerto `8180` del equipo anfitrión.
-
-## Comprobar catálogo y reproducción
-
-En otra terminal, desde la carpeta del proyecto, carga el token y lanza el escaneo:
-
-```sh
-set -a; . ./.env; set +a
-curl -X POST http://localhost:8180/api/v1/admin/scan \
+set -a
+. ./.env
+set +a
+curl -i -X POST http://localhost:8180/api/v1/admin/sync \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
-La respuesta muestra cuántos archivos encontró. Comprueba que el servidor está activo y consulta los primeros elementos:
+La respuesta incluye un `id`. Consulta el progreso con:
 
 ```sh
-curl http://localhost:8180/health
-curl 'http://localhost:8180/api/v1/items?limit=10'
-curl 'http://localhost:8180/api/v1/items?q=nombre%20de%20pelicula'
+curl http://localhost:8180/api/v1/admin/sync/ID_DEL_TRABAJO \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
-En la lista, copia el `id` de un vídeo real y prueba una descarga parcial de los primeros 1 KiB:
+El estado pasa por `scan` y `metadata:N`; al terminar devuelve cuántos archivos se escanearon y cuántos títulos se asociaron, quedaron para revisar o no tuvieron coincidencia. La importación automática solo acepta coincidencias claras; los casos ambiguos quedan en la cola de revisión:
 
 ```sh
-curl -v -H 'Range: bytes=0-1023' \
-  http://localhost:8180/api/v1/items/ID_DEL_VIDEO/stream \
-  -o /tmp/zinema-fragmento.bin
+curl http://localhost:8180/api/v1/admin/metadata/review \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
-Debe devolver `206 Partial Content`, `Accept-Ranges: bytes` y `Content-Range: bytes 0-1023/TAMANO`. Comprueba el fragmento con `file /tmp/zinema-fragmento.bin`. Para probar reproducción completa, abre en VLC `http://IP_DEL_SERVIDOR:8180/api/v1/items/ID_DEL_VIDEO/stream` desde un dispositivo de la misma red.
+Para aceptar una coincidencia, envía el `tmdb_id` elegido:
 
-Desde otro equipo, sustituye `localhost` por la IP del equipo que ejecuta Docker: `http://IP_DEL_SERVIDOR:8180/api/v1/items/ID_DEL_VIDEO/stream`. Si funciona localmente pero no desde el móvil/TV, revisa el firewall y que ambos estén en la misma red.
+```sh
+curl -X POST 'http://localhost:8180/api/v1/admin/catalog/ID_DEL_NODO/match?tmdb_id=ID_TMDB' \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
 
-## Límites de esta primera versión
+Tras una sincronización inicial completada, el servidor vuelve a escanear diariamente. Solo consulta TMDb para entradas nuevas o cuya metadata lleve 30 días sin actualizar. Puedes cambiar el intervalo y el tamaño de lote con `TMDB_SYNC_INTERVAL_HOURS` y `TMDB_SYNC_BATCH_SIZE`.
 
-- Sirve los formatos tal como están en el NAS (Direct Play); todavía no convierte formatos incompatibles.
-- El escaneo es manual y se inicia con el token de administrador.
-- El catálogo guarda título provisional derivado del nombre del archivo. Todavía no importa metadatos ni crea temporadas y episodios a partir de la estructura.
-- La API de catálogo y streaming está pensada para una red privada de confianza. No la publiques directamente en internet; autenticación por usuario y HTTPS quedan para antes del acceso remoto.
-- Si una ruta no está montada al escanear, el servidor lo informa y no modifica el catálogo. Los archivos que desaparecen de un escaneo se marcan como no disponibles sin borrar sus registros.
+## API para el cliente
+
+El catálogo se navega por nivel, usando `parent_id` para abrir una colección, serie o temporada:
+
+```sh
+curl 'http://localhost:8180/api/v1/catalog?library=movies'
+curl 'http://localhost:8180/api/v1/catalog?library=series'
+curl 'http://localhost:8180/api/v1/catalog?library=series&parent_id=ID_DEL_NODO'
+curl 'http://localhost:8180/api/v1/catalog/ID_DEL_NODO'
+```
+
+Cada nodo incluye `kind`, `display_title`, `overview`, `year`, `genres`, `poster_url`, `backdrop_url`, `children`, `files` y `mosaic_images`. Los archivos reproducibles conservan sus IDs y URL de streaming:
+
+```text
+/api/v1/items/ID_DEL_ARCHIVO/stream
+```
+
+`/api/v1/items` sigue disponible como lista plana. `/health` permite comprobar que el servidor responde.
+
+## Fuentes y acceso
+
+TMDb proporciona metadata e imágenes para este proyecto. La aplicación debe mostrar la atribución requerida por TMDb: **“This product uses the TMDB API but is not endorsed or certified by TMDB.”** Si el uso pasa a ser comercial, revisa las condiciones y licencia con TMDb. Zinema conserva los IDs de IMDb que TMDb devuelva, pero no consulta ni extrae datos directamente de IMDb.
+
+Las rutas de catálogo, metadata e imágenes no requieren autenticación. Las rutas bajo `/api/v1/admin` sí requieren `ADMIN_TOKEN`. Mantén el servicio dentro de una red privada o protégelo detrás de una VPN/autenticación antes de hacerlo accesible desde Internet.
+
+## Comprobaciones
+
+```sh
+./check-nas.sh
+./smoke-test.sh
+```
+
+El primer escaneo completo puede tardar según el tamaño de las bibliotecas y la respuesta de TMDb. Los datos anteriores se conservan en SQLite y `./data/artwork` entre reconstrucciones del contenedor.

@@ -10,6 +10,11 @@ services:
       SERIES_ROOT: /library/series
       DATABASE_PATH: /data/zinema.sqlite3
       ADMIN_TOKEN: ${ADMIN_TOKEN:?Set ADMIN_TOKEN in .env}
+      TMDB_ACCESS_TOKEN: ${TMDB_ACCESS_TOKEN:-}
+      TMDB_LANGUAGE: ${TMDB_LANGUAGE:-es-ES}
+      TMDB_SYNC_INTERVAL_HOURS: ${TMDB_SYNC_INTERVAL_HOURS:-24}
+      TMDB_SYNC_BATCH_SIZE: ${TMDB_SYNC_BATCH_SIZE:-100}
+      TMDB_REQUEST_DELAY_SECONDS: ${TMDB_REQUEST_DELAY_SECONDS:-0.25}
     volumes:
       - type: bind
         source: ${MOVIES_PATH:?Set MOVIES_PATH to the mounted NAS movies folder}
