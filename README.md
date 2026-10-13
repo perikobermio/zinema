@@ -51,18 +51,18 @@ El NAS y SQLite se montan de forma persistente en `./data`; las carpetas de medi
 La sincronización vuelve a escanear las carpetas y busca metadata de películas y series en TMDb. Se ejecuta como trabajo en segundo plano:
 
 ```sh
+./start-import.sh
+```
+
+El script lee `ADMIN_TOKEN` de `.env`, inicia el trabajo y muestra su ID. Para usar una URL distinta, ejecuta `API_BASE_URL=https://zinema.tudominio.com ./start-import.sh`. Consulta el progreso con la URL y el comando que imprime el script, o con:
+
+```sh
 set -a
 . ./.env
 set +a
-curl -i -X POST http://localhost:8180/api/v1/admin/sync \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-```
-
-La respuesta incluye un `id`. Consulta el progreso con:
-
-```sh
 curl http://localhost:8180/api/v1/admin/sync/ID_DEL_TRABAJO \
   -H "Authorization: Bearer $ADMIN_TOKEN"
+unset ADMIN_TOKEN
 ```
 
 El estado pasa por `scan` y `metadata:N`; al terminar devuelve cuántos archivos se escanearon y cuántos títulos se asociaron, quedaron para revisar o no tuvieron coincidencia. La importación automática solo acepta coincidencias claras; los casos ambiguos quedan en la cola de revisión:
