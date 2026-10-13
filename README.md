@@ -65,6 +65,15 @@ curl http://localhost:8180/api/v1/admin/sync/ID_DEL_TRABAJO \
 unset ADMIN_TOKEN
 ```
 
+También puedes consultar el último trabajo o uno concreto con el script de estado:
+
+```sh
+./sync-status.sh
+./sync-status.sh ID_DEL_TRABAJO
+```
+
+Acepta la misma variable `API_BASE_URL` para consultar el servidor mediante el dominio del reverse proxy.
+
 El estado pasa por `scan` y `metadata:N`; al terminar devuelve cuántos archivos se escanearon y cuántos títulos se asociaron, quedaron para revisar o no tuvieron coincidencia. La importación automática solo acepta coincidencias claras; los casos ambiguos quedan en la cola de revisión:
 
 ```sh
