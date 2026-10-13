@@ -1,0 +1,26 @@
+services:
+  zinema:
+    build: .
+    container_name: zinema-server
+    restart: unless-stopped
+    ports:
+      - "8180:8000"
+    environment:
+      MOVIES_ROOT: /library/movies
+      SERIES_ROOT: /library/series
+      DATABASE_PATH: /data/zinema.sqlite3
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?Set ADMIN_TOKEN in .env}
+    volumes:
+      - type: bind
+        source: ${MOVIES_PATH:?Set MOVIES_PATH to the mounted NAS movies folder}
+        target: /library/movies
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SERIES_PATH:?Set SERIES_PATH to the mounted NAS series folder}
+        target: /library/series
+        read_only: true
+        bind:
+          create_host_path: false
+      - ./data:/data

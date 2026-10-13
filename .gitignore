@@ -1,0 +1,6 @@
+.env
+cre.askPas
+data/
+__pycache__/
+*.py[cod]
+.venv/
