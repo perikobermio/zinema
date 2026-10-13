@@ -109,6 +109,16 @@ Cada nodo incluye `kind`, `display_title`, `overview`, `year`, `genres`, `poster
 
 `/api/v1/items` sigue disponible como lista plana. `/health` permite comprobar que el servidor responde.
 
+## Cliente Android
+
+El código del cliente está en [`client/`](client/). Para compilar el APK de depuración con Android SDK Platform 35 y Build Tools 36.0.0:
+
+```sh
+./client/build-apk.sh
+```
+
+El archivo queda en `client/build/outputs/apk/debug/zinema-client-debug.apk`. El cliente se conecta al dominio público configurado en la app y permite cambiarlo desde ajustes.
+
 ## Fuentes y acceso
 
 TMDb proporciona metadata e imágenes para este proyecto. La aplicación debe mostrar la atribución requerida por TMDb: **“This product uses the TMDB API but is not endorsed or certified by TMDB.”** Si el uso pasa a ser comercial, revisa las condiciones y licencia con TMDb. Zinema conserva los IDs de IMDb que TMDb devuelva, pero no consulta ni extrae datos directamente de IMDb.
