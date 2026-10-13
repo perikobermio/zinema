@@ -27,6 +27,8 @@ MEDIA_ROOTS = {
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/zinema.sqlite3"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 TMDB_ACCESS_TOKEN = os.getenv("TMDB_ACCESS_TOKEN", "")
+TMDB_KEY = os.getenv("TMDB_KEY", "") if not TMDB_ACCESS_TOKEN else ""
+TMDB_CONFIGURED = bool(TMDB_ACCESS_TOKEN or TMDB_KEY)
 TMDB_LANGUAGE = os.getenv("TMDB_LANGUAGE", "es-ES")
 TMDB_SYNC_INTERVAL_HOURS = max(1, int(os.getenv("TMDB_SYNC_INTERVAL_HOURS", "24")))
 TMDB_SYNC_BATCH_SIZE = max(1, int(os.getenv("TMDB_SYNC_BATCH_SIZE", "100")))
@@ -316,6 +318,7 @@ def _run_sync_job(job_id: str) -> None:
                     connection, TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, ARTWORK_DIR,
                     batch_size=TMDB_SYNC_BATCH_SIZE,
                     minimum_delay=TMDB_REQUEST_DELAY_SECONDS,
+                    api_key=TMDB_KEY,
                 )
             for key, value in batch.items():
                 metadata_result[key] += value
@@ -338,7 +341,7 @@ def _run_sync_job(job_id: str) -> None:
 
 
 def _start_sync_job() -> str | None:
-    if not TMDB_ACCESS_TOKEN or not SYNC_LOCK.acquire(blocking=False):
+    if not TMDB_CONFIGURED or not SYNC_LOCK.acquire(blocking=False):
         return None
     job_id = uuid4().hex
     try:
@@ -360,7 +363,7 @@ def _daily_sync_loop() -> None:
     interval = TMDB_SYNC_INTERVAL_HOURS * 3600
     while True:
         time.sleep(min(interval, 3600))
-        if not TMDB_ACCESS_TOKEN or SYNC_LOCK.locked():
+        if not TMDB_CONFIGURED or SYNC_LOCK.locked():
             continue
         with closing(database()) as connection:
             row = connection.execute(
@@ -508,8 +511,8 @@ def get_catalog_image(node_id: str, image_type: str):
 
 @app.post("/api/v1/admin/sync", status_code=202, dependencies=[Depends(require_admin)])
 def start_catalog_sync() -> dict[str, str]:
-    if not TMDB_ACCESS_TOKEN:
-        raise HTTPException(status_code=503, detail="Set TMDB_ACCESS_TOKEN in .env first")
+    if not TMDB_CONFIGURED:
+        raise HTTPException(status_code=503, detail="Set TMDB_KEY or TMDB_ACCESS_TOKEN in .env first")
     job_id = _start_sync_job()
     if job_id is None:
         raise HTTPException(status_code=409, detail="A catalog sync is already running")
@@ -536,8 +539,8 @@ def get_catalog_sync(job_id: str) -> SyncJob:
 
 @app.post("/api/v1/admin/catalog/{node_id}/match", dependencies=[Depends(require_admin)])
 def set_catalog_match(node_id: str, tmdb_id: Annotated[int, Query(gt=0)]) -> dict[str, object]:
-    if not TMDB_ACCESS_TOKEN:
-        raise HTTPException(status_code=503, detail="Set TMDB_ACCESS_TOKEN in .env first")
+    if not TMDB_CONFIGURED:
+        raise HTTPException(status_code=503, detail="Set TMDB_KEY or TMDB_ACCESS_TOKEN in .env first")
     with closing(database()) as connection:
         node = connection.execute(
             "SELECT * FROM catalog_nodes WHERE id=? AND kind IN ('movie', 'series') AND available=1",
@@ -546,7 +549,8 @@ def set_catalog_match(node_id: str, tmdb_id: Annotated[int, Query(gt=0)]) -> dic
         if node is None:
             raise HTTPException(status_code=404, detail="Movie or series not found")
         try:
-            apply_tmdb_id(connection, node, tmdb_id, TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, ARTWORK_DIR)
+            apply_tmdb_id(connection, node, tmdb_id, TMDB_ACCESS_TOKEN, TMDB_LANGUAGE,
+                           ARTWORK_DIR, api_key=TMDB_KEY)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"TMDb match failed: {exc}") from None
         updated = connection.execute("SELECT * FROM catalog_nodes WHERE id=?", (node_id,)).fetchone()

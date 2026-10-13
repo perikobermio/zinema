@@ -33,7 +33,7 @@ Requisitos: Docker Engine con Docker Compose v2, `curl` y acceso de lectura del 
    nano .env
    ```
 
-2. Configura `MOVIES_PATH`, `SERIES_PATH` y un `ADMIN_TOKEN` propio. En tu cuenta de TMDb solicita el **API Read Access Token** y guárdalo en `TMDB_ACCESS_TOKEN`. No lo pongas en el cliente ni lo subas a Git. `TMDB_LANGUAGE` controla el idioma preferido de los resultados; por defecto es `es-ES`.
+2. Configura `MOVIES_PATH`, `SERIES_PATH` y un `ADMIN_TOKEN` propio. Para TMDb puedes guardar la **API Key v3** en `TMDB_KEY` o el **API Read Access Token** en `TMDB_ACCESS_TOKEN`; basta con configurar uno. No pongas estas credenciales en el cliente ni las subas a Git. `TMDB_LANGUAGE` controla el idioma preferido de los resultados; por defecto es `es-ES`.
 
 3. Valida las rutas y arranca el servidor:
 

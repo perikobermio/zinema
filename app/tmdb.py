@@ -51,22 +51,30 @@ def _match_score(query: str, result: str, original: str, year: int | None,
     return title_score * 0.85
 
 
-def _api_get(client: httpx.Client, path: str, params: dict[str, object] | None = None) -> dict:
+def _api_get(client: httpx.Client, path: str, params: dict[str, object] | None = None,
+             api_key: str = "") -> dict:
+    request_params = dict(params or {})
+    if api_key:
+        request_params["api_key"] = api_key
     for attempt in range(4):
-        response = client.get(f"{TMDB_API}{path}", params=params)
+        try:
+            response = client.get(f"{TMDB_API}{path}", params=request_params)
+        except httpx.RequestError as exc:
+            raise RuntimeError("Could not connect to TMDb") from None
         if response.status_code == 429 or response.status_code >= 500:
             if attempt == 3:
-                response.raise_for_status()
+                raise RuntimeError(f"TMDb returned HTTP {response.status_code}")
             retry_after = response.headers.get("Retry-After")
             time.sleep(float(retry_after) if retry_after and retry_after.isdigit() else 1.5 ** attempt)
             continue
-        response.raise_for_status()
+        if response.is_error:
+            raise RuntimeError(f"TMDb returned HTTP {response.status_code}")
         return response.json()
     raise RuntimeError("TMDb request retry limit reached")
 
 
-def _image_config(client: httpx.Client) -> tuple[str, str, str]:
-    data = _api_get(client, "/configuration").get("images", {})
+def _image_config(client: httpx.Client, api_key: str = "") -> tuple[str, str, str]:
+    data = _api_get(client, "/configuration", api_key=api_key).get("images", {})
     base = data.get("secure_base_url") or f"{TMDB_IMAGES}/"
     posters = data.get("poster_sizes") or ["original"]
     backdrops = data.get("backdrop_sizes") or ["original"]
@@ -125,14 +133,15 @@ def _write_match(connection: sqlite3.Connection, node: sqlite3.Row, details: dic
     )
 
 
-def _fetch_details(client: httpx.Client, kind: str, tmdb_id: int, language: str) -> dict:
+def _fetch_details(client: httpx.Client, kind: str, tmdb_id: int, language: str,
+                   api_key: str = "") -> dict:
     return _api_get(client, f"/{kind}/{tmdb_id}",
-                    {"language": language, "append_to_response": "external_ids"})
+                    {"language": language, "append_to_response": "external_ids"}, api_key)
 
 
 def enrich_pending(connection: sqlite3.Connection, access_token: str, language: str,
                    artwork_dir: Path, batch_size: int = 100,
-                   minimum_delay: float = 0.25) -> dict[str, int]:
+                   minimum_delay: float = 0.25, api_key: str = "") -> dict[str, int]:
     """Match pending movie/series nodes, then save TMDb metadata and local artwork."""
     now = datetime.now(timezone.utc)
     cutoff = (now - timedelta(days=30)).isoformat()
@@ -150,16 +159,18 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
     if not rows:
         return {"matched": 0, "needs_review": 0, "not_found": 0, "errors": 0, "processed": 0}
 
-    headers = {"Authorization": f"Bearer {access_token}", "accept": "application/json"}
+    headers = {"accept": "application/json"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
     counts = {"matched": 0, "needs_review": 0, "not_found": 0, "errors": 0, "processed": 0}
     with httpx.Client(headers=headers, timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
-        config = _image_config(client)
+        config = _image_config(client, api_key)
         for node in rows:
             counts["processed"] += 1
             try:
                 kind = "movie" if node["kind"] == "movie" else "tv"
                 if node["tmdb_id"]:
-                    details = _fetch_details(client, kind, int(node["tmdb_id"]), language)
+                    details = _fetch_details(client, kind, int(node["tmdb_id"]), language, api_key)
                     _write_match(connection, node, details, artwork_dir, client, config)
                     counts["matched"] += 1
                     connection.commit()
@@ -169,7 +180,7 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
                 params: dict[str, object] = {"query": title, "language": language, "include_adult": "false"}
                 if source_year:
                     params["year" if kind == "movie" else "first_air_date_year"] = source_year
-                search = _api_get(client, f"/search/{kind}", params)
+                search = _api_get(client, f"/search/{kind}", params, api_key)
                 candidates = []
                 for result in search.get("results", [])[:10]:
                     result_title = result.get("title") or result.get("name") or ""
@@ -192,7 +203,7 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
                     best = candidates[0]
                     margin = best["score"] - candidates[1]["score"] if len(candidates) > 1 else 1.0
                     if best["score"] >= 0.93 and margin >= 0.04:
-                        details = _fetch_details(client, kind, int(best["tmdb_id"]), language)
+                        details = _fetch_details(client, kind, int(best["tmdb_id"]), language, api_key)
                         _write_match(connection, node, details, artwork_dir, client, config)
                         counts["matched"] += 1
                     else:
@@ -218,12 +229,15 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
 
 
 def apply_tmdb_id(connection: sqlite3.Connection, node: sqlite3.Row, tmdb_id: int,
-                  access_token: str, language: str, artwork_dir: Path) -> None:
+                  access_token: str, language: str, artwork_dir: Path,
+                  api_key: str = "") -> None:
     kind = "movie" if node["kind"] == "movie" else "tv"
-    headers = {"Authorization": f"Bearer {access_token}", "accept": "application/json"}
+    headers = {"accept": "application/json"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
     with httpx.Client(headers=headers, timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
-        config = _image_config(client)
-        details = _fetch_details(client, kind, tmdb_id, language)
+        config = _image_config(client, api_key)
+        details = _fetch_details(client, kind, tmdb_id, language, api_key)
         if int(details.get("id", -1)) != tmdb_id:
             raise ValueError("TMDb returned a different item id")
         _write_match(connection, node, details, artwork_dir, client, config)
