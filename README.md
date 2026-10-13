@@ -15,6 +15,20 @@ Desde `/home/projects/zinema` ya está preparado un `.env` local con las dos rut
 cp .env.example .env
 ```
 
+En el NAS, configura `MOVIES_PATH` y `SERIES_PATH` con las rutas reales de sus carpetas compartidas. Antes de arrancar, puedes validar Docker, el `.env` y los permisos con:
+
+```sh
+./check-nas.sh
+```
+
+Para arrancar el servicio y comprobar salud, escaneo, catálogo y streaming por rangos:
+
+```sh
+./smoke-test.sh
+```
+
+El escaneo recorre ambas bibliotecas, por lo que puede tardar si contienen muchos vídeos. Para comprobar un servicio que escucha en otra dirección, indica la URL, por ejemplo `API_BASE_URL=http://192.168.1.20:8180 ./smoke-test.sh`.
+
 Las rutas están configuradas con las que has proporcionado. Comprueba que Docker puede leer ambas carpetas y luego ejecuta:
 
 ```sh
