@@ -107,6 +107,8 @@ Las ediciones manuales permanecen guardadas y no las reemplaza la sincronizació
 
 Al asociar una serie con TMDb, el servidor consulta también los episodios para guardar sus títulos. Si TMDb no tiene un título para el episodio, el cliente muestra el nombre del archivo. En temporadas intenta usar el póster de temporada, una imagen del primer episodio y, como último recurso, el póster de la serie.
 
+Los nodos y archivos heredan los géneros y el póster de la colección ancestro más cercana cuando no tienen esos datos propios. Un póster o género asignado al nodo prevalece sobre el heredado. `GET /api/v1/genres` devuelve la lista sin duplicados de los géneros que ya aparecen en el catálogo; al importar metadata nueva, sus géneros pasan a estar disponibles automáticamente.
+
 Cada nodo incluye `kind`, `display_title`, `overview`, `year`, `genres`, `poster_url`, `backdrop_url`, `children`, `files` y `mosaic_images`. Los archivos reproducibles conservan sus IDs y URL de streaming:
 
 ```text

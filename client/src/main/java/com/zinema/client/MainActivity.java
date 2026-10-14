@@ -68,6 +68,7 @@ public class MainActivity extends Activity {
     HorizontalScrollView navScroll;
     String server;
     String currentLibrary = "movies";
+    String selectedSection = "home";
     String lastSearchQuery;
     String detailNodeId = "";
     boolean libraryMode;
@@ -130,9 +131,9 @@ public class MainActivity extends Activity {
         navScroll.setHorizontalScrollBarEnabled(false);
         LinearLayout nav = new LinearLayout(this);
         nav.setPadding(d(16), 0, d(16), d(8));
-        nav.addView(navChip("Inicio", () -> loadHome(), true));
-        nav.addView(navChip("Películas", () -> openLibrary("movies"), false));
-        nav.addView(navChip("Series", () -> openLibrary("series"), false));
+        nav.addView(navChip("Inicio", () -> loadHome(), selectedSection.equals("home")));
+        nav.addView(navChip("Películas", () -> openLibrary("movies"), selectedSection.equals("movies")));
+        nav.addView(navChip("Series", () -> openLibrary("series"), selectedSection.equals("series")));
         navScroll.addView(nav);
         page.addView(navScroll, new LinearLayout.LayoutParams(-1, d(42)));
 
@@ -171,6 +172,7 @@ public class MainActivity extends Activity {
         TextView chip = label(title, 14, active ? Color.WHITE : MUTED, active);
         chip.setGravity(Gravity.CENTER);
         chip.setPadding(d(14), 0, d(14), 0);
+        if (active) chip.setBackground(round(0xFF42151B, d(18)));
         chip.setFocusable(true);
         chip.setClickable(true);
         chip.setOnClickListener(v -> action.run());
@@ -234,6 +236,7 @@ public class MainActivity extends Activity {
     void loadHome() {
         libraryMode = false;
         showingDetail = false;
+        selectedSection = "home";
         breadcrumbs.clear();
         buildShell("Inicio");
         showLoading("Conectando con tu biblioteca…");
@@ -369,7 +372,8 @@ public class MainActivity extends Activity {
         FrameLayout art = new FrameLayout(this);
         art.setBackground(round(PANEL, d(10)));
         JSONArray mosaic = node.optJSONArray("mosaic_images");
-        if (node.optString("kind").equals("collection") && mosaic != null && mosaic.length() > 0) {
+        if (node.optString("kind").equals("collection")
+                && node.optString("poster_url").isEmpty() && mosaic != null && mosaic.length() > 0) {
             LinearLayout mosaicBox = new LinearLayout(this);
             mosaicBox.setOrientation(LinearLayout.VERTICAL);
             for (int r = 0; r < 2; r++) {
@@ -481,6 +485,7 @@ public class MainActivity extends Activity {
     void openLibrary(String library) {
         libraryMode = true;
         showingDetail = false;
+        selectedSection = library;
         currentLibrary = library;
         breadcrumbs.clear();
         buildShell(library.equals("movies") ? "Películas" : "Series");
@@ -677,8 +682,13 @@ public class MainActivity extends Activity {
 
         EditText title = metadataField(node.optString("display_title", node.optString("title", "")), "Título", false);
         EditText year = metadataField(node.isNull("year") ? "" : node.optString("year"), "Año", false);
-        EditText genres = metadataField(join(node.optJSONArray("genres")), "Géneros separados por coma", false);
         EditText overview = metadataField(node.optString("overview", ""), "Sinopsis", true);
+        ArrayList<String> genreOptions = new ArrayList<>();
+        ArrayList<String> selectedGenres = new ArrayList<>();
+        addGenreValues(genreOptions, node.optJSONArray("genres"));
+        addGenreValues(selectedGenres, node.optJSONArray("genres"));
+        Button genres = actionButton("Seleccionar géneros (" + selectedGenres.size() + ")", false);
+        genres.setOnClickListener(v -> showGenrePicker(genres, genreOptions, selectedGenres));
         form.addView(title, fieldMargins());
         form.addView(year, fieldMargins());
         form.addView(genres, fieldMargins());
@@ -708,8 +718,22 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams saveParams = fieldMargins();
         saveParams.topMargin = d(14);
         form.addView(save, saveParams);
-        save.setOnClickListener(v -> saveMetadata(node, title, year, genres, overview,
+        save.setOnClickListener(v -> saveMetadata(node, title, year, selectedGenres, overview,
                 selectedTmdbId[0], selectedImagePath[0], selectedImageType[0]));
+
+        io.execute(() -> {
+            try {
+                JSONArray importedGenres = getArray("/api/v1/genres");
+                runOnUiThread(() -> {
+                    addGenreValues(genreOptions, importedGenres);
+                    addGenreValues(genreOptions, new JSONArray(selectedGenres));
+                    genres.setText("Seleccionar géneros (" + selectedGenres.size() + ")");
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(this,
+                        "No se pudo cargar la lista de géneros: " + e.getMessage(), Toast.LENGTH_LONG).show());
+            }
+        });
 
         candidateGallery.removeAllViews();
         for (int i = 0; i < candidates.length(); i++) {
@@ -730,8 +754,8 @@ public class MainActivity extends Activity {
             candidateName.setMaxLines(2);
             card.addView(candidateName, new LinearLayout.LayoutParams(d(102), -2));
             card.setOnClickListener(v -> selectMetadataCandidate(node, candidate, title, year,
-                    genres, overview, selectedTmdbId, selectedImagePath, selectedImageType,
-                    imageGallery));
+                    genres, genreOptions, selectedGenres, overview, selectedTmdbId,
+                    selectedImagePath, selectedImageType, imageGallery));
             candidateGallery.addView(card);
         }
         if (candidates.length() == 0) {
@@ -740,6 +764,41 @@ public class MainActivity extends Activity {
         }
         searchMetadataImages(node, title.getText().toString(), selectedTmdbId[0],
                 imageGallery, selectedImagePath, selectedImageType);
+    }
+
+    void addGenreValues(List<String> destination, JSONArray values) {
+        if (values == null) return;
+        for (int i = 0; i < values.length(); i++) {
+            String value = values.optString(i, "").trim();
+            if (value.isEmpty()) continue;
+            boolean exists = false;
+            for (String current : destination) {
+                if (current.equalsIgnoreCase(value)) { exists = true; break; }
+            }
+            if (!exists) destination.add(value);
+        }
+    }
+
+    void showGenrePicker(Button button, List<String> options, List<String> selected) {
+        String[] labels = options.toArray(new String[0]);
+        boolean[] checked = new boolean[labels.length];
+        for (int i = 0; i < labels.length; i++) {
+            for (String genre : selected) {
+                if (genre.equalsIgnoreCase(labels[i])) { checked[i] = true; break; }
+            }
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Selecciona los géneros")
+                .setMultiChoiceItems(labels, checked, (dialog, which, isChecked) -> {
+                    String genre = labels[which];
+                    selected.removeIf(item -> item.equalsIgnoreCase(genre));
+                    if (isChecked) selected.add(genre);
+                    button.setText("Seleccionar géneros (" + selected.size() + ")");
+                })
+                .setPositiveButton("Listo", (dialog, which) ->
+                        button.setText("Seleccionar géneros (" + selected.size() + ")"))
+                .setNegativeButton("Cancelar", null)
+                .show();
     }
 
     void setMetadataEditorChrome(boolean visible) {
@@ -764,7 +823,8 @@ public class MainActivity extends Activity {
     }
 
     void selectMetadataCandidate(JSONObject node, JSONObject candidate, EditText title,
-                                 EditText year, EditText genres, EditText overview,
+                                 EditText year, Button genres, List<String> genreOptions,
+                                 List<String> selectedGenres, EditText overview,
                                  long[] selectedTmdbId, String[] selectedImagePath,
                                  String[] selectedImageType, LinearLayout imageGallery) {
         long tmdbId = candidate.optLong("tmdb_id", 0);
@@ -781,10 +841,14 @@ public class MainActivity extends Activity {
                     title.setText(detail.optString("metadata_title", ""));
                     year.setText(detail.isNull("year") ? "" : detail.optString("year"));
                     JSONArray values = detail.optJSONArray("genres");
-                    genres.setText(values == null ? "" : join(values));
+                    selectedGenres.clear();
+                    addGenreValues(selectedGenres, values);
+                    addGenreValues(genreOptions, values);
+                    genres.setText("Seleccionar géneros (" + selectedGenres.size() + ")");
                     overview.setText(detail.optString("overview", ""));
                     showMetadataEditorWithSelection(node, selectedTmdbId[0], detail, title,
-                            year, genres, overview, selectedImagePath, selectedImageType, imageGallery);
+                            year, genres, genreOptions, selectedGenres, overview,
+                            selectedImagePath, selectedImageType, imageGallery);
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> Toast.makeText(this, "No se pudo cargar la coincidencia: " + e.getMessage(),
@@ -794,7 +858,8 @@ public class MainActivity extends Activity {
     }
 
     void showMetadataEditorWithSelection(JSONObject node, long tmdbId, JSONObject detail,
-                                         EditText title, EditText year, EditText genres,
+                                         EditText title, EditText year, Button genres,
+                                         List<String> genreOptions, List<String> selectedGenres,
                                          EditText overview, String[] selectedImagePath,
                                          String[] selectedImageType, LinearLayout imageGallery) {
         // The editor stays visible while the selected match supplies its image choices.
@@ -831,16 +896,20 @@ public class MainActivity extends Activity {
                         image.setBackground(round(PANEL, d(7)));
                         card.addView(image, new LinearLayout.LayoutParams(d(104), d(138)));
                         loadImage(option.optString("url", ""), image, false);
+                        card.setTag(new String[]{option.optString("path", ""),
+                                option.optString("type", "poster")});
                         TextView kind = label(option.optString("type", "poster").equals("backdrop")
                                 ? "Horizontal" : "Póster", 10, MUTED, false);
                         card.addView(kind);
                         card.setOnClickListener(v -> {
                             selectedPath[0] = option.optString("path", null);
                             selectedType[0] = option.optString("type", "poster");
+                            highlightImageSelection(gallery, selectedPath[0], selectedType[0]);
                             Toast.makeText(this, "Miniatura seleccionada.", Toast.LENGTH_SHORT).show();
                         });
                         gallery.addView(card);
                     }
+                    highlightImageSelection(gallery, selectedPath[0], selectedType[0]);
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
@@ -858,7 +927,25 @@ public class MainActivity extends Activity {
         });
     }
 
-    void saveMetadata(JSONObject node, EditText title, EditText year, EditText genres,
+    void highlightImageSelection(LinearLayout gallery, String selectedPath, String selectedType) {
+        for (int i = 0; i < gallery.getChildCount(); i++) {
+            View child = gallery.getChildAt(i);
+            Object tag = child.getTag();
+            boolean selected = false;
+            if (tag instanceof String[] && selectedPath != null) {
+                String[] image = (String[]) tag;
+                selected = selectedPath.equals(image[0]) && selectedType.equals(image[1]);
+            }
+            GradientDrawable border = new GradientDrawable();
+            border.setColor(Color.TRANSPARENT);
+            border.setCornerRadius(d(8));
+            border.setStroke(d(selected ? 3 : 1), selected ? RED : 0x66585B66);
+            child.setBackground(border);
+            child.setElevation(selected ? d(5) : 0);
+        }
+    }
+
+    void saveMetadata(JSONObject node, EditText title, EditText year, List<String> selectedGenres,
                       EditText overview, long tmdbId, String imagePath, String imageType) {
         String itemTitle = title.getText().toString().trim();
         if (itemTitle.isEmpty()) {
@@ -872,9 +959,7 @@ public class MainActivity extends Activity {
             payload.put("year", year.getText().toString().trim().isEmpty()
                     ? JSONObject.NULL : Integer.parseInt(year.getText().toString().trim()));
             JSONArray genreList = new JSONArray();
-            for (String genre : genres.getText().toString().split(",")) {
-                if (!genre.trim().isEmpty()) genreList.put(genre.trim());
-            }
+            for (String genre : selectedGenres) genreList.put(genre);
             payload.put("genres", genreList);
             if (imagePath != null && !imagePath.isEmpty()) payload.put("image_path", imagePath);
             payload.put("image_type", imageType == null ? "poster" : imageType);

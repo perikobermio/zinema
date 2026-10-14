@@ -196,24 +196,59 @@ def display_title(path: Path) -> str:
     return path.stem.replace(".", " ").replace("_", " ").strip()
 
 
-def item_from_row(row: sqlite3.Row) -> LibraryItem:
+def item_from_row(row: sqlite3.Row, connection: sqlite3.Connection) -> LibraryItem:
     data = dict(row)
     data["genres"] = json.loads(data.pop("genres_json", "[]") or "[]")
     metadata_node_id = data.pop("metadata_node_id", None)
+    metadata_parent_id = data.pop("metadata_parent_id", None)
     poster_file = data.pop("poster_file", None)
+    if not data["genres"]:
+        inherited_genres = _inherited_collection_value(connection, metadata_parent_id, "genres")
+        if inherited_genres:
+            data["genres"] = json.loads(inherited_genres[1] or "[]")
     if metadata_node_id and poster_file:
         data["poster_url"] = f"/api/v1/catalog/{metadata_node_id}/images/poster"
+    elif metadata_node_id:
+        inherited_poster = _inherited_collection_value(connection, metadata_parent_id, "poster_file")
+        if inherited_poster:
+            data["poster_url"] = f"/api/v1/catalog/{inherited_poster[0]}/images/poster"
     return LibraryItem(**data)
+
+
+def _inherited_collection_value(connection: sqlite3.Connection, parent_id: str | None,
+                                column: str) -> tuple[str, str] | None:
+    if column not in {"poster_file", "genres"}:
+        return None
+    while parent_id:
+        parent = connection.execute(
+            f"SELECT id, kind, parent_id, {column} AS value FROM catalog_nodes "
+            "WHERE id=? AND available=1", (parent_id,),
+        ).fetchone()
+        if parent is None:
+            return None
+        if parent["kind"] == "collection" and parent["value"]:
+            if column != "genres" or parent["value"] != "[]":
+                return parent["id"], parent["value"]
+        parent_id = parent["parent_id"]
+    return None
 
 
 def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     node = dict(row)
     genres = json.loads(node.pop("genres", "[]") or "[]")
     node["display_title"] = node.pop("metadata_title", None) or node["title"]
+    inherited_genres = _inherited_collection_value(connection, node.get("parent_id"), "genres")
+    if not genres and inherited_genres:
+        genres = json.loads(inherited_genres[1] or "[]")
     node["genres"] = genres
-    node["poster_available"] = bool(node.get("poster_file")) or node["kind"] == "season"
+    poster_file = node.get("poster_file")
+    inherited_poster = None
+    if not poster_file and node["kind"] != "season":
+        inherited_poster = _inherited_collection_value(connection, node.get("parent_id"), "poster_file")
+    node["poster_available"] = bool(poster_file or inherited_poster) or node["kind"] == "season"
+    poster_node_id = node["id"] if poster_file else (inherited_poster[0] if inherited_poster else node["id"])
     node["poster_url"] = (
-        f"/api/v1/catalog/{node['id']}/images/poster" if node["poster_available"] else None
+        f"/api/v1/catalog/{poster_node_id}/images/poster" if node["poster_available"] else None
     )
     node["backdrop_url"] = (
         f"/api/v1/catalog/{node['id']}/images/backdrop" if node.get("backdrop_file") else None
@@ -222,7 +257,7 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     node.pop("poster_file", None)
     node.pop("backdrop_file", None)
     node.pop("metadata_error", None)
-    if node["kind"] == "collection":
+    if node["kind"] == "collection" and not genres:
         genre_row = connection.execute(
             """WITH RECURSIVE descendants(id) AS (
                    SELECT id FROM catalog_nodes WHERE parent_id=? AND available=1
@@ -237,26 +272,30 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
                ORDER BY title COLLATE NOCASE LIMIT 1""",
             (node["id"],),
         ).fetchone()
-        if node.get("metadata_source") != "manual":
-            node["genres"] = json.loads(genre_row["genres"] or "[]") if genre_row else []
+        node["genres"] = json.loads(genre_row["genres"] or "[]") if genre_row else []
 
     child_rows = connection.execute(
-        """SELECT id, kind, title, metadata_title, poster_file, season_number
+        """SELECT id, kind, title, metadata_title, poster_file, season_number, parent_id
            FROM catalog_nodes WHERE parent_id=? AND available=1
            ORDER BY CASE kind WHEN 'collection' THEN 0 WHEN 'series' THEN 1
                               WHEN 'season' THEN 2 ELSE 3 END,
                     title COLLATE NOCASE""",
         (node["id"],),
     ).fetchall()
-    node["children"] = [
-        {"id": child["id"], "kind": child["kind"],
-         "title": child["metadata_title"] or child["title"],
-         "season_number": child["season_number"],
-         "poster_url": (f"/api/v1/catalog/{child['id']}/images/poster"
-                        if child["poster_file"] or child["kind"] == "season" else None),
-         "poster_available": bool(child["poster_file"]) or child["kind"] == "season"}
-        for child in child_rows
-    ]
+    node["children"] = []
+    for child in child_rows:
+        inherited = None
+        if not child["poster_file"] and child["kind"] != "season":
+            inherited = _inherited_collection_value(connection, child["parent_id"], "poster_file")
+        available = bool(child["poster_file"] or inherited) or child["kind"] == "season"
+        poster_node_id = child["id"] if child["poster_file"] else (inherited[0] if inherited else child["id"])
+        node["children"].append(
+            {"id": child["id"], "kind": child["kind"],
+             "title": child["metadata_title"] or child["title"],
+             "season_number": child["season_number"],
+             "poster_url": (f"/api/v1/catalog/{poster_node_id}/images/poster" if available else None),
+             "poster_available": available}
+        )
     file_rows = connection.execute(
         """SELECT id, COALESCE(episode_title, title) AS title, title AS filename,
                   relative_path, extension, size_bytes, season_number,
@@ -298,7 +337,7 @@ def _item_select() -> str:
                      n.metadata_title, n.overview, n.year, n.genres AS genres_json,
                      (SELECT COUNT(*) FROM catalog_nodes s
                       WHERE s.parent_id=n.id AND s.kind='season' AND s.available=1) AS season_count,
-                     n.id AS metadata_node_id, n.poster_file
+                     n.id AS metadata_node_id, n.parent_id AS metadata_parent_id, n.poster_file
               FROM library_items li
               LEFT JOIN catalog_nodes n ON n.id=COALESCE(li.series_node_id, li.node_id)
               WHERE li.available=1"""
@@ -562,7 +601,7 @@ def list_items(
     parameters.extend((limit, offset))
     with closing(database()) as connection:
         rows = connection.execute(sql, parameters).fetchall()
-    return [item_from_row(row) for row in rows]
+        return [item_from_row(row, connection) for row in rows]
 
 
 @app.get("/api/v1/items/{item_id}", response_model=LibraryItem)
@@ -572,9 +611,9 @@ def get_item(item_id: str) -> LibraryItem:
             _item_select().replace("WHERE li.available=1", "WHERE li.available=1 AND li.id=?"),
             (item_id,),
         ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Item not found")
-    return item_from_row(row)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Item not found")
+        return item_from_row(row, connection)
 
 
 @app.get("/api/v1/catalog")
@@ -604,6 +643,25 @@ def list_catalog(
                 (library,),
             ).fetchall()
         return [_node_payload(row, connection) for row in rows]
+
+
+@app.get("/api/v1/genres")
+def list_genres() -> list[str]:
+    with closing(database()) as connection:
+        rows = connection.execute(
+            "SELECT genres FROM catalog_nodes WHERE available=1 AND genres!='[]'"
+        ).fetchall()
+    genres: dict[str, str] = {}
+    for row in rows:
+        try:
+            values = json.loads(row["genres"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        for value in values if isinstance(values, list) else []:
+            if isinstance(value, str) and value.strip():
+                genre = value.strip()
+                genres.setdefault(genre.casefold(), genre)
+    return sorted(genres.values(), key=str.casefold)
 
 
 @app.get("/api/v1/catalog/{node_id}")
