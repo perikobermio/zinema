@@ -176,6 +176,15 @@ public class MainActivity extends Activity {
         return view;
     }
 
+    TextView labelRaw(String text, int size, int color, boolean bold) {
+        TextView view = new TextView(this);
+        view.setText(text);
+        view.setTextSize(size);
+        view.setTextColor(color);
+        if (bold) view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        return view;
+    }
+
     TextView navAction(String glyph, String hint, View.OnClickListener onClick) {
         TextView view = label(glyph, 23, Color.WHITE, true);
         view.setContentDescription(t(hint));
@@ -331,7 +340,7 @@ public class MainActivity extends Activity {
 
     String displayTitle(JSONObject node) {
         String title = node.optString("display_title", node.optString("title", "Zinema"));
-        if (node.optString("kind").equals("season")) return "Temporada " + String.format("%02d", node.optInt("season_number"));
+        if (node.optString("kind").equals("season")) return t("Temporada") + " " + String.format("%02d", node.optInt("season_number"));
         return title;
     }
 
@@ -409,7 +418,7 @@ public class MainActivity extends Activity {
         }
         LinearLayout.LayoutParams ap = new LinearLayout.LayoutParams(width, d(204));
         card.addView(art, ap);
-        TextView name = label(displayTitle(node), 13, Color.WHITE, true);
+        TextView name = labelRaw(displayTitle(node), 13, Color.WHITE, true);
         name.setMaxLines(2);
         name.setPadding(d(2), d(7), d(2), 0);
         card.addView(name, new LinearLayout.LayoutParams(width, -2));
@@ -456,13 +465,13 @@ public class MainActivity extends Activity {
                     if (child != null && "season".equals(child.optString("kind"))) seasons++;
                 }
             }
-            return seasons + (seasons == 1 ? " temporada" : " temporadas");
+            return seasons + (seasons == 1 ? " " + t("temporada") : " " + t("temporadas"));
         }
-        if (kind.equals("season")) return "Temporada " + String.format("%02d", node.optInt("season_number"));
+        if (kind.equals("season")) return t("Temporada") + " " + String.format("%02d", node.optInt("season_number"));
         JSONArray genres = node.optJSONArray("genres");
         if (kind.equals("collection")) {
             int count = node.optInt("item_count");
-            String countLabel = count + (count == 1 ? " título" : " títulos");
+            String countLabel = count + (count == 1 ? " " + t("título") : " " + t("títulos"));
             if (genres == null || genres.length() == 0) return countLabel;
             List<String> shown = new ArrayList<>();
             for (int i = 0; i < Math.min(2, genres.length()); i++) shown.add(genres.optString(i));
@@ -1045,7 +1054,7 @@ public class MainActivity extends Activity {
         scroll.addView(form);
         content.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
         form.addView(label("Metadata manual", 23, Color.WHITE, true));
-        TextView subtitle = label(displayTitle(node) + " · " + node.optString("kind"), 13, MUTED, false);
+        TextView subtitle = labelRaw(displayTitle(node) + " · " + kindLabel(node.optString("kind")), 13, MUTED, false);
         subtitle.setPadding(0, d(4), 0, d(14));
         form.addView(subtitle);
 
@@ -1096,7 +1105,7 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     addGenreValues(genreOptions, importedGenres);
                     addGenreValues(genreOptions, new JSONArray(selectedGenres));
-                    genres.setText("Seleccionar géneros (" + selectedGenres.size() + ")");
+                    genres.setText(genrePickerText(selectedGenres.size()));
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> Toast.makeText(this,
@@ -1119,7 +1128,7 @@ public class MainActivity extends Activity {
             if (!path.isEmpty()) loadImage("https://image.tmdb.org/t/p/w342" + path, poster, false);
             String candidateLabel = candidate.optString("title", "Título") +
                     (candidate.isNull("year") ? "" : " (" + candidate.optString("year") + ")");
-            TextView candidateName = label(candidateLabel, 11, Color.WHITE, false);
+            TextView candidateName = labelRaw(candidateLabel, 11, Color.WHITE, false);
             candidateName.setMaxLines(2);
             card.addView(candidateName, new LinearLayout.LayoutParams(d(102), -2));
             card.setOnClickListener(v -> selectMetadataCandidate(node, candidate, title, year,
@@ -1249,7 +1258,7 @@ public class MainActivity extends Activity {
                     selectedGenres.clear();
                     addGenreValues(selectedGenres, values);
                     addGenreValues(genreOptions, values);
-                    genres.setText("Seleccionar géneros (" + selectedGenres.size() + ")");
+                    genres.setText(genrePickerText(selectedGenres.size()));
                     overview.setText(detail.optString("overview", ""));
                     showMetadataEditorWithSelection(node, selectedTmdbId[0], detail, title,
                             year, genres, genreOptions, selectedGenres, overview,
@@ -1428,15 +1437,15 @@ public class MainActivity extends Activity {
         info.setOrientation(LinearLayout.VERTICAL);
         info.setGravity(Gravity.BOTTOM);
         info.setPadding(d(24), d(26), d(24), d(24));
-        TextView kind = label(node.optString("kind", "").toUpperCase(), 11, 0xFFFF646B, true);
+        TextView kind = label(kindLabel(node.optString("kind")), 11, 0xFFFF646B, true);
         kind.setLetterSpacing(0.12f);
         info.addView(kind);
         if (isNodeSeen(node)) {
-            TextView watched = label("✓  VISTO", 11, 0xFF79E3B7, true);
+            TextView watched = label("✓  " + t("VISTO"), 11, 0xFF79E3B7, true);
             watched.setPadding(0, d(5), 0, 0);
             info.addView(watched);
         }
-        info.addView(label(displayTitle(node), 30, Color.WHITE, true));
+        info.addView(labelRaw(displayTitle(node), 30, Color.WHITE, true));
         String meta = node.optString("kind").equals("series")
                 ? cardSubtitle(node)
                 : node.optString("year", "") + (node.optJSONArray("genres") == null ? "" : "   •   " + join(node.optJSONArray("genres")));
@@ -1444,7 +1453,7 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams mp = new LinearLayout.LayoutParams(-1, -2);
         mp.topMargin = d(5);
         info.addView(metadata, mp);
-        TextView overview = label(node.optString("overview", ""), 14, 0xFFE0E1E6, false);
+        TextView overview = labelRaw(node.optString("overview", ""), 14, 0xFFE0E1E6, false);
         overview.setMaxLines(4);
         LinearLayout.LayoutParams op = new LinearLayout.LayoutParams(-1, -2);
         op.topMargin = d(10);
@@ -1455,7 +1464,7 @@ public class MainActivity extends Activity {
         Button play = actionButton(node.optString("kind").equals("series") ? "Ver episodios" : "Reproducir", true);
         controls.addView(play, new LinearLayout.LayoutParams(-2, d(44)));
         if ("movie".equals(node.optString("kind")) && files != null && files.length() > 0) {
-            Button details = actionButton("ⓘ  Details", false);
+            Button details = actionButton("ⓘ  " + t("Details"), false);
             LinearLayout.LayoutParams detailsParams = new LinearLayout.LayoutParams(-2, d(44));
             detailsParams.leftMargin = d(8);
             controls.addView(details, detailsParams);
@@ -1536,6 +1545,16 @@ public class MainActivity extends Activity {
         }
     }
 
+    String kindLabel(String kind) {
+        if ("eu".equals(prefs.getString("language", "es"))) {
+            if ("movie".equals(kind)) return "FILMA";
+            if ("series".equals(kind)) return "TELESAILA";
+            if ("season".equals(kind)) return "DENBORALDIA";
+            if ("collection".equals(kind)) return "BILDUMA";
+        }
+        return kind == null ? "" : kind.toUpperCase(java.util.Locale.ROOT);
+    }
+
     String t(String text) {
         if (text == null || prefs == null || !"eu".equals(prefs.getString("language", "es"))) return text;
         switch (text) {
@@ -1583,6 +1602,37 @@ public class MainActivity extends Activity {
             case "Cerrar": return "Itxi";
             case "Selecciona para continuar": return "Hautatu jarraitzeko";
             case "No se encontraron episodios.": return "Ez da atalik aurkitu.";
+            case "temporada": return "denboraldi";
+            case "temporadas": return "denboraldi";
+            case "título": return "izenburu";
+            case "títulos": return "izenburu";
+            case "VISTO": return "IKUSITA";
+            case "CONTINUAR": return "JARRAITU";
+            case "Tu biblioteca está vacía. Sincroniza el catálogo en el servidor.":
+                return "Zure liburutegia hutsik dago. Sinkronizatu katalogoa zerbitzarian.";
+            case "Explora tu biblioteca": return "Arakatu zure liburutegia";
+            case "No hay títulos en esta sección.": return "Atal honetan ez dago izenbururik.";
+            case "Cargando catálogo…": return "Katalogoa kargatzen…";
+            case "Cargando ficha…": return "Fitxa kargatzen…";
+            case "Conectando con tu biblioteca…": return "Zure liburutegira konektatzen…";
+            case "Buscar coincidencias en TMDb…": return "TMDb-n bat-etortzeak bilatzen…";
+            case "Coincidencias TMDb · selecciona para validar": return "TMDb-ko bat-etortzeak · hautatu egiaztatzeko";
+            case "Imágenes online · selecciona una miniatura": return "Sareko irudiak · hautatu miniatura bat";
+            case "No hay imágenes disponibles para esta búsqueda.": return "Ez dago irudirik bilaketa honetarako.";
+            case "Horizontal": return "Horizontala";
+            case "Póster": return "Posterra";
+            case "Miniatura seleccionada.": return "Miniatura hautatuta.";
+            case "El título no puede estar vacío.": return "Izenburua ezin da hutsik egon.";
+            case "Revisa el año introducido.": return "Egiaztatu sartutako urtea.";
+            case "Guardando metadata…": return "Metadatuak gordetzen…";
+            case "Detalles": return "Xehetasunak";
+            case "Details": return "Xehetasunak";
+            case "Nombre:": return "Izena:";
+            case "Extensión:": return "Luzapena:";
+            case "Tamaño:": return "Tamaina:";
+            case "Ruta:": return "Bidea:";
+            case "Biblioteca:": return "Liburutegia:";
+            case "Modificado:": return "Aldatuta:";
             case "Sin género disponible": return "Generorik ez dago";
             case "Encuentra películas, series y episodios": return "Bilatu filmak, telesailak eta atalak";
             case "Resultados": return "Emaitzak";
@@ -1611,6 +1661,21 @@ public class MainActivity extends Activity {
             case "No hay un vídeo disponible.": return "Ez dago bideorik.";
             case "No se encontraron coincidencias. Puedes completar los campos manualmente.":
                 return "Ez da bat-etortzerik aurkitu. Eremuak eskuz bete ditzakezu.";
+            case "Buscando coincidencias en TMDb…": return "TMDb-n bat-etortzeak bilatzen…";
+            case "No encontramos resultados para": return "Ez dugu emaitzarik aurkitu honentzat";
+            case "No se encontraron coincidencias.": return "Ez da bat-etortzerik aurkitu.";
+            case "No pudimos cargar la lista de géneros.": return "Ezin izan da generoen zerrenda kargatu.";
+            case "Cargando coincidencia…": return "Bat-etortzea kargatzen…";
+            case "Buscando imágenes…": return "Irudiak bilatzen…";
+            case "No se pudo cargar la coincidencia": return "Ezin izan da bat-etortzea kargatu";
+            case "No se pudieron buscar imágenes": return "Ezin izan dira irudiak bilatu";
+            case "El elemento ya no existe en el catálogo. Resincroniza el catálogo e inténtalo de nuevo.":
+                return "Elementua ez dago katalogoan. Sinkronizatu katalogoa berriro eta saiatu.";
+            case "No se pudo guardar": return "Ezin izan da gorde";
+            case "Metadata guardada y cliente actualizado.": return "Metadatuak gorde dira eta bezeroa eguneratu da.";
+            case "Añadido a Mi lista": return "Nire zerrendara gehituta";
+            case "Eliminado de Mi lista": return "Nire zerrendatik kenduta";
+            case "Servidor actual": return "Uneko zerbitzaria";
             default: return text;
         }
     }
@@ -1645,12 +1710,12 @@ public class MainActivity extends Activity {
             text.setOrientation(LinearLayout.VERTICAL);
             text.setGravity(Gravity.BOTTOM);
             text.setPadding(d(12), d(10), d(12), d(10));
-            TextView name = label(member.optString("name"), 14, Color.WHITE, true);
+            TextView name = labelRaw(member.optString("name"), 14, Color.WHITE, true);
             name.setMaxLines(2);
             text.addView(name);
             String character = member.optString("character", "").trim();
             if (!character.isEmpty()) {
-                TextView role = label(character, 12, MUTED, false);
+                TextView role = labelRaw(character, 12, MUTED, false);
                 role.setMaxLines(2);
                 LinearLayout.LayoutParams roleParams = new LinearLayout.LayoutParams(-1, -2);
                 roleParams.topMargin = d(5);
@@ -1692,13 +1757,13 @@ public class MainActivity extends Activity {
         long bytes = file.optLong("size_bytes", 0);
         String modified = file.optString("modified_at", "");
         StringBuilder message = new StringBuilder();
-        message.append("Nombre: ").append(filename)
-                .append("\nTítulo: ").append(file.optString("title", ""))
-                .append("\nExtensión: ").append(extension.isEmpty() ? "—" : extension)
-                .append("\nTamaño: ").append(formatDetailedSize(bytes))
-                .append("\nRuta: ").append(file.optString("relative_path", "—"))
-                .append("\nBiblioteca: ").append(library.isEmpty() ? "—" : library);
-        if (!modified.isEmpty()) message.append("\nModificado: ").append(modified);
+        message.append(t("Nombre:")).append(" ").append(filename)
+                .append("\n").append(t("Título")).append(": ").append(file.optString("title", ""))
+                .append("\n").append(t("Extensión:")).append(" ").append(extension.isEmpty() ? "—" : extension)
+                .append("\n").append(t("Tamaño:")).append(" ").append(formatDetailedSize(bytes))
+                .append("\n").append(t("Ruta:")).append(" ").append(file.optString("relative_path", "—"))
+                .append("\n").append(t("Biblioteca:")).append(" ").append(library.isEmpty() ? "—" : library);
+        if (!modified.isEmpty()) message.append("\n").append(t("Modificado:")).append(" ").append(modified);
         new AlertDialog.Builder(this).setTitle(t("Detalles del archivo"))
                 .setMessage(message.toString()).setPositiveButton(t("Cerrar"), null).show();
     }
@@ -1726,7 +1791,7 @@ public class MainActivity extends Activity {
             item.addView(play, new LinearLayout.LayoutParams(d(48), d(48)));
             LinearLayout texts = new LinearLayout(this);
             texts.setOrientation(LinearLayout.VERTICAL);
-            TextView name = label(file.optString("title", "Vídeo"), 15, Color.WHITE, true);
+            TextView name = labelRaw(file.optString("title", "Vídeo"), 15, Color.WHITE, true);
             String watched = isMediaSeen(file) ? "   ·   ✓ VISTO" : "";
             TextView sub = label(file.optString("extension", "").replace(".", "").toUpperCase() + "   ·   " + formatSize(file.optLong("size_bytes")) + watched,
                     12, isMediaSeen(file) ? 0xFF79E3B7 : MUTED, false);
@@ -1847,7 +1912,7 @@ public class MainActivity extends Activity {
         LinearLayout textBox = new LinearLayout(this);
         textBox.setOrientation(LinearLayout.VERTICAL);
         textBox.setPadding(d(12), 0, d(8), 0);
-        textBox.addView(label(result.optString("metadata_title", result.optString("title", "Vídeo")), 15, Color.WHITE, true));
+        textBox.addView(labelRaw(result.optString("metadata_title", result.optString("title", "Vídeo")), 15, Color.WHITE, true));
         TextView detail = label(searchSubtitle(result) + "   ·   " + result.optString("extension", "").replace(".", "").toUpperCase(), 12, MUTED, false);
         if (isMediaSeen(result)) detail.setText(detail.getText() + "   ·   ✓ VISTO");
         LinearLayout.LayoutParams detailP = new LinearLayout.LayoutParams(-1, -2);
@@ -1886,7 +1951,7 @@ public class MainActivity extends Activity {
     String searchSubtitle(JSONObject result) {
         if (!result.optString("series_id").isEmpty()) {
             int seasons = result.optInt("season_count");
-            return seasons + (seasons == 1 ? " temporada" : " temporadas");
+            return seasons + (seasons == 1 ? " " + t("temporada") : " " + t("temporadas"));
         }
         JSONArray genres = result.optJSONArray("genres");
         if (genres != null && genres.length() > 0) return join(genres);
@@ -1950,7 +2015,7 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams saveP = new LinearLayout.LayoutParams(0, d(48), 1);
         saveP.leftMargin = d(9);
         connectButtons.addView(save, saveP);
-        TextView status = label("Servidor actual: " + serverName, 12, MUTED, false);
+        TextView status = label(t("Servidor actual") + ": " + serverName, 12, MUTED, false);
         LinearLayout.LayoutParams statusP = new LinearLayout.LayoutParams(-1, -2);
         statusP.topMargin = d(12);
         serverCard.addView(status, statusP);
@@ -2147,9 +2212,9 @@ public class MainActivity extends Activity {
             details.setOrientation(LinearLayout.VERTICAL);
             details.setGravity(Gravity.BOTTOM);
             details.setPadding(d(14), d(12), d(14), d(12));
-            details.addView(label("▶  CONTINUAR · " + formatTime(item.optInt("position")),
+            details.addView(label("▶  " + t("CONTINUAR") + " · " + formatTime(item.optInt("position")),
                     10, 0xFFFF858A, true));
-            TextView name = label(item.optString("title", "Vídeo"), 14, Color.WHITE, true);
+            TextView name = labelRaw(item.optString("title", "Vídeo"), 14, Color.WHITE, true);
             name.setMaxLines(2);
             LinearLayout.LayoutParams nameParams = new LinearLayout.LayoutParams(-1, -2);
             nameParams.topMargin = d(5);
