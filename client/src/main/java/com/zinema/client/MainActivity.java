@@ -1523,7 +1523,7 @@ public class MainActivity extends Activity {
                 text.addView(role, roleParams);
             }
             card.addView(text, new FrameLayout.LayoutParams(-1, -1));
-            LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(d(164), d(112));
+            LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(d(152), d(228));
             cardParams.setMargins(0, 0, d(8), 0);
             cards.addView(card, cardParams);
         }
