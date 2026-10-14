@@ -62,11 +62,19 @@ public class MainActivity extends Activity {
     LinearLayout page;
     LinearLayout content;
     TextView backButton;
+    TextView brandButton;
+    TextView searchButton;
+    TextView settingsButton;
+    HorizontalScrollView navScroll;
     String server;
     String currentLibrary = "movies";
+    String lastSearchQuery;
     String detailNodeId = "";
     boolean libraryMode;
     boolean showingDetail;
+    boolean metadataEditorFromDetail;
+    boolean metadataEditorMode;
+    boolean metadataEditorPreviousBackVisible;
     List<JSONObject> movies = new ArrayList<>();
     List<JSONObject> series = new ArrayList<>();
     final List<JSONObject> breadcrumbs = new ArrayList<>();
@@ -106,19 +114,19 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(d(36), d(42));
         backParams.rightMargin = d(8);
         bar.addView(backButton, backParams);
-        TextView brand = label("ZINEMA", 22, Color.WHITE, true);
-        brand.setLetterSpacing(0.12f);
-        brand.setOnClickListener(v -> loadHome());
-        bar.addView(brand, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView search = navAction("⌕", "Buscar", v -> showSearch());
-        bar.addView(search);
-        TextView settings = navAction("⚙", "Servidor", v -> showSettings());
+        brandButton = label("ZINEMA", 22, Color.WHITE, true);
+        brandButton.setLetterSpacing(0.12f);
+        brandButton.setOnClickListener(v -> loadHome());
+        bar.addView(brandButton, new LinearLayout.LayoutParams(0, -2, 1));
+        searchButton = navAction("⌕", "Buscar", v -> showSearch());
+        bar.addView(searchButton);
+        settingsButton = navAction("⚙", "Servidor", v -> showSettings());
         LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(-2, -2);
         sp.leftMargin = d(20);
-        bar.addView(settings, sp);
+        bar.addView(settingsButton, sp);
         page.addView(bar, new LinearLayout.LayoutParams(-1, d(58)));
 
-        HorizontalScrollView navScroll = new HorizontalScrollView(this);
+        navScroll = new HorizontalScrollView(this);
         navScroll.setHorizontalScrollBarEnabled(false);
         LinearLayout nav = new LinearLayout(this);
         nav.setPadding(d(16), 0, d(16), d(8));
@@ -573,51 +581,327 @@ public class MainActivity extends Activity {
         return new JSONObject(body);
     }
 
+    JSONObject postJson(String path, JSONObject payload) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(server + path).openConnection();
+        connection.setRequestMethod("POST");
+        connection.setConnectTimeout(12000);
+        connection.setReadTimeout(45000);
+        connection.setDoOutput(true);
+        connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+        connection.getOutputStream().write(payload.toString().getBytes(StandardCharsets.UTF_8));
+        int status = connection.getResponseCode();
+        InputStream input = status < 400 ? connection.getInputStream() : connection.getErrorStream();
+        String body = readText(input);
+        connection.disconnect();
+        if (status < 200 || status >= 300) {
+            String detail = "";
+            try { detail = new JSONObject(body).optString("detail", ""); }
+            catch (JSONException ignored) { }
+            throw new Exception(detail.isEmpty() ? "HTTP " + status : detail);
+        }
+        return new JSONObject(body);
+    }
+
     void showActions(JSONObject node) {
+        List<String> actions = new ArrayList<>();
+        List<Runnable> handlers = new ArrayList<>();
+        String kind = node.optString("kind");
+        if (kind.equals("movie") || kind.equals("series")) {
+            actions.add("Reintentar metadata (TMDb)");
+            handlers.add(() -> retryMetadata(node));
+        }
+        actions.add("Metadata manual");
+        handlers.add(() -> showMetadataEditor(node, new JSONArray()));
         new AlertDialog.Builder(this)
                 .setTitle("Acciones")
-                .setItems(new String[]{"Reintentar obtención de metadata"}, (dialog, which) -> retryMetadata(node))
+                .setItems(actions.toArray(new String[0]), (dialog, which) -> handlers.get(which).run())
                 .show();
     }
 
     void retryMetadata(JSONObject node) {
         String nodeId = node.optString("id");
         if (nodeId.isEmpty()) return;
+        showLoading("Buscando coincidencias en TMDb…");
         io.execute(() -> {
             try {
-                JSONObject result = postJson("/api/v1/catalog/" + enc(nodeId) + "/metadata/retry");
-                int items = result.optInt("items", 1);
-                String jobId = result.optString("id");
-                runOnUiThread(() -> Toast.makeText(this,
-                        "Reintento iniciado para " + items + (items == 1 ? " elemento" : " elementos") +
-                                ". Te avisaremos al terminar.", Toast.LENGTH_LONG).show());
-                for (int attempt = 0; attempt < 300; attempt++) {
-                    JSONObject status = getJson("/api/v1/catalog/metadata/retry/" + enc(jobId));
-                    if ("completed".equals(status.optString("status"))) {
-                        imageCache.evictAll();
-                        runOnUiThread(() -> finishMetadataRetry(nodeId));
-                        return;
-                    }
-                    if ("failed".equals(status.optString("status"))) {
-                        String error = status.optString("error", "Fallo al consultar TMDb");
-                        runOnUiThread(() -> Toast.makeText(this, "Falló el reintento: " + error,
-                                Toast.LENGTH_LONG).show());
-                        return;
-                    }
-                    Thread.sleep(2000);
-                }
-                runOnUiThread(() -> Toast.makeText(this,
-                        "El reintento sigue en curso. Consulta el servidor más tarde.", Toast.LENGTH_LONG).show());
+                JSONObject result = postJson("/api/v1/catalog/" + enc(nodeId) + "/metadata/candidates");
+                JSONArray candidates = result.optJSONArray("candidates");
+                runOnUiThread(() -> showMetadataEditor(node,
+                        candidates == null ? new JSONArray() : candidates));
             } catch (Exception e) {
-                runOnUiThread(() -> Toast.makeText(this, "No se pudo reintentar: " + e.getMessage(),
+                runOnUiThread(() -> {
+                    showMetadataEditor(node, new JSONArray());
+                    String message = e.getMessage() == null ? "Error desconocido" : e.getMessage();
+                    if (message.contains("Metadata was recently requested")) {
+                        message = "Ya se buscó hace poco. Espera un minuto antes de volver a intentarlo.";
+                    }
+                    Toast.makeText(this, "No se pudieron buscar coincidencias: " + message,
+                            Toast.LENGTH_LONG).show();
+                });
+            }
+        });
+    }
+
+    EditText metadataField(String value, String hint, boolean multiline) {
+        EditText field = new EditText(this);
+        field.setTextColor(Color.WHITE);
+        field.setHintTextColor(MUTED);
+        field.setHint(hint);
+        field.setText(value);
+        field.setSingleLine(!multiline);
+        if (multiline) {
+            field.setMinLines(3);
+            field.setGravity(Gravity.TOP | Gravity.LEFT);
+        }
+        field.setPadding(d(12), d(10), d(12), d(10));
+        field.setBackground(round(PANEL, d(8)));
+        return field;
+    }
+
+    void showMetadataEditor(JSONObject node, JSONArray candidates) {
+        metadataEditorFromDetail = showingDetail;
+        showingDetail = false;
+        setMetadataEditorChrome(true);
+        content.removeAllViews();
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(d(18), d(8), d(18), d(30));
+        scroll.addView(form);
+        content.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
+        form.addView(label("Metadata manual", 23, Color.WHITE, true));
+        TextView subtitle = label(displayTitle(node) + " · " + node.optString("kind"), 13, MUTED, false);
+        subtitle.setPadding(0, d(4), 0, d(14));
+        form.addView(subtitle);
+
+        EditText title = metadataField(node.optString("display_title", node.optString("title", "")), "Título", false);
+        EditText year = metadataField(node.isNull("year") ? "" : node.optString("year"), "Año", false);
+        EditText genres = metadataField(join(node.optJSONArray("genres")), "Géneros separados por coma", false);
+        EditText overview = metadataField(node.optString("overview", ""), "Sinopsis", true);
+        form.addView(title, fieldMargins());
+        form.addView(year, fieldMargins());
+        form.addView(genres, fieldMargins());
+        form.addView(overview, fieldMargins());
+
+        long[] selectedTmdbId = {node.optLong("tmdb_id", 0)};
+        String[] selectedImagePath = {null};
+        String[] selectedImageType = {"poster"};
+        LinearLayout candidateGallery = new LinearLayout(this);
+        HorizontalScrollView candidateScroller = new HorizontalScrollView(this);
+        candidateScroller.setHorizontalScrollBarEnabled(false);
+        candidateScroller.addView(candidateGallery);
+        LinearLayout imageGallery = new LinearLayout(this);
+        HorizontalScrollView imageScroller = new HorizontalScrollView(this);
+        imageScroller.setHorizontalScrollBarEnabled(false);
+        imageScroller.addView(imageGallery);
+        form.addView(label("Coincidencias TMDb · selecciona para validar", 16, Color.WHITE, true), fieldMargins());
+        form.addView(candidateScroller, new LinearLayout.LayoutParams(-1, d(195)));
+        form.addView(label("Imágenes online · selecciona una miniatura", 16, Color.WHITE, true), fieldMargins());
+        form.addView(imageScroller, new LinearLayout.LayoutParams(-1, d(174)));
+
+        Button searchImages = actionButton("Buscar imágenes", false);
+        form.addView(searchImages, fieldMargins());
+        searchImages.setOnClickListener(v -> searchMetadataImages(node, title.getText().toString(),
+                selectedTmdbId[0], imageGallery, selectedImagePath, selectedImageType));
+        Button save = actionButton("Guardar metadata", true);
+        LinearLayout.LayoutParams saveParams = fieldMargins();
+        saveParams.topMargin = d(14);
+        form.addView(save, saveParams);
+        save.setOnClickListener(v -> saveMetadata(node, title, year, genres, overview,
+                selectedTmdbId[0], selectedImagePath[0], selectedImageType[0]));
+
+        candidateGallery.removeAllViews();
+        for (int i = 0; i < candidates.length(); i++) {
+            JSONObject candidate = candidates.optJSONObject(i);
+            if (candidate == null) continue;
+            LinearLayout card = new LinearLayout(this);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(d(4), d(4), d(10), d(4));
+            ImageView poster = new ImageView(this);
+            poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            poster.setBackground(round(PANEL, d(7)));
+            card.addView(poster, new LinearLayout.LayoutParams(d(102), d(142)));
+            String path = candidate.optString("poster_path", "");
+            if (!path.isEmpty()) loadImage("https://image.tmdb.org/t/p/w342" + path, poster, false);
+            String candidateLabel = candidate.optString("title", "Título") +
+                    (candidate.isNull("year") ? "" : " (" + candidate.optString("year") + ")");
+            TextView candidateName = label(candidateLabel, 11, Color.WHITE, false);
+            candidateName.setMaxLines(2);
+            card.addView(candidateName, new LinearLayout.LayoutParams(d(102), -2));
+            card.setOnClickListener(v -> selectMetadataCandidate(node, candidate, title, year,
+                    genres, overview, selectedTmdbId, selectedImagePath, selectedImageType,
+                    imageGallery));
+            candidateGallery.addView(card);
+        }
+        if (candidates.length() == 0) {
+            candidateGallery.addView(label("No se encontraron coincidencias. Puedes completar los campos manualmente.",
+                    13, MUTED, false));
+        }
+        searchMetadataImages(node, title.getText().toString(), selectedTmdbId[0],
+                imageGallery, selectedImagePath, selectedImageType);
+    }
+
+    void setMetadataEditorChrome(boolean visible) {
+        if (backButton != null) {
+            if (visible && !metadataEditorMode) {
+                metadataEditorPreviousBackVisible = backButton.getVisibility() == View.VISIBLE;
+            }
+            backButton.setVisibility(visible || metadataEditorPreviousBackVisible ? View.VISIBLE : View.GONE);
+        }
+        int menuVisibility = visible ? View.GONE : View.VISIBLE;
+        if (brandButton != null) brandButton.setVisibility(menuVisibility);
+        if (searchButton != null) searchButton.setVisibility(menuVisibility);
+        if (settingsButton != null) settingsButton.setVisibility(menuVisibility);
+        if (navScroll != null) navScroll.setVisibility(menuVisibility);
+        metadataEditorMode = visible;
+    }
+
+    LinearLayout.LayoutParams fieldMargins() {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+        params.bottomMargin = d(9);
+        return params;
+    }
+
+    void selectMetadataCandidate(JSONObject node, JSONObject candidate, EditText title,
+                                 EditText year, EditText genres, EditText overview,
+                                 long[] selectedTmdbId, String[] selectedImagePath,
+                                 String[] selectedImageType, LinearLayout imageGallery) {
+        long tmdbId = candidate.optLong("tmdb_id", 0);
+        if (tmdbId <= 0) return;
+        Toast.makeText(this, "Cargando coincidencia…", Toast.LENGTH_SHORT).show();
+        io.execute(() -> {
+            try {
+                JSONObject detail = getJson("/api/v1/catalog/" + enc(node.optString("id")) +
+                        "/metadata/candidate/" + tmdbId);
+                runOnUiThread(() -> {
+                    selectedTmdbId[0] = tmdbId;
+                    selectedImagePath[0] = detail.optString("poster_path", null);
+                    selectedImageType[0] = "poster";
+                    title.setText(detail.optString("metadata_title", ""));
+                    year.setText(detail.isNull("year") ? "" : detail.optString("year"));
+                    JSONArray values = detail.optJSONArray("genres");
+                    genres.setText(values == null ? "" : join(values));
+                    overview.setText(detail.optString("overview", ""));
+                    showMetadataEditorWithSelection(node, selectedTmdbId[0], detail, title,
+                            year, genres, overview, selectedImagePath, selectedImageType, imageGallery);
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(this, "No se pudo cargar la coincidencia: " + e.getMessage(),
                         Toast.LENGTH_LONG).show());
             }
         });
     }
 
-    void finishMetadataRetry(String requestedNodeId) {
-        Toast.makeText(this, "Metadata actualizada.", Toast.LENGTH_SHORT).show();
-        if (showingDetail && requestedNodeId.equals(detailNodeId)) {
+    void showMetadataEditorWithSelection(JSONObject node, long tmdbId, JSONObject detail,
+                                         EditText title, EditText year, EditText genres,
+                                         EditText overview, String[] selectedImagePath,
+                                         String[] selectedImageType, LinearLayout imageGallery) {
+        // The editor stays visible while the selected match supplies its image choices.
+        imageCache.evictAll();
+        searchMetadataImages(node, title.getText().toString(), tmdbId,
+                imageGallery, selectedImagePath, selectedImageType);
+    }
+
+    void searchMetadataImages(JSONObject node, String query, long tmdbId,
+                              LinearLayout gallery, String[] selectedPath, String[] selectedType) {
+        String nodeId = node.optString("id");
+        if (nodeId.isEmpty() || query.trim().isEmpty()) return;
+        gallery.removeAllViews();
+        gallery.addView(label("Buscando imágenes…", 13, MUTED, false));
+        io.execute(() -> {
+            try {
+                String path = "/api/v1/catalog/" + enc(nodeId) + "/metadata/images?q=" + enc(query.trim());
+                if (tmdbId > 0) path += "&tmdb_id=" + tmdbId;
+                JSONArray images = getJson(path).optJSONArray("images");
+                runOnUiThread(() -> {
+                    gallery.removeAllViews();
+                    if (images == null || images.length() == 0) {
+                        gallery.addView(label("No hay imágenes disponibles para esta búsqueda.", 13, MUTED, false));
+                        return;
+                    }
+                    for (int i = 0; i < images.length(); i++) {
+                        JSONObject option = images.optJSONObject(i);
+                        if (option == null) continue;
+                        LinearLayout card = new LinearLayout(this);
+                        card.setOrientation(LinearLayout.VERTICAL);
+                        card.setPadding(d(4), d(4), d(8), d(4));
+                        ImageView image = new ImageView(this);
+                        image.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                        image.setBackground(round(PANEL, d(7)));
+                        card.addView(image, new LinearLayout.LayoutParams(d(104), d(138)));
+                        loadImage(option.optString("url", ""), image, false);
+                        TextView kind = label(option.optString("type", "poster").equals("backdrop")
+                                ? "Horizontal" : "Póster", 10, MUTED, false);
+                        card.addView(kind);
+                        card.setOnClickListener(v -> {
+                            selectedPath[0] = option.optString("path", null);
+                            selectedType[0] = option.optString("type", "poster");
+                            Toast.makeText(this, "Miniatura seleccionada.", Toast.LENGTH_SHORT).show();
+                        });
+                        gallery.addView(card);
+                    }
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    gallery.removeAllViews();
+                    String error = e.getMessage() == null ? "Error desconocido" : e.getMessage();
+                    if (error.contains("HTTP 404") && error.contains("Not Found")) {
+                        error = "El servidor del NAS aún no tiene la ruta de búsqueda de imágenes. " +
+                                "Actualiza el contenedor con: docker compose up --build -d";
+                    } else if (error.contains("Catalog node not found")) {
+                        error = "El elemento ya no existe en el catálogo. Resincroniza el catálogo e inténtalo de nuevo.";
+                    }
+                    gallery.addView(label("No se pudieron buscar imágenes: " + error, 12, MUTED, false));
+                });
+            }
+        });
+    }
+
+    void saveMetadata(JSONObject node, EditText title, EditText year, EditText genres,
+                      EditText overview, long tmdbId, String imagePath, String imageType) {
+        String itemTitle = title.getText().toString().trim();
+        if (itemTitle.isEmpty()) {
+            Toast.makeText(this, "El título no puede estar vacío.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        JSONObject payload = new JSONObject();
+        try {
+            payload.put("metadata_title", itemTitle);
+            payload.put("overview", overview.getText().toString());
+            payload.put("year", year.getText().toString().trim().isEmpty()
+                    ? JSONObject.NULL : Integer.parseInt(year.getText().toString().trim()));
+            JSONArray genreList = new JSONArray();
+            for (String genre : genres.getText().toString().split(",")) {
+                if (!genre.trim().isEmpty()) genreList.put(genre.trim());
+            }
+            payload.put("genres", genreList);
+            if (imagePath != null && !imagePath.isEmpty()) payload.put("image_path", imagePath);
+            payload.put("image_type", imageType == null ? "poster" : imageType);
+            if (tmdbId > 0) payload.put("tmdb_id", tmdbId);
+        } catch (JSONException | NumberFormatException e) {
+            Toast.makeText(this, "Revisa el año introducido.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String nodeId = node.optString("id");
+        showLoading("Guardando metadata…");
+        io.execute(() -> {
+            try {
+                postJson("/api/v1/catalog/" + enc(nodeId) + "/metadata/manual", payload);
+                imageCache.evictAll();
+                runOnUiThread(() -> finishMetadataRetry(nodeId, "Metadata guardada y cliente actualizado."));
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(this, "No se pudo guardar: " + e.getMessage(),
+                        Toast.LENGTH_LONG).show());
+            }
+        });
+    }
+
+    void finishMetadataRetry(String requestedNodeId, String summary) {
+        Toast.makeText(this, summary, Toast.LENGTH_LONG).show();
+        setMetadataEditorChrome(false);
+        if ((showingDetail || metadataEditorFromDetail) && requestedNodeId.equals(detailNodeId)) {
+            metadataEditorFromDetail = false;
             io.execute(() -> {
                 try {
                     JSONObject updated = getJson("/api/v1/catalog/" + enc(detailNodeId));
@@ -627,6 +911,8 @@ public class MainActivity extends Activity {
             });
         } else if (!showingDetail && !breadcrumbs.isEmpty()) {
             showCollectionContents(breadcrumbs.get(breadcrumbs.size() - 1));
+        } else if (!showingDetail && lastSearchQuery != null) {
+            performSearch(lastSearchQuery);
         } else if (!showingDetail && libraryMode) {
             openLibrary(currentLibrary);
         } else if (!showingDetail) {
@@ -774,6 +1060,7 @@ public class MainActivity extends Activity {
 
     void showSearch() {
         showingDetail = false;
+        lastSearchQuery = null;
         if (backButton != null) backButton.setVisibility(View.VISIBLE);
         content.removeAllViews();
         addSectionHeader("Buscar", "Encuentra películas, series y episodios");
@@ -803,6 +1090,7 @@ public class MainActivity extends Activity {
 
     void performSearch(String query) {
         if (query.trim().isEmpty()) return;
+        lastSearchQuery = query;
         ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(content.getWindowToken(), 0);
         showLoading("Buscando…");
         io.execute(() -> {
@@ -1039,6 +1327,19 @@ public class MainActivity extends Activity {
     }
 
     @Override public void onBackPressed() {
+        if (metadataEditorMode) {
+            setMetadataEditorChrome(false);
+        }
+        if (metadataEditorFromDetail) {
+            metadataEditorFromDetail = false;
+            io.execute(() -> {
+                try {
+                    JSONObject node = getJson("/api/v1/catalog/" + enc(detailNodeId));
+                    runOnUiThread(() -> renderDetail(node));
+                } catch (Exception e) { runOnUiThread(this::loadHome); }
+            });
+            return;
+        }
         if (showingDetail) {
             showingDetail = false;
             if (!breadcrumbs.isEmpty()) {

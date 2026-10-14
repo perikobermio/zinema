@@ -9,6 +9,9 @@ Cliente Android nativo conectado a la API pública de Zinema. La interfaz usa un
 - Navegar atrás con el botón visible en pantalla o con la tecla atrás del dispositivo.
 - Buscar en el catálogo del servidor.
 - Ver fichas con sinopsis, año, géneros e imágenes.
+- Editar metadata manualmente y escoger una miniatura entre hasta diez imágenes encontradas en TMDb.
+- Validar las coincidencias encontradas por TMDb antes de guardarlas.
+- Mostrar el título de cada episodio cuando TMDb lo proporciona; si no, mostrar el nombre del archivo.
 - Guardar títulos en «Mi lista» y conservar el progreso local para continuar viendo.
 - Reintentar la metadata desde el menú de tres puntos de cada tarjeta o ficha.
 - Reproducir el contenido del NAS con los controles nativos de Android.

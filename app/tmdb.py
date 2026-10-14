@@ -149,31 +149,52 @@ def _write_season_artwork(connection: sqlite3.Connection, node: sqlite3.Row, det
         "ORDER BY CASE WHEN season_number=0 THEN 1 ELSE 0 END, season_number",
         (node["id"],),
     ).fetchall()
-    image_base, poster_size, _ = image_config
+    image_base, poster_size, backdrop_size = image_config
+    series_row = connection.execute(
+        "SELECT poster_file FROM catalog_nodes WHERE id=?", (node["id"],),
+    ).fetchone()
+    series_poster = series_row["poster_file"] if series_row else None
     first_available_poster = None
+    episode_metadata_ok = True
     for season in season_rows:
         season_number = int(season["season_number"] or 0)
         tmdb_season = seasons.get(season_number, {})
-        image_path = tmdb_season.get("poster_path")
-        if not image_path and not season["poster_file"]:
-            try:
-                season_details = _api_get(
-                    client, f"/tv/{int(details['id'])}/season/{season_number}",
-                    {"language": language}, api_key,
+        season_details = {}
+        try:
+            season_details = _api_get(
+                client, f"/tv/{int(details['id'])}/season/{season_number}",
+                {"language": language}, api_key,
+            )
+        except Exception:
+            episode_metadata_ok = False
+            pass
+        episodes = sorted(
+            season_details.get("episodes", []),
+            key=lambda episode: int(episode.get("episode_number") or 0),
+        )
+        for episode in episodes:
+            episode_number = episode.get("episode_number")
+            episode_title = (episode.get("name") or "").strip()
+            if episode_number is not None and episode_title:
+                connection.execute(
+                    """UPDATE library_items SET episode_title=?
+                       WHERE series_node_id=? AND season_number=? AND episode_number=?
+                         AND available=1""",
+                    (episode_title, node["id"], season_number, int(episode_number)),
                 )
-                episodes = sorted(
-                    season_details.get("episodes", []),
-                    key=lambda episode: int(episode.get("episode_number") or 0),
-                )
-                image_path = next((episode.get("still_path") for episode in episodes
-                                   if episode.get("still_path")), None)
-            except Exception:
-                image_path = None
+
+        image_path = (tmdb_season.get("poster_path") or season_details.get("poster_path"))
+        image_type = "poster"
+        if not image_path:
+            image_path = next((episode.get("still_path") for episode in episodes
+                               if episode.get("still_path")), None)
+            image_type = "backdrop"
         poster_file = None
-        if image_path:
+        if image_path and not season["poster_file"]:
             try:
                 poster_file = _save_image(
-                    client, image_base, poster_size, image_path,
+                    client, image_base,
+                    poster_size if image_type == "poster" else backdrop_size, image_path,
                     artwork_dir / f"{season['id']}-poster.jpg",
                 )
             except Exception:
@@ -184,7 +205,12 @@ def _write_season_artwork(connection: sqlite3.Connection, node: sqlite3.Row, det
                 (poster_file, season["id"]),
             )
         else:
-            poster_file = season["poster_file"]
+            poster_file = season["poster_file"] or series_poster
+            if not season["poster_file"] and series_poster:
+                connection.execute(
+                    "UPDATE catalog_nodes SET poster_file=? WHERE id=?",
+                    (series_poster, season["id"]),
+                )
         if first_available_poster is None and poster_file:
             first_available_poster = poster_file
     if first_available_poster:
@@ -192,12 +218,143 @@ def _write_season_artwork(connection: sqlite3.Connection, node: sqlite3.Row, det
             "UPDATE catalog_nodes SET poster_file=COALESCE(poster_file, ?) WHERE id=?",
             (first_available_poster, node["id"]),
         )
+    if episode_metadata_ok:
+        connection.execute(
+            "UPDATE catalog_nodes SET episode_metadata_checked_at=? WHERE id=?",
+            (datetime.now(timezone.utc).isoformat(), node["id"]),
+        )
 
 
 def _fetch_details(client: httpx.Client, kind: str, tmdb_id: int, language: str,
                    api_key: str = "") -> dict:
     return _api_get(client, f"/{kind}/{tmdb_id}",
                     {"language": language, "append_to_response": "external_ids"}, api_key)
+
+
+def _search_titles(client: httpx.Client, kind: str, title: str, source_year: int | None,
+                   language: str, api_key: str = "") -> list[dict]:
+    """Retry searches without a restrictive year and, when needed, in English."""
+    languages = [language]
+    if language.casefold() != "en-us":
+        languages.append("en-US")
+    results: dict[int, dict] = {}
+    for search_language in languages:
+        year_variants = [source_year, None] if source_year else [None]
+        for year in year_variants:
+            params: dict[str, object] = {
+                "query": title, "language": search_language, "include_adult": "false",
+            }
+            if year:
+                params["year" if kind == "movie" else "first_air_date_year"] = year
+            search = _api_get(client, f"/search/{kind}", params, api_key)
+            for result in search.get("results", []):
+                result_id = result.get("id")
+                if result_id is not None:
+                    results.setdefault(int(result_id), result)
+            if results:
+                return list(results.values())
+    return []
+
+
+def search_metadata_candidates(node: sqlite3.Row, access_token: str, language: str,
+                               api_key: str = "") -> list[dict]:
+    kind = "movie" if node["kind"] == "movie" else "tv"
+    title, source_year = _source_title(node["title"], node["source_year"])
+    headers = {"accept": "application/json"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    with httpx.Client(headers=headers, timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
+        results = _search_titles(client, kind, title, source_year, language, api_key)
+    candidates = []
+    for result in results:
+        candidate_title = result.get("title") or result.get("name") or ""
+        original = result.get("original_title") or result.get("original_name") or ""
+        date = result.get("release_date") or result.get("first_air_date")
+        candidates.append({
+            "tmdb_id": result.get("id"), "title": candidate_title,
+            "original_title": original,
+            "year": int(date[:4]) if date and len(date) >= 4 and date[:4].isdigit() else None,
+            "overview": result.get("overview") or "",
+            "poster_path": result.get("poster_path"),
+            "score": round(_match_score(title, candidate_title, original, source_year, date), 4),
+        })
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    return candidates[:10]
+
+
+def get_candidate_details(kind: str, tmdb_id: int, access_token: str,
+                          language: str, api_key: str = "") -> dict:
+    entity_kind = "movie" if kind == "movie" else "tv"
+    headers = {"accept": "application/json"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    with httpx.Client(headers=headers, timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
+        details = _fetch_details(client, entity_kind, tmdb_id, language, api_key)
+    release = details.get("release_date") if entity_kind == "movie" else details.get("first_air_date")
+    return {
+        "tmdb_id": int(details["id"]),
+        "metadata_title": details.get("title") or details.get("name") or "",
+        "overview": details.get("overview") or "",
+        "year": int(release[:4]) if release and len(release) >= 4 and release[:4].isdigit() else None,
+        "genres": [item["name"] for item in details.get("genres", []) if item.get("name")],
+        "poster_path": details.get("poster_path"),
+        "backdrop_path": details.get("backdrop_path"),
+    }
+
+
+def search_image_options(kind: str, query: str, access_token: str, language: str,
+                         api_key: str = "", tmdb_id: int | None = None,
+                         season_number: int | None = None) -> list[dict]:
+    entity_kind = "movie" if kind == "movie" else "tv"
+    headers = {"accept": "application/json"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    with httpx.Client(headers=headers, timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
+        base, poster_size, backdrop_size = _image_config(client, api_key)
+        results: list[dict] = []
+        if tmdb_id:
+            path = (f"/tv/{tmdb_id}/season/{season_number}/images" if season_number is not None
+                    else f"/{entity_kind}/{tmdb_id}/images")
+            images = _api_get(client, path, {
+                "language": language,
+                "include_image_language": f"{language.split('-')[0]},en,null",
+            }, api_key)
+            if season_number is not None:
+                groups = [("poster", images.get("posters", []))]
+            else:
+                groups = [("poster", images.get("posters", [])),
+                          ("backdrop", images.get("backdrops", []))]
+            for image_type, values in groups:
+                for item in values:
+                    file_path = item.get("file_path")
+                    if not file_path:
+                        continue
+                    size = poster_size if image_type == "poster" else backdrop_size
+                    results.append({
+                        "path": file_path, "type": image_type,
+                        "url": f"{base.rstrip('/')}/{size}/{quote(file_path.lstrip('/'), safe='/')}",
+                        "width": item.get("width"), "height": item.get("height"),
+                        "score": item.get("vote_average") or 0,
+                    })
+        else:
+            title, source_year = _source_title(query, None)
+            search = _search_titles(client, entity_kind, title, source_year, language, api_key)
+            for item in search:
+                for image_type, file_path in (
+                    ("poster", item.get("poster_path")),
+                    ("backdrop", item.get("backdrop_path")),
+                ):
+                    if not file_path:
+                        continue
+                    size = poster_size if image_type == "poster" else backdrop_size
+                    results.append({
+                        "path": file_path, "type": image_type,
+                        "url": f"{base.rstrip('/')}/{size}/{quote(file_path.lstrip('/'), safe='/')}",
+                        "width": None, "height": None,
+                        "score": item.get("vote_average") or 0,
+                    })
+        unique = {item["path"]: item for item in results}
+        return sorted(unique.values(), key=lambda item: item["score"], reverse=True)[:10]
 
 
 def enrich_pending(connection: sqlite3.Connection, access_token: str, language: str,
@@ -211,10 +368,13 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
     rows = connection.execute(
         """SELECT * FROM catalog_nodes
            WHERE available=1 AND kind IN ('movie', 'series')
+             AND COALESCE(metadata_source, '')!='manual'
              AND (? IS NULL OR id=?)
              AND (metadata_checked_at IS NULL
                   OR (metadata_status='error' AND metadata_checked_at < ?)
-                  OR (metadata_status!='error' AND metadata_checked_at < ?))
+                  OR (metadata_status!='error' AND metadata_checked_at < ?)
+                  OR (kind='series' AND tmdb_id IS NOT NULL
+                      AND episode_metadata_checked_at IS NULL))
            ORDER BY CASE WHEN tmdb_id IS NOT NULL THEN 1 ELSE 0 END, scanned_at
            LIMIT ?""",
         (node_id, node_id, error_cutoff, cutoff, batch_size),
@@ -241,12 +401,9 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
                     continue
 
                 title, source_year = _source_title(node["title"], node["source_year"])
-                params: dict[str, object] = {"query": title, "language": language, "include_adult": "false"}
-                if source_year:
-                    params["year" if kind == "movie" else "first_air_date_year"] = source_year
-                search = _api_get(client, f"/search/{kind}", params, api_key)
                 candidates = []
-                for result in search.get("results", [])[:10]:
+                for result in _search_titles(client, kind, title, source_year,
+                                             language, api_key)[:10]:
                     result_title = result.get("title") or result.get("name") or ""
                     original = result.get("original_title") or result.get("original_name") or ""
                     date = result.get("release_date") or result.get("first_air_date")

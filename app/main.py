@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -14,11 +15,14 @@ from typing import Annotated
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+import httpx
 from pydantic import BaseModel, Field
 from starlette.responses import FileResponse, Response, StreamingResponse
 
 from app.catalog import scan_catalog
-from app.tmdb import apply_tmdb_id, enrich_pending
+from app.tmdb import (apply_tmdb_id, enrich_pending, get_candidate_details,
+                      search_image_options, search_metadata_candidates,
+                      _image_config, _save_image)
 
 MEDIA_ROOTS = {
     "movies": Path(os.getenv("MOVIES_ROOT", "/library/movies")).resolve(),
@@ -38,7 +42,7 @@ CHUNK_SIZE = 1024 * 1024
 SYNC_LOCK = threading.Lock()
 METADATA_RETRY_LOCK = threading.Lock()
 METADATA_RETRY_LAST_REQUEST: dict[str, float] = {}
-METADATA_RETRY_COOLDOWN_SECONDS = 600
+METADATA_RETRY_COOLDOWN_SECONDS = 60
 METADATA_RETRY_GLOBAL_LAST_REQUEST = 0.0
 METADATA_RETRY_GLOBAL_COOLDOWN_SECONDS = 10
 SCHEDULER_STARTED = False
@@ -50,6 +54,7 @@ class LibraryItem(BaseModel):
     id: str
     library: str
     title: str
+    filename: str | None = None
     relative_path: str
     extension: str
     size_bytes: int
@@ -83,6 +88,16 @@ class SyncJob(BaseModel):
     error: str | None = None
 
 
+class ManualMetadataRequest(BaseModel):
+    metadata_title: str = Field(min_length=1, max_length=300)
+    overview: str = Field(default="", max_length=10000)
+    year: int | None = Field(default=None, ge=1800, le=2200)
+    genres: list[str] = Field(default_factory=list, max_length=20)
+    image_path: str | None = Field(default=None, max_length=500)
+    image_type: str = Field(default="poster", pattern="^(poster|backdrop)$")
+    tmdb_id: int | None = Field(default=None, gt=0)
+
+
 def database() -> sqlite3.Connection:
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DATABASE_PATH, timeout=30)
@@ -112,6 +127,7 @@ def database() -> sqlite3.Connection:
     for name, sql_type in (
         ("node_id", "TEXT"), ("series_node_id", "TEXT"),
         ("season_number", "INTEGER"), ("episode_number", "INTEGER"),
+        ("episode_title", "TEXT"),
     ):
         if name not in columns:
             connection.execute(f"ALTER TABLE library_items ADD COLUMN {name} {sql_type}")
@@ -139,11 +155,15 @@ def database() -> sqlite3.Connection:
             metadata_checked_at TEXT,
             metadata_candidates TEXT,
             metadata_error TEXT,
+            episode_metadata_checked_at TEXT,
             scanned_at TEXT NOT NULL,
             available INTEGER NOT NULL DEFAULT 1,
             UNIQUE(library, kind, relative_path)
         )"""
     )
+    node_columns = {row["name"] for row in connection.execute("PRAGMA table_info(catalog_nodes)")}
+    if "episode_metadata_checked_at" not in node_columns:
+        connection.execute("ALTER TABLE catalog_nodes ADD COLUMN episode_metadata_checked_at TEXT")
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_catalog_parent ON catalog_nodes(library, parent_id, kind, title COLLATE NOCASE)"
     )
@@ -203,7 +223,7 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     node.pop("backdrop_file", None)
     node.pop("metadata_error", None)
     if node["kind"] == "collection":
-        genre_rows = connection.execute(
+        genre_row = connection.execute(
             """WITH RECURSIVE descendants(id) AS (
                    SELECT id FROM catalog_nodes WHERE parent_id=? AND available=1
                    UNION ALL
@@ -212,16 +232,13 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
                    WHERE child.available=1
                )
                SELECT genres FROM catalog_nodes
-               WHERE id IN (SELECT id FROM descendants) AND genres!='[]'
-               ORDER BY title COLLATE NOCASE""",
+               WHERE id IN (SELECT id FROM descendants)
+                 AND kind IN ('movie', 'series') AND genres!='[]'
+               ORDER BY title COLLATE NOCASE LIMIT 1""",
             (node["id"],),
-        ).fetchall()
-        aggregated_genres = []
-        for genre_row in genre_rows:
-            for genre in json.loads(genre_row["genres"] or "[]"):
-                if genre not in aggregated_genres:
-                    aggregated_genres.append(genre)
-        node["genres"] = aggregated_genres
+        ).fetchone()
+        if node.get("metadata_source") != "manual":
+            node["genres"] = json.loads(genre_row["genres"] or "[]") if genre_row else []
 
     child_rows = connection.execute(
         """SELECT id, kind, title, metadata_title, poster_file, season_number
@@ -241,7 +258,8 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
         for child in child_rows
     ]
     file_rows = connection.execute(
-        """SELECT id, title, relative_path, extension, size_bytes, season_number,
+        """SELECT id, COALESCE(episode_title, title) AS title, title AS filename,
+                  relative_path, extension, size_bytes, season_number,
                   episode_number
            FROM library_items WHERE node_id=? AND available=1
            ORDER BY season_number, episode_number, title COLLATE NOCASE""",
@@ -273,7 +291,8 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
 
 
 def _item_select() -> str:
-    return """SELECT li.id, li.library, li.title, li.relative_path, li.extension,
+    return """SELECT li.id, COALESCE(li.episode_title, li.title) AS title,
+                     li.title AS filename, li.library, li.relative_path, li.extension,
                      li.size_bytes, li.modified_at, li.node_id,
                      li.series_node_id AS series_id, li.season_number, li.episode_number,
                      n.metadata_title, n.overview, n.year, n.genres AS genres_json,
@@ -534,10 +553,11 @@ def list_items(
     sql = _item_select()
     parameters: list[object] = []
     if q:
-        sql += " AND (li.title LIKE ? ESCAPE '!' COLLATE NOCASE OR n.title LIKE ? ESCAPE '!' COLLATE NOCASE " \
+        sql += " AND (li.title LIKE ? ESCAPE '!' COLLATE NOCASE OR li.episode_title LIKE ? ESCAPE '!' COLLATE NOCASE " \
+               "OR n.title LIKE ? ESCAPE '!' COLLATE NOCASE " \
                "OR n.metadata_title LIKE ? ESCAPE '!' COLLATE NOCASE)"
         escaped = q.replace("!", "!!").replace("%", "!%").replace("_", "!_")
-        parameters.extend((f"%{escaped}%", f"%{escaped}%", f"%{escaped}%"))
+        parameters.extend((f"%{escaped}%", f"%{escaped}%", f"%{escaped}%", f"%{escaped}%"))
     sql += " ORDER BY COALESCE(n.metadata_title, n.title, li.title) COLLATE NOCASE LIMIT ? OFFSET ?"
     parameters.extend((limit, offset))
     with closing(database()) as connection:
@@ -639,6 +659,145 @@ def get_metadata_retry_status(job_id: str) -> SyncJob:
     if row is None or not row["stage"].startswith("retry:"):
         raise HTTPException(status_code=404, detail="Metadata retry job not found")
     return _sync_job_payload(row)
+
+
+@app.post("/api/v1/catalog/{node_id}/metadata/candidates")
+def catalog_metadata_candidates(node_id: str) -> dict[str, object]:
+    if not TMDB_CONFIGURED:
+        raise HTTPException(status_code=503, detail="TMDb credentials are not configured")
+    with closing(database()) as connection:
+        node = connection.execute(
+            "SELECT * FROM catalog_nodes WHERE id=? AND available=1", (node_id,),
+        ).fetchone()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Catalog node not found")
+        if node["kind"] not in {"movie", "series"}:
+            raise HTTPException(status_code=422, detail="TMDb matching supports movies and series")
+
+    now = time.monotonic()
+    global METADATA_RETRY_GLOBAL_LAST_REQUEST
+    with METADATA_RETRY_LOCK:
+        global_wait = METADATA_RETRY_GLOBAL_COOLDOWN_SECONDS - (
+            now - METADATA_RETRY_GLOBAL_LAST_REQUEST
+        )
+        previous = METADATA_RETRY_LAST_REQUEST.get(node_id)
+        item_wait = (METADATA_RETRY_COOLDOWN_SECONDS - (now - previous)
+                     if previous is not None else 0)
+        retry_after = max(global_wait, item_wait)
+        if retry_after > 0:
+            raise HTTPException(
+                status_code=429, detail="Metadata was recently requested for this item",
+                headers={"Retry-After": str(max(1, int(retry_after)))},
+            )
+        METADATA_RETRY_LAST_REQUEST[node_id] = now
+        METADATA_RETRY_GLOBAL_LAST_REQUEST = now
+
+    try:
+        candidates = search_metadata_candidates(
+            node, TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, TMDB_KEY,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"TMDb search failed: {str(exc)[:300]}") from None
+    return {"node_id": node_id, "candidates": candidates}
+
+
+@app.get("/api/v1/catalog/{node_id}/metadata/candidate/{tmdb_id}")
+def catalog_metadata_candidate(node_id: str, tmdb_id: int) -> dict[str, object]:
+    with closing(database()) as connection:
+        node = connection.execute(
+            "SELECT kind FROM catalog_nodes WHERE id=? AND available=1", (node_id,),
+        ).fetchone()
+    if node is None:
+        raise HTTPException(status_code=404, detail="Catalog node not found")
+    if node["kind"] not in {"movie", "series"}:
+        raise HTTPException(status_code=422, detail="TMDb matching supports movies and series")
+    try:
+        return get_candidate_details(
+            node["kind"], tmdb_id, TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, TMDB_KEY,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not load TMDb candidate: {str(exc)[:300]}") from None
+
+
+@app.get("/api/v1/catalog/{node_id}/metadata/images")
+def catalog_metadata_images(node_id: str, q: str | None = None,
+                            tmdb_id: int | None = Query(default=None, gt=0)) -> dict[str, object]:
+    if not TMDB_CONFIGURED:
+        raise HTTPException(status_code=503, detail="TMDb credentials are not configured")
+    with closing(database()) as connection:
+        node = connection.execute(
+            "SELECT * FROM catalog_nodes WHERE id=? AND available=1", (node_id,),
+        ).fetchone()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Catalog node not found")
+        search_node = node
+        if node["kind"] == "season":
+            search_node = connection.execute(
+                "SELECT s.* FROM catalog_nodes s JOIN catalog_nodes season ON season.parent_id=s.id "
+                "WHERE season.id=? AND s.kind='series' AND s.available=1",
+                (node_id,),
+            ).fetchone()
+            if search_node is None:
+                raise HTTPException(status_code=422, detail="Season has no available series")
+    image_id = tmdb_id or search_node["tmdb_id"]
+    try:
+        images = search_image_options(
+            "series" if search_node["kind"] == "series" else "movie",
+            q or search_node["metadata_title"] or search_node["title"],
+            TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, TMDB_KEY, image_id,
+            int(node["season_number"] or 0) if node["kind"] == "season" else None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Image search failed: {str(exc)[:300]}") from None
+    return {"images": images[:10]}
+
+
+@app.post("/api/v1/catalog/{node_id}/metadata/manual")
+def save_manual_metadata(node_id: str, request: ManualMetadataRequest) -> dict[str, object]:
+    with closing(database()) as connection:
+        node = connection.execute(
+            "SELECT * FROM catalog_nodes WHERE id=? AND available=1", (node_id,),
+        ).fetchone()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Catalog node not found")
+        if request.tmdb_id is not None and node["kind"] in {"movie", "series"}:
+            try:
+                apply_tmdb_id(
+                    connection, node, request.tmdb_id, TMDB_ACCESS_TOKEN,
+                    TMDB_LANGUAGE, ARTWORK_DIR, api_key=TMDB_KEY,
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"TMDb selection failed: {str(exc)[:300]}") from None
+
+        poster_file = None
+        if request.image_path:
+            if (not request.image_path.startswith("/") or ".." in request.image_path
+                    or not re.fullmatch(r"/[A-Za-z0-9._/-]+", request.image_path)):
+                raise HTTPException(status_code=422, detail="Invalid TMDb image path")
+            try:
+                with httpx.Client(timeout=httpx.Timeout(30.0)) as client:
+                    image_base, poster_size, backdrop_size = _image_config(client, TMDB_KEY)
+                    size = backdrop_size if request.image_type == "backdrop" else poster_size
+                    poster_file = _save_image(
+                        client, image_base, size, request.image_path,
+                        ARTWORK_DIR / f"{node_id}-poster.jpg",
+                    )
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Could not save selected image: {str(exc)[:300]}") from None
+
+        genres = list(dict.fromkeys(genre.strip() for genre in request.genres if genre.strip()))
+        connection.execute(
+            """UPDATE catalog_nodes SET metadata_title=?, overview=?, year=?, genres=?,
+               tmdb_id=COALESCE(?, tmdb_id), poster_file=COALESCE(?, poster_file),
+               metadata_status='matched', metadata_source='manual', metadata_checked_at=?,
+               metadata_candidates=NULL, metadata_error=NULL WHERE id=?""",
+            (request.metadata_title.strip(), request.overview.strip(), request.year,
+             json.dumps(genres, ensure_ascii=False), request.tmdb_id, poster_file,
+             datetime.now(timezone.utc).isoformat(), node_id),
+        )
+        updated = connection.execute("SELECT * FROM catalog_nodes WHERE id=?", (node_id,)).fetchone()
+        connection.commit()
+        return _node_payload(updated, connection)
 
 
 @app.get("/api/v1/catalog/{node_id}/images/{image_type}")

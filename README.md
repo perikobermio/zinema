@@ -101,7 +101,11 @@ curl 'http://localhost:8180/api/v1/catalog?library=series&parent_id=ID_DEL_NODO'
 curl 'http://localhost:8180/api/v1/catalog/ID_DEL_NODO'
 ```
 
-El cliente puede solicitar un nuevo intento de metadata con `POST /api/v1/catalog/ID_DEL_NODO/metadata/retry`. En películas y series se actualiza ese título; en una temporada se actualiza su serie, y en una colección se reintentan sus películas y series descendientes. El servidor limita solicitudes repetidas durante diez minutos por elemento y las ejecuta en segundo plano.
+Al reintentar metadata desde el cliente, `POST /api/v1/catalog/ID_DEL_NODO/metadata/candidates` busca coincidencias TMDb para validarlas antes de guardarlas. `GET /api/v1/catalog/ID_DEL_NODO/metadata/candidate/ID_TMDB` carga sus datos completos. La edición manual se guarda con `POST /api/v1/catalog/ID_DEL_NODO/metadata/manual`. Para buscar imágenes se usa `GET /api/v1/catalog/ID_DEL_NODO/metadata/images?q=TITULO`; devuelve hasta diez imágenes TMDb.
+
+Las ediciones manuales permanecen guardadas y no las reemplaza la sincronización diaria. Se pueden volver a solicitar coincidencias después de un minuto por elemento.
+
+Al asociar una serie con TMDb, el servidor consulta también los episodios para guardar sus títulos. Si TMDb no tiene un título para el episodio, el cliente muestra el nombre del archivo. En temporadas intenta usar el póster de temporada, una imagen del primer episodio y, como último recurso, el póster de la serie.
 
 Cada nodo incluye `kind`, `display_title`, `overview`, `year`, `genres`, `poster_url`, `backdrop_url`, `children`, `files` y `mosaic_images`. Los archivos reproducibles conservan sus IDs y URL de streaming:
 
