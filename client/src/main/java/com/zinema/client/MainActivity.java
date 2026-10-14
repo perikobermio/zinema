@@ -10,6 +10,8 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.util.LruCache;
@@ -30,6 +32,9 @@ import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.webkit.JavascriptInterface;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -60,6 +65,7 @@ public class MainActivity extends Activity {
     static final String PREFS = "zinema_client";
     static final String DEFAULT_SERVER = "https://zinema.ebu.freemyip.com";
     final ExecutorService io = Executors.newFixedThreadPool(4);
+    final Handler mainHandler = new Handler(Looper.getMainLooper());
     final LruCache<String, Bitmap> imageCache = new LruCache<>(24);
     final Map<String, List<ImageView>> pendingImageTargets = new HashMap<>();
     SharedPreferences prefs;
@@ -81,6 +87,8 @@ public class MainActivity extends Activity {
     boolean libraryMode;
     boolean showingDetail;
     boolean showingAdmin;
+    boolean introShowing;
+    WebView introWebView;
     String adminReturnDetailId = "";
     boolean metadataEditorFromDetail;
     boolean metadataEditorMode;
@@ -98,6 +106,40 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         server = trimBase(prefs.getString("server", DEFAULT_SERVER));
         serverName = prefs.getString("server_name", "Zinema NAS");
+        showIntro();
+    }
+
+    void showIntro() {
+        introShowing = true;
+        introWebView = new WebView(this);
+        introWebView.setBackgroundColor(BG);
+        introWebView.setVerticalScrollBarEnabled(false);
+        introWebView.setHorizontalScrollBarEnabled(false);
+        introWebView.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        WebSettings webSettings = introWebView.getSettings();
+        webSettings.setJavaScriptEnabled(true);
+        webSettings.setAllowFileAccess(true);
+        introWebView.addJavascriptInterface(new IntroBridge(), "ZinemaIntro");
+        setContentView(introWebView);
+        introWebView.loadUrl("file:///android_asset/zinema_intro.html?embed=1");
+    }
+
+    public final class IntroBridge {
+        @JavascriptInterface public void onIntroEnded() {
+            runOnUiThread(() -> mainHandler.postDelayed(MainActivity.this::finishIntro, 1000));
+        }
+    }
+
+    void finishIntro() {
+        if (!introShowing || isFinishing()) return;
+        introShowing = false;
+        if (introWebView != null) {
+            introWebView.stopLoading();
+            introWebView.removeJavascriptInterface("ZinemaIntro");
+            introWebView.removeAllViews();
+            introWebView.destroy();
+            introWebView = null;
+        }
         buildShell("Inicio");
         loadHome();
     }
@@ -119,7 +161,7 @@ public class MainActivity extends Activity {
 
         LinearLayout bar = new LinearLayout(this);
         bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setPadding(d(20), d(12), d(16), d(10));
+        bar.setPadding(d(20), d(20), d(16), d(8));
         bar.setBackgroundColor(BG);
         backButton = navAction("‹", "Atrás", v -> onBackPressed());
         backButton.setTextSize(30);
@@ -143,16 +185,22 @@ public class MainActivity extends Activity {
                 : new LinearLayout.LayoutParams(d(132), d(42));
         bar.addView(brandButton, brandParams);
         searchButton = navAction("⌕", "Buscar", v -> showSearch());
-        bar.addView(searchButton);
+        searchButton.setBackground(round(PANEL, d(22)));
+        searchButton.setElevation(d(4));
+        bar.addView(searchButton, new LinearLayout.LayoutParams(d(44), d(44)));
         settingsButton = navAction("⚙", "Servidor", v -> showSettings());
+        settingsButton.setBackground(round(PANEL, d(22)));
+        settingsButton.setElevation(d(4));
         LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(-2, -2);
-        sp.leftMargin = d(20);
+        sp.width = d(44);
+        sp.height = d(44);
+        sp.leftMargin = d(10);
         bar.addView(settingsButton, sp);
         if (showingAdmin) {
             searchButton.setVisibility(View.GONE);
             settingsButton.setVisibility(View.GONE);
         }
-        page.addView(bar, new LinearLayout.LayoutParams(-1, d(58)));
+        page.addView(bar, new LinearLayout.LayoutParams(-1, d(68)));
 
         navScroll = new HorizontalScrollView(this);
         navScroll.setHorizontalScrollBarEnabled(false);
@@ -2306,6 +2354,7 @@ public class MainActivity extends Activity {
     }
 
     @Override public void onBackPressed() {
+        if (introShowing) return;
         if (showingAdmin) {
             showingAdmin = false;
             String returnDetailId = adminReturnDetailId;
