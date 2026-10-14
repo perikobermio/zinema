@@ -24,6 +24,30 @@ def _normalise(value: str) -> str:
     return " ".join(value.split())
 
 
+def normalize_genres(values: object) -> list[str]:
+    """Normalize Spanish genre labels and collapse case/accent duplicates."""
+    if not isinstance(values, (list, tuple)):
+        return []
+    aliases = {
+        "animacion": "Animación",
+        "animation": "Animación",
+        "fantasia": "Fantasía",
+        "fantasy": "Fantasía",
+    }
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        label = value.strip()
+        key = _normalise(label)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(aliases.get(key, label))
+    return result
+
+
 def _source_title(title: str, source_year: int | None) -> tuple[str, int | None]:
     match = YEAR_RE.search(title)
     if match:
@@ -120,8 +144,9 @@ def _write_match(connection: sqlite3.Connection, node: sqlite3.Row, details: dic
     year = int(release[:4]) if release and len(release) >= 4 and release[:4].isdigit() else None
     title = details.get("title") or details.get("name") or node["title"]
     original_title = details.get("original_title") or details.get("original_name")
-    genres = json.dumps([genre["name"] for genre in details.get("genres", []) if genre.get("name")],
-                        ensure_ascii=False)
+    genres = json.dumps(normalize_genres(
+        [genre.get("name") for genre in details.get("genres", []) if genre.get("name")]
+    ), ensure_ascii=False)
     connection.execute(
         """UPDATE catalog_nodes SET tmdb_id=?, imdb_id=?, metadata_title=?, original_title=?,
            overview=?, year=?, genres=?, poster_file=COALESCE(?, poster_file),

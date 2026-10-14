@@ -56,7 +56,7 @@ def scan_catalog(connection: sqlite3.Connection, roots: dict[str, Path]) -> dict
             "id": node_id, "library": library, "kind": kind,
             "relative_path": rel, "parent_id": parent_id, "title": title,
             "season_number": season_number, "source_year": source_year,
-            "scanned_at": now,
+            "scanned_at": now, "added_at": now,
         }
         return node_id
 
@@ -148,9 +148,9 @@ def scan_catalog(connection: sqlite3.Connection, roots: dict[str, Path]) -> dict
     connection.executemany(
         """INSERT INTO catalog_nodes
            (id, library, kind, relative_path, parent_id, title, season_number, source_year,
-            scanned_at, available)
+            scanned_at, added_at, available)
            VALUES (:id, :library, :kind, :relative_path, :parent_id, :title, :season_number,
-                   :source_year, :scanned_at, 1)
+                   :source_year, :scanned_at, :added_at, 1)
            ON CONFLICT(id) DO UPDATE SET
              parent_id=excluded.parent_id, title=excluded.title,
              season_number=excluded.season_number, source_year=excluded.source_year,

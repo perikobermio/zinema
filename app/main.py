@@ -22,7 +22,7 @@ from starlette.responses import FileResponse, Response, StreamingResponse
 from app.catalog import scan_catalog
 from app.tmdb import (apply_tmdb_id, enrich_pending, get_candidate_details,
                       search_image_options, search_metadata_candidates,
-                      _image_config, _save_image)
+                      _image_config, _save_image, normalize_genres)
 
 MEDIA_ROOTS = {
     "movies": Path(os.getenv("MOVIES_ROOT", "/library/movies")).resolve(),
@@ -157,6 +157,7 @@ def database() -> sqlite3.Connection:
             metadata_error TEXT,
             episode_metadata_checked_at TEXT,
             scanned_at TEXT NOT NULL,
+            added_at TEXT NOT NULL DEFAULT '',
             available INTEGER NOT NULL DEFAULT 1,
             UNIQUE(library, kind, relative_path)
         )"""
@@ -164,6 +165,9 @@ def database() -> sqlite3.Connection:
     node_columns = {row["name"] for row in connection.execute("PRAGMA table_info(catalog_nodes)")}
     if "episode_metadata_checked_at" not in node_columns:
         connection.execute("ALTER TABLE catalog_nodes ADD COLUMN episode_metadata_checked_at TEXT")
+    if "added_at" not in node_columns:
+        connection.execute("ALTER TABLE catalog_nodes ADD COLUMN added_at TEXT NOT NULL DEFAULT ''")
+    connection.execute("UPDATE catalog_nodes SET added_at=scanned_at WHERE added_at='' ")
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_catalog_parent ON catalog_nodes(library, parent_id, kind, title COLLATE NOCASE)"
     )
@@ -198,14 +202,14 @@ def display_title(path: Path) -> str:
 
 def item_from_row(row: sqlite3.Row, connection: sqlite3.Connection) -> LibraryItem:
     data = dict(row)
-    data["genres"] = json.loads(data.pop("genres_json", "[]") or "[]")
+    data["genres"] = normalize_genres(json.loads(data.pop("genres_json", "[]") or "[]"))
     metadata_node_id = data.pop("metadata_node_id", None)
     metadata_parent_id = data.pop("metadata_parent_id", None)
     poster_file = data.pop("poster_file", None)
     if not data["genres"]:
         inherited_genres = _inherited_collection_value(connection, metadata_parent_id, "genres")
         if inherited_genres:
-            data["genres"] = json.loads(inherited_genres[1] or "[]")
+            data["genres"] = normalize_genres(json.loads(inherited_genres[1] or "[]"))
     if metadata_node_id and poster_file:
         data["poster_url"] = f"/api/v1/catalog/{metadata_node_id}/images/poster"
     elif metadata_node_id:
@@ -233,24 +237,64 @@ def _inherited_collection_value(connection: sqlite3.Connection, parent_id: str |
     return None
 
 
+def _collection_artwork(connection: sqlite3.Connection, collection_id: str) -> dict:
+    items = connection.execute(
+        """WITH RECURSIVE descendants(id, parent_id, kind, poster_file, title) AS (
+               SELECT id, parent_id, kind, poster_file, title
+               FROM catalog_nodes WHERE parent_id=? AND available=1
+               UNION ALL
+               SELECT child.id, child.parent_id, child.kind, child.poster_file, child.title
+               FROM catalog_nodes child
+               JOIN descendants parent ON child.parent_id=parent.id
+               WHERE child.available=1
+           )
+           SELECT id, parent_id, kind, poster_file, title FROM descendants
+           WHERE kind IN ('movie', 'series') ORDER BY kind, title COLLATE NOCASE""",
+        (collection_id,),
+    ).fetchall()
+    mosaic = [
+        f"/api/v1/catalog/{item['id']}/images/poster"
+        for item in items if item["poster_file"]
+    ][:4]
+    single_poster_url = None
+    if len(items) == 1:
+        item = items[0]
+        poster_node_id = item["id"] if item["poster_file"] else None
+        if poster_node_id is None:
+            inherited = _inherited_collection_value(connection, item["parent_id"], "poster_file")
+            if inherited:
+                poster_node_id = inherited[0]
+        if poster_node_id:
+            single_poster_url = f"/api/v1/catalog/{poster_node_id}/images/poster"
+    return {"item_count": len(items), "mosaic_images": mosaic,
+            "single_item_poster_url": single_poster_url}
+
+
 def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     node = dict(row)
-    genres = json.loads(node.pop("genres", "[]") or "[]")
+    genres = normalize_genres(json.loads(node.pop("genres", "[]") or "[]"))
     node["display_title"] = node.pop("metadata_title", None) or node["title"]
+    node["year"] = node.get("year") or node.get("source_year")
     inherited_genres = _inherited_collection_value(connection, node.get("parent_id"), "genres")
     if not genres and inherited_genres:
-        genres = json.loads(inherited_genres[1] or "[]")
+        genres = normalize_genres(json.loads(inherited_genres[1] or "[]"))
     node["genres"] = genres
     poster_file = node.get("poster_file")
+    collection_artwork = _collection_artwork(connection, node["id"]) if node["kind"] == "collection" else None
     inherited_poster = None
     if not poster_file and node["kind"] != "season":
         inherited_poster = _inherited_collection_value(connection, node.get("parent_id"), "poster_file")
-    node["poster_available"] = bool(poster_file or inherited_poster) or node["kind"] == "season"
+    single_item_poster = collection_artwork["single_item_poster_url"] if collection_artwork else None
+    node["poster_available"] = bool(poster_file or single_item_poster or inherited_poster) or node["kind"] == "season"
     node["poster_is_assigned"] = bool(poster_file)
-    poster_node_id = node["id"] if poster_file else (inherited_poster[0] if inherited_poster else node["id"])
-    node["poster_url"] = (
-        f"/api/v1/catalog/{poster_node_id}/images/poster" if node["poster_available"] else None
-    )
+    if poster_file:
+        node["poster_url"] = f"/api/v1/catalog/{node['id']}/images/poster"
+    elif single_item_poster:
+        node["poster_url"] = single_item_poster
+    elif inherited_poster:
+        node["poster_url"] = f"/api/v1/catalog/{inherited_poster[0]}/images/poster"
+    else:
+        node["poster_url"] = None
     node["backdrop_url"] = (
         f"/api/v1/catalog/{node['id']}/images/backdrop" if node.get("backdrop_file") else None
     )
@@ -273,7 +317,9 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
                ORDER BY title COLLATE NOCASE LIMIT 1""",
             (node["id"],),
         ).fetchone()
-        node["genres"] = json.loads(genre_row["genres"] or "[]") if genre_row else []
+        node["genres"] = normalize_genres(
+            json.loads(genre_row["genres"] or "[]") if genre_row else []
+        )
 
     child_rows = connection.execute(
         """SELECT id, kind, title, metadata_title, poster_file, season_number, parent_id
@@ -290,14 +336,20 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
             inherited = _inherited_collection_value(connection, child["parent_id"], "poster_file")
         available = bool(child["poster_file"] or inherited) or child["kind"] == "season"
         poster_node_id = child["id"] if child["poster_file"] else (inherited[0] if inherited else child["id"])
-        node["children"].append(
-            {"id": child["id"], "kind": child["kind"],
+        child_payload = {"id": child["id"], "kind": child["kind"],
              "title": child["metadata_title"] or child["title"],
              "season_number": child["season_number"],
              "poster_url": (f"/api/v1/catalog/{poster_node_id}/images/poster" if available else None),
              "poster_available": available,
              "poster_is_assigned": bool(child["poster_file"])}
-        )
+        if child["kind"] == "collection":
+            child_artwork = _collection_artwork(connection, child["id"])
+            if not child["poster_file"] and child_artwork["single_item_poster_url"]:
+                child_payload["poster_url"] = child_artwork["single_item_poster_url"]
+                child_payload["poster_available"] = True
+            child_payload.update({"item_count": child_artwork["item_count"],
+                                  "mosaic_images": child_artwork["mosaic_images"]})
+        node["children"].append(child_payload)
     file_rows = connection.execute(
         """SELECT id, COALESCE(episode_title, title) AS title, title AS filename,
                   relative_path, extension, size_bytes, season_number,
@@ -311,37 +363,9 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
          "poster_url": node["poster_url"]}
         for media in file_rows
     ]
-    node["mosaic_images"] = []
-    if node["kind"] == "collection":
-        count_row = connection.execute(
-            """WITH RECURSIVE descendants(id, kind) AS (
-                   SELECT id, kind FROM catalog_nodes WHERE parent_id=? AND available=1
-                   UNION ALL
-                   SELECT child.id, child.kind FROM catalog_nodes child
-                   JOIN descendants parent ON child.parent_id=parent.id
-                   WHERE child.available=1
-               )
-               SELECT COUNT(*) AS total FROM descendants WHERE kind IN ('movie', 'series')""",
-            (node["id"],),
-        ).fetchone()
-        node["item_count"] = int(count_row["total"] or 0)
-        artwork_rows = connection.execute(
-            """WITH RECURSIVE descendants(id) AS (
-                   SELECT id FROM catalog_nodes WHERE parent_id=? AND available=1
-                   UNION ALL
-                   SELECT child.id FROM catalog_nodes child
-                   JOIN descendants parent ON child.parent_id=parent.id
-                   WHERE child.available=1
-               )
-               SELECT id FROM catalog_nodes
-               WHERE id IN (SELECT id FROM descendants) AND poster_file IS NOT NULL
-                 AND kind IN ('movie', 'series')
-               ORDER BY kind, title COLLATE NOCASE LIMIT 4""",
-            (node["id"],),
-        ).fetchall()
-        node["mosaic_images"] = [
-            f"/api/v1/catalog/{art['id']}/images/poster" for art in artwork_rows
-        ]
+    node["mosaic_images"] = collection_artwork["mosaic_images"] if collection_artwork else []
+    if collection_artwork:
+        node["item_count"] = collection_artwork["item_count"]
     return node
 
 
@@ -350,7 +374,8 @@ def _item_select() -> str:
                      li.title AS filename, li.library, li.relative_path, li.extension,
                      li.size_bytes, li.modified_at, li.node_id,
                      li.series_node_id AS series_id, li.season_number, li.episode_number,
-                     n.metadata_title, n.overview, n.year, n.genres AS genres_json,
+                     n.metadata_title, n.overview, COALESCE(n.year, n.source_year) AS year,
+                     n.genres AS genres_json,
                      (SELECT COUNT(*) FROM catalog_nodes s
                       WHERE s.parent_id=n.id AND s.kind='season' AND s.available=1) AS season_count,
                      n.id AS metadata_node_id, n.parent_id AS metadata_parent_id, n.poster_file
@@ -588,6 +613,14 @@ def _sync_job_payload(row: sqlite3.Row) -> SyncJob:
 def initialize_database() -> None:
     global SCHEDULER_STARTED
     with closing(database()) as connection:
+        for row in connection.execute("SELECT id, genres FROM catalog_nodes WHERE genres!='[]'").fetchall():
+            try:
+                cleaned = normalize_genres(json.loads(row["genres"] or "[]"))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            encoded = json.dumps(cleaned, ensure_ascii=False)
+            if encoded != row["genres"]:
+                connection.execute("UPDATE catalog_nodes SET genres=? WHERE id=?", (encoded, row["id"]))
         connection.commit()
     if not SCHEDULER_STARTED:
         threading.Thread(target=_daily_sync_loop, daemon=True, name="zinema-daily-sync").start()
@@ -667,17 +700,14 @@ def list_genres() -> list[str]:
         rows = connection.execute(
             "SELECT genres FROM catalog_nodes WHERE available=1 AND genres!='[]'"
         ).fetchall()
-    genres: dict[str, str] = {}
+    genres: list[str] = []
     for row in rows:
         try:
             values = json.loads(row["genres"] or "[]")
         except (TypeError, json.JSONDecodeError):
             continue
-        for value in values if isinstance(values, list) else []:
-            if isinstance(value, str) and value.strip():
-                genre = value.strip()
-                genres.setdefault(genre.casefold(), genre)
-    return sorted(genres.values(), key=str.casefold)
+        genres.extend(normalize_genres(values))
+    return sorted(normalize_genres(genres), key=str.casefold)
 
 
 @app.get("/api/v1/catalog/{node_id}")
@@ -859,7 +889,7 @@ def save_manual_metadata(node_id: str, request: ManualMetadataRequest) -> dict[s
             except Exception as exc:
                 raise HTTPException(status_code=502, detail=f"Could not save selected image: {str(exc)[:300]}") from None
 
-        genres = list(dict.fromkeys(genre.strip() for genre in request.genres if genre.strip()))
+        genres = normalize_genres(request.genres)
         connection.execute(
             """UPDATE catalog_nodes SET metadata_title=?, overview=?, year=?, genres=?,
                tmdb_id=COALESCE(?, tmdb_id), poster_file=COALESCE(?, poster_file),

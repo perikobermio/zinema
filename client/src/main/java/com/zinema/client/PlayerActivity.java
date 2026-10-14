@@ -1,96 +1,86 @@
 package com.zinema.client;
 
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
+import android.content.ComponentName;
+import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
-import android.view.View;
-import android.view.WindowManager;
-import android.widget.MediaController;
-import android.widget.TextView;
-import android.widget.VideoView;
+import android.widget.Toast;
 
 import org.json.JSONObject;
 
 public class PlayerActivity extends Activity {
-    private VideoView video;
-    private Handler handler;
+    private static final int VLC_REQUEST = 41;
     private String path;
     private String title;
     private String posterUrl;
-    private boolean prepared;
-    private final Runnable progressTick = new Runnable() {
-        @Override public void run() {
-            if (prepared && video != null && video.isPlaying()) saveProgress(false);
-            if (handler != null) handler.postDelayed(this, 10000);
-        }
-    };
+    private String ownerNodeId;
+    private String mediaId;
+    private String ownerKind;
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        getWindow().getDecorView().setSystemUiVisibility(
-                View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
-                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
         String url = getIntent().getStringExtra("url");
         path = getIntent().getStringExtra("path");
         title = getIntent().getStringExtra("title");
         posterUrl = getIntent().getStringExtra("poster_url");
-        int resumeAt = getIntent().getIntExtra("position", 0);
-        video = new VideoView(this);
-        video.setBackgroundColor(0xFF000000);
-        setContentView(video);
-        MediaController controls = new MediaController(this);
-        controls.setAnchorView(video);
-        video.setMediaController(controls);
-        video.setVideoURI(Uri.parse(url));
-        video.setOnPreparedListener(player -> {
-            prepared = true;
-            player.setOnVideoSizeChangedListener((mp, width, height) -> controls.setAnchorView(video));
-            if (resumeAt > 15000) video.seekTo(resumeAt);
-            video.start();
-            handler = new Handler(Looper.getMainLooper());
-            handler.postDelayed(progressTick, 10000);
-        });
-        video.setOnCompletionListener(player -> {
-            getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit().remove("watch:" + path).apply();
+        ownerNodeId = getIntent().getStringExtra("owner_node_id");
+        mediaId = getIntent().getStringExtra("media_id");
+        ownerKind = getIntent().getStringExtra("owner_kind");
+        long resumeAt = getIntent().getLongExtra("position", 0L);
+        if (url == null || url.isEmpty()) {
             finish();
-        });
-        video.setOnErrorListener((player, what, extra) -> {
-            android.widget.Toast.makeText(this, "No se pudo reproducir este formato de vídeo.", android.widget.Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        Intent vlc = new Intent(Intent.ACTION_VIEW);
+        vlc.setComponent(new ComponentName("org.videolan.vlc", "org.videolan.vlc.StartActivity"));
+        vlc.setDataAndType(Uri.parse(url), "video/*");
+        vlc.putExtra("title", title == null ? "Zinema" : title);
+        vlc.putExtra("position", (int) Math.max(0L, resumeAt));
+        vlc.putExtra("return_result", true);
+        vlc.putExtra("secure_uri", true);
+        try {
+            startActivityForResult(vlc, VLC_REQUEST);
+        } catch (ActivityNotFoundException e) {
+            Toast.makeText(this, "Instala VLC para reproducir vídeos.", Toast.LENGTH_LONG).show();
             finish();
-            return true;
-        });
+        }
     }
 
-    private void saveProgress(boolean force) {
-        if (video == null || !prepared) return;
-        int position = video.getCurrentPosition();
-        if (position < 10000) return;
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != VLC_REQUEST) return;
+        if (resultCode == RESULT_OK && data != null) {
+            long position = data.getLongExtra("extra_position", -1L);
+            long duration = data.getLongExtra("extra_duration", -1L);
+            if (position >= 0L && duration > 0L && position >= duration - 5000L) {
+                getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
+                        .remove("watch:" + path).apply();
+            } else if (position > 10000L) {
+                saveProgress(position);
+            }
+        }
+        finish();
+    }
+
+    private void saveProgress(long position) {
+        if (path == null || path.isEmpty()) return;
         try {
             JSONObject item = new JSONObject();
-            item.put("title", title);
+            item.put("title", title == null ? "Vídeo" : title);
             item.put("path", path);
             item.put("stream", path);
             item.put("poster_url", posterUrl == null ? "" : posterUrl);
-            item.put("position", position);
+            item.put("owner_node_id", ownerNodeId == null ? "" : ownerNodeId);
+            item.put("node_id", ownerNodeId == null ? "" : ownerNodeId);
+            item.put("media_id", mediaId == null ? "" : mediaId);
+            item.put("owner_kind", ownerKind == null ? "" : ownerKind);
+            item.put("position", (int) Math.min(Integer.MAX_VALUE, position));
             item.put("updated", System.currentTimeMillis());
             getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
                     .putString("watch:" + path, item.toString()).apply();
         } catch (Exception ignored) { }
-    }
-
-    @Override protected void onPause() {
-        saveProgress(true);
-        if (video != null && video.isPlaying()) video.pause();
-        super.onPause();
-    }
-
-    @Override protected void onDestroy() {
-        if (handler != null) handler.removeCallbacks(progressTick);
-        if (video != null) video.stopPlayback();
-        super.onDestroy();
     }
 }

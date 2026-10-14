@@ -16,6 +16,7 @@ import android.util.LruCache;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.graphics.Rect;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.content.Context;
@@ -40,12 +41,14 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.WeakHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -58,10 +61,12 @@ public class MainActivity extends Activity {
     static final String DEFAULT_SERVER = "https://zinema.ebu.freemyip.com";
     final ExecutorService io = Executors.newFixedThreadPool(4);
     final LruCache<String, Bitmap> imageCache = new LruCache<>(24);
+    final Map<String, List<ImageView>> pendingImageTargets = new HashMap<>();
     SharedPreferences prefs;
     FrameLayout frame;
     LinearLayout page;
     LinearLayout content;
+    ScrollView contentScroller;
     TextView backButton;
     TextView brandButton;
     TextView searchButton;
@@ -79,8 +84,8 @@ public class MainActivity extends Activity {
     boolean metadataEditorPreviousBackVisible;
     List<JSONObject> movies = new ArrayList<>();
     List<JSONObject> series = new ArrayList<>();
-    List<JSONObject> recommendations = new ArrayList<>();
     final Map<String, String> posterByStream = new HashMap<>();
+    final Map<ImageView, String> requestedImages = new WeakHashMap<>();
     final List<JSONObject> breadcrumbs = new ArrayList<>();
 
     @Override public void onCreate(Bundle state) {
@@ -140,14 +145,16 @@ public class MainActivity extends Activity {
         navScroll.addView(nav);
         page.addView(navScroll, new LinearLayout.LayoutParams(-1, d(48)));
 
-        ScrollView scroller = new ScrollView(this);
-        scroller.setFillViewport(true);
-        scroller.setVerticalScrollBarEnabled(false);
+        contentScroller = new ScrollView(this);
+        contentScroller.setFillViewport(true);
+        contentScroller.setVerticalScrollBarEnabled(false);
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.setPadding(0, 0, 0, d(28));
-        scroller.addView(content);
-        page.addView(scroller, new LinearLayout.LayoutParams(-1, 0, 1));
+        contentScroller.addView(content);
+        contentScroller.setOnScrollChangeListener((View view, int x, int y, int oldX, int oldY) ->
+                loadVisibleLazyRows());
+        page.addView(contentScroller, new LinearLayout.LayoutParams(-1, 0, 1));
         setContentView(frame);
     }
 
@@ -247,6 +254,7 @@ public class MainActivity extends Activity {
     void loadHome() {
         libraryMode = false;
         showingDetail = false;
+        lastSearchQuery = null;
         selectedSection = "home";
         breadcrumbs.clear();
         buildShell("Inicio");
@@ -258,11 +266,12 @@ public class MainActivity extends Activity {
                 JSONArray allItems = getArray("/api/v1/items?limit=500");
                 List<JSONObject> movieList = toList(m);
                 List<JSONObject> seriesList = toList(s);
-                List<JSONObject> suggested = buildRecommendations(allItems);
+                sortNewestFirst(movieList);
+                sortNewestFirst(seriesList);
+                cachePosterByStream(allItems);
                 runOnUiThread(() -> {
                     movies = movieList;
                     series = seriesList;
-                    recommendations = suggested;
                     renderHome();
                 });
             } catch (Exception e) {
@@ -280,11 +289,15 @@ public class MainActivity extends Activity {
         return result;
     }
 
+    void sortNewestFirst(List<JSONObject> nodes) {
+        Collections.sort(nodes, (left, right) ->
+                right.optString("added_at", "").compareTo(left.optString("added_at", "")));
+    }
+
     void renderHome() {
         content.removeAllViews();
         List<JSONObject> resume = readContinueWatching();
         if (!resume.isEmpty()) addResumeRow("Seguir viendo", resume);
-        if (!recommendations.isEmpty()) addHeroCarousel();
         List<JSONObject> favorites = readFavorites();
         if (!favorites.isEmpty()) addRow("Mi lista", favorites);
         addRow("Películas", movies);
@@ -296,142 +309,15 @@ public class MainActivity extends Activity {
         }
     }
 
-    List<JSONObject> buildRecommendations(JSONArray items) {
-        List<JSONObject> result = new ArrayList<>();
-        java.util.HashSet<String> seen = new java.util.HashSet<>();
+    void cachePosterByStream(JSONArray items) {
         posterByStream.clear();
-        for (int i = 0; i < items.length() && result.size() < 5; i++) {
+        for (int i = 0; i < items.length(); i++) {
             JSONObject item = items.optJSONObject(i);
             if (item == null) continue;
             String stream = item.optString("stream_url", "");
             String poster = item.optString("poster_url", "");
             if (!stream.isEmpty() && !poster.isEmpty()) posterByStream.put(stream, poster);
-            String seriesId = item.optString("series_id", "");
-            boolean isSeries = !seriesId.isEmpty() && !seriesId.equals("null");
-            String nodeId = isSeries ? seriesId : item.optString("node_id", "");
-            if (nodeId.isEmpty() || nodeId.equals("null") || !seen.add(nodeId)) continue;
-            JSONObject suggestion = new JSONObject();
-            try {
-                suggestion.put("id", nodeId);
-                suggestion.put("kind", isSeries ? "series" : "movie");
-                suggestion.put("library", item.optString("library", isSeries ? "series" : "movies"));
-                suggestion.put("display_title", item.optString("metadata_title", item.optString("title", "")));
-                suggestion.put("overview", item.optString("overview", ""));
-                suggestion.put("year", item.opt("year"));
-                suggestion.put("genres", item.optJSONArray("genres") == null ? new JSONArray() : item.optJSONArray("genres"));
-                suggestion.put("poster_url", item.optString("poster_url", ""));
-                result.add(suggestion);
-            } catch (JSONException ignored) { }
         }
-        if (result.isEmpty()) {
-            for (JSONObject node : movies) {
-                if (result.size() == 5) break;
-                if (node.optString("kind").equals("movie")) result.add(node);
-            }
-            for (JSONObject node : series) {
-                if (result.size() == 5) break;
-                if (node.optString("kind").equals("series")) result.add(node);
-            }
-        }
-        return result;
-    }
-
-    JSONObject firstPlayableOrPoster(List<JSONObject> a, List<JSONObject> b) {
-        for (JSONObject item : a) if (item.optString("backdrop_url", "").length() > 0) return item;
-        for (JSONObject item : b) if (item.optString("backdrop_url", "").length() > 0) return item;
-        if (!a.isEmpty()) return a.get(0);
-        return b.isEmpty() ? null : b.get(0);
-    }
-
-    void addHeroCarousel() {
-        if (recommendations.isEmpty()) return;
-        FrameLayout hero = new FrameLayout(this);
-        hero.setBackground(round(PANEL, d(14)));
-        hero.setClipToOutline(true);
-        ImageView image = new ImageView(this);
-        image.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        hero.addView(image, new FrameLayout.LayoutParams(-1, -1));
-        JSONObject[] activeNode = {recommendations.get(0)};
-        View shade = new View(this);
-        shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
-                new int[]{0xFF090A0D, 0xCC090A0D, 0x11090A0D}));
-        hero.addView(shade, new FrameLayout.LayoutParams(-1, -1));
-        LinearLayout info = new LinearLayout(this);
-        info.setOrientation(LinearLayout.VERTICAL);
-        info.setGravity(Gravity.BOTTOM);
-        info.setPadding(d(64), d(20), d(64), d(22));
-        TextView eyebrow = label("RECOMENDADO PARA TI", 11, 0xFFFF777E, true);
-        eyebrow.setLetterSpacing(0.12f);
-        info.addView(eyebrow);
-        TextView title = label(displayTitle(activeNode[0]), 29, Color.WHITE, true);
-        title.setMaxLines(2);
-        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(-1, -2);
-        tp.topMargin = d(6);
-        info.addView(title, tp);
-        TextView desc = label(activeNode[0].optString("overview", ""), 13, 0xFFE2E3E8, false);
-        desc.setMaxLines(2);
-        LinearLayout.LayoutParams dp = new LinearLayout.LayoutParams(-1, -2);
-        dp.topMargin = d(6);
-        info.addView(desc, dp);
-        LinearLayout buttons = new LinearLayout(this);
-        buttons.setGravity(Gravity.CENTER_VERTICAL);
-        Button button = actionButton("Ver ficha", true);
-        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(-2, d(42));
-        bp.topMargin = d(12);
-        buttons.addView(button, bp);
-        TextView counter = label("1 / " + recommendations.size(), 12, Color.WHITE, true);
-        counter.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams counterParams = new LinearLayout.LayoutParams(-2, d(42));
-        counterParams.leftMargin = d(14);
-        counterParams.topMargin = d(12);
-        buttons.addView(counter, counterParams);
-        info.addView(buttons);
-        button.setOnClickListener(v -> openNode(activeNode[0]));
-        hero.addView(info, new FrameLayout.LayoutParams(-1, -1));
-        TextView actions = heroControl("⋮", "Acciones", v -> showActions(activeNode[0]));
-        FrameLayout.LayoutParams actionParams = new FrameLayout.LayoutParams(d(42), d(42), Gravity.TOP | Gravity.RIGHT);
-        actionParams.setMargins(0, d(12), d(12), 0);
-        hero.addView(actions, actionParams);
-        TextView previous = heroControl("‹", "Sugerencia anterior", v -> { });
-        TextView next = heroControl("›", "Siguiente sugerencia", v -> { });
-        FrameLayout.LayoutParams previousParams = new FrameLayout.LayoutParams(d(42), d(54), Gravity.CENTER_VERTICAL | Gravity.LEFT);
-        previousParams.leftMargin = d(10);
-        FrameLayout.LayoutParams nextParams = new FrameLayout.LayoutParams(d(42), d(54), Gravity.CENTER_VERTICAL | Gravity.RIGHT);
-        nextParams.rightMargin = d(10);
-        hero.addView(previous, previousParams);
-        hero.addView(next, nextParams);
-        int[] current = {0};
-        Runnable update = () -> {
-            JSONObject selected = recommendations.get(current[0]);
-            activeNode[0] = selected;
-            loadImage(selected.optString("poster_url", ""), image, true);
-            title.setText(displayTitle(selected));
-            desc.setText(selected.optString("overview", ""));
-            counter.setText((current[0] + 1) + " / " + recommendations.size());
-            previous.setAlpha(current[0] == 0 ? 0.35f : 1f);
-            next.setAlpha(current[0] == recommendations.size() - 1 ? 0.35f : 1f);
-        };
-        previous.setOnClickListener(v -> {
-            if (current[0] > 0) { current[0]--; update.run(); }
-        });
-        next.setOnClickListener(v -> {
-            if (current[0] < recommendations.size() - 1) { current[0]++; update.run(); }
-        });
-        update.run();
-        LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(-1, d(330));
-        hp.setMargins(d(16), d(8), d(16), d(14));
-        content.addView(hero, hp);
-    }
-
-    TextView heroControl(String glyph, String hint, View.OnClickListener listener) {
-        TextView control = label(glyph, 28, Color.WHITE, true);
-        control.setGravity(Gravity.CENTER);
-        control.setContentDescription(hint);
-        control.setBackground(round(0xB8000000, d(22)));
-        control.setFocusable(true);
-        control.setClickable(true);
-        control.setOnClickListener(listener);
-        return control;
     }
 
     String displayTitle(JSONObject node) {
@@ -449,10 +335,12 @@ public class MainActivity extends Activity {
         section.addView(heading);
         HorizontalScrollView horizontal = new HorizontalScrollView(this);
         horizontal.setHorizontalScrollBarEnabled(false);
+        horizontal.setTag("zinema-lazy-posters");
         LinearLayout cards = new LinearLayout(this);
         cards.setPadding(d(16), 0, d(16), d(8));
-        for (JSONObject node : nodes) cards.addView(posterCard(node));
+        for (JSONObject node : nodes) cards.addView(posterCard(node, true));
         horizontal.addView(cards);
+        installLazyRowScroll(horizontal);
         section.addView(horizontal);
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
         p.bottomMargin = d(8);
@@ -460,6 +348,10 @@ public class MainActivity extends Activity {
     }
 
     View posterCard(JSONObject node) {
+        return posterCard(node, false);
+    }
+
+    View posterCard(JSONObject node, boolean lazyPosters) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setFocusable(true);
@@ -468,8 +360,13 @@ public class MainActivity extends Activity {
         FrameLayout art = new FrameLayout(this);
         art.setBackground(round(PANEL, d(10)));
         JSONArray mosaic = node.optJSONArray("mosaic_images");
-        if (node.optString("kind").equals("collection")
-                && !node.optBoolean("poster_is_assigned") && mosaic != null && mosaic.length() > 0) {
+        boolean isCollection = node.optString("kind").equals("collection");
+        boolean hasMosaic = mosaic != null && mosaic.length() > 0;
+        boolean showMosaic = isCollection && hasMosaic &&
+                (node.optBoolean("poster_is_assigned")
+                        ? prefs.getBoolean(collectionMosaicKey(node), false)
+                        : node.optInt("item_count") > 1);
+        if (showMosaic) {
             LinearLayout mosaicBox = new LinearLayout(this);
             mosaicBox.setOrientation(LinearLayout.VERTICAL);
             for (int r = 0; r < 2; r++) {
@@ -482,7 +379,7 @@ public class MainActivity extends Activity {
                     LinearLayout.LayoutParams tileParams = new LinearLayout.LayoutParams(0, -1, 1);
                     tileParams.setMargins(d(1), d(1), d(1), d(1));
                     mosaicRow.addView(tile, tileParams);
-                    if (index < mosaic.length()) loadImage(mosaic.optString(index), tile, false);
+                    if (index < mosaic.length()) showPoster(mosaic.optString(index), tile, lazyPosters);
                 }
                 mosaicBox.addView(mosaicRow, new LinearLayout.LayoutParams(-1, 0, 1));
             }
@@ -491,7 +388,15 @@ public class MainActivity extends Activity {
             ImageView poster = new ImageView(this);
             poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
             art.addView(poster, new FrameLayout.LayoutParams(-1, -1));
-            loadImage(node.optString("poster_url", ""), poster, false);
+            showPoster(node.optString("poster_url", ""), poster, lazyPosters);
+        }
+        if (isCollection) {
+            TextView collectionIcon = label("▦", 17, Color.WHITE, true);
+            collectionIcon.setGravity(Gravity.CENTER);
+            collectionIcon.setContentDescription("Colección");
+            FrameLayout.LayoutParams collectionParams = new FrameLayout.LayoutParams(d(34), d(34), Gravity.TOP | Gravity.LEFT);
+            collectionParams.setMargins(d(6), d(6), 0, 0);
+            art.addView(collectionIcon, collectionParams);
         }
         LinearLayout.LayoutParams ap = new LinearLayout.LayoutParams(width, d(204));
         card.addView(art, ap);
@@ -511,6 +416,15 @@ public class MainActivity extends Activity {
         actionParams.setMargins(0, d(6), d(6), 0);
         art.addView(actions, actionParams);
         actions.setOnClickListener(v -> showActions(node));
+        if (isNodeSeen(node)) {
+            TextView seen = label("✓ VISTO", 10, Color.WHITE, true);
+            seen.setGravity(Gravity.CENTER);
+            seen.setPadding(d(8), d(5), d(8), d(5));
+            seen.setBackground(round(0xDD22936F, d(10)));
+            FrameLayout.LayoutParams seenParams = new FrameLayout.LayoutParams(-2, -2, Gravity.LEFT | Gravity.BOTTOM);
+            seenParams.setMargins(d(7), 0, 0, d(7));
+            art.addView(seen, seenParams);
+        }
         LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(width, -2);
         cp.setMargins(0, 0, d(12), 0);
         card.setOnClickListener(v -> openNode(node));
@@ -566,29 +480,114 @@ public class MainActivity extends Activity {
             return;
         }
         String url = path.startsWith("http") ? path : server + (path.startsWith("/") ? path : "/" + path);
+        if (url.equals(requestedImages.get(target))) return;
         target.setTag(url);
+        requestedImages.put(target, url);
         Bitmap cached = imageCache.get(url);
         if (cached != null) { target.setImageBitmap(cached); return; }
+        List<ImageView> pending = pendingImageTargets.get(url);
+        if (pending != null) {
+            pending.add(target);
+            return;
+        }
+        pending = new ArrayList<>();
+        pending.add(target);
+        pendingImageTargets.put(url, pending);
         io.execute(() -> {
             HttpURLConnection connection = null;
+            Bitmap bitmap = null;
             try {
                 connection = (HttpURLConnection) new URL(url).openConnection();
                 connection.setConnectTimeout(10000);
                 connection.setReadTimeout(15000);
                 connection.setInstanceFollowRedirects(true);
-                Bitmap bitmap = BitmapFactory.decodeStream(connection.getInputStream());
-                if (bitmap != null) {
-                    imageCache.put(url, bitmap);
-                    runOnUiThread(() -> { if (url.equals(target.getTag())) target.setImageBitmap(bitmap); });
-                }
+                bitmap = BitmapFactory.decodeStream(connection.getInputStream());
             } catch (Exception ignored) {
             } finally { if (connection != null) connection.disconnect(); }
+            Bitmap result = bitmap;
+            runOnUiThread(() -> {
+                List<ImageView> targets = pendingImageTargets.remove(url);
+                if (result != null) imageCache.put(url, result);
+                if (targets == null || result == null) return;
+                for (ImageView image : targets) {
+                    if (url.equals(image.getTag())) image.setImageBitmap(result);
+                }
+            });
         });
+    }
+
+    void showPoster(String path, ImageView target, boolean lazy) {
+        if (!lazy) {
+            loadImage(path, target, false);
+            return;
+        }
+        if (path == null || path.trim().isEmpty()) {
+            target.setBackground(round(PANEL, d(8)));
+            return;
+        }
+        String url = path.startsWith("http") ? path : server + (path.startsWith("/") ? path : "/" + path);
+        target.setTag(url);
+        Bitmap cached = imageCache.get(url);
+        if (cached != null) {
+            target.setImageBitmap(cached);
+            requestedImages.put(target, url);
+        }
+    }
+
+    void installLazyRowScroll(HorizontalScrollView horizontal) {
+        horizontal.setOnScrollChangeListener((View view, int x, int y, int oldX, int oldY) ->
+                loadLazyRow(horizontal));
+        horizontal.post(() -> loadLazyRow(horizontal));
+    }
+
+    void loadVisibleLazyRows() {
+        if (content == null) return;
+        loadVisibleLazyRowsIn(content);
+    }
+
+    void loadVisibleLazyRowsIn(View view) {
+        if (view instanceof HorizontalScrollView && "zinema-lazy-posters".equals(view.getTag())) {
+            loadLazyRow((HorizontalScrollView) view);
+            return;
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) loadVisibleLazyRowsIn(group.getChildAt(i));
+        }
+    }
+
+    void loadLazyRow(HorizontalScrollView horizontal) {
+        Rect visible = new Rect();
+        if (!horizontal.getGlobalVisibleRect(visible) || horizontal.getChildCount() == 0) return;
+        ViewGroup cards = (ViewGroup) horizontal.getChildAt(0);
+        int cardStep = cards.getChildCount() == 0 ? d(154) : cards.getChildAt(0).getWidth() + d(10);
+        int end = horizontal.getScrollX() + horizontal.getWidth() + cardStep * 3;
+        for (int i = 0; i < cards.getChildCount(); i++) {
+            View card = cards.getChildAt(i);
+            if (card.getRight() >= horizontal.getScrollX() && card.getLeft() <= end) {
+                loadDeferredPosters(card);
+            }
+        }
+    }
+
+    void loadDeferredPosters(View view) {
+        if (view instanceof ImageView) {
+            Object value = view.getTag();
+            if (value instanceof String && ((String) value).startsWith("http")) {
+                loadImage((String) value, (ImageView) view, false);
+            }
+            return;
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) loadDeferredPosters(group.getChildAt(i));
+        }
     }
 
     void openLibrary(String library) {
         libraryMode = true;
         showingDetail = false;
+        lastSearchQuery = null;
         selectedSection = library;
         currentLibrary = library;
         breadcrumbs.clear();
@@ -603,8 +602,12 @@ public class MainActivity extends Activity {
     }
 
     void renderListing(String title, List<JSONObject> nodes) {
+        renderListing(title, "Explora tu biblioteca", nodes);
+    }
+
+    void renderListing(String title, String subtitle, List<JSONObject> nodes) {
         content.removeAllViews();
-        addSectionHeader(title, "Explora tu biblioteca");
+        addSectionHeader(title, subtitle);
         addGrid(nodes);
         if (nodes.isEmpty()) addEmpty("No hay títulos en esta sección.");
     }
@@ -664,7 +667,18 @@ public class MainActivity extends Activity {
             try {
                 JSONArray children = getArray("/api/v1/catalog?library=" + currentLibrary +
                         "&parent_id=" + enc(collection.optString("id")));
-                runOnUiThread(() -> renderListing(displayTitle(collection), toList(children)));
+                List<JSONObject> items = toList(children);
+                int movieCount = 0;
+                int collectionCount = 0;
+                for (JSONObject item : items) {
+                    if ("movie".equals(item.optString("kind"))) movieCount++;
+                    else if ("collection".equals(item.optString("kind"))) collectionCount++;
+                }
+                String subtitle = movieCount + (movieCount == 1 ? " película" : " películas");
+                if (collectionCount > 0) subtitle += " · " + collectionCount +
+                        (collectionCount == 1 ? " colección" : " colecciones");
+                String collectionSubtitle = subtitle;
+                runOnUiThread(() -> renderListing(displayTitle(collection), collectionSubtitle, items));
             } catch (Exception e) { runOnUiThread(() -> renderError(e.getMessage())); }
         });
     }
@@ -717,8 +731,20 @@ public class MainActivity extends Activity {
         List<Runnable> handlers = new ArrayList<>();
         String kind = node.optString("kind");
         if (kind.equals("movie") || kind.equals("series")) {
+            actions.add("Marcar como visto");
+            handlers.add(() -> setNodeWatched(node, true));
+            actions.add("Marcar como no visto");
+            handlers.add(() -> setNodeWatched(node, false));
             actions.add("Reintentar metadata (TMDb)");
             handlers.add(() -> retryMetadata(node));
+        }
+        if (kind.equals("collection") && node.optBoolean("poster_is_assigned")) {
+            boolean showingMosaic = prefs.getBoolean(collectionMosaicKey(node), false);
+            actions.add(showingMosaic ? "Usar póster manual" : "Usar mosaico de pósters");
+            handlers.add(() -> {
+                prefs.edit().putBoolean(collectionMosaicKey(node), !showingMosaic).apply();
+                refreshCurrentScreen();
+            });
         }
         actions.add("Metadata manual");
         handlers.add(() -> showMetadataEditor(node, new JSONArray()));
@@ -726,6 +752,229 @@ public class MainActivity extends Activity {
                 .setTitle("Acciones")
                 .setItems(actions.toArray(new String[0]), (dialog, which) -> handlers.get(which).run())
                 .show();
+    }
+
+    String collectionMosaicKey(JSONObject node) {
+        return "collection:mosaic:" + node.optString("id", "");
+    }
+
+    String nodeSeenKey(String nodeId) { return "seen:node:" + nodeId; }
+    String mediaSeenKey(JSONObject media) {
+        String id = media.optString("id", "");
+        if (id.isEmpty() || id.equals("null")) id = media.optString("stream_url", media.optString("stream", ""));
+        return "seen:file:" + id;
+    }
+    boolean isNodeSeen(JSONObject node) {
+        String id = node.optString("id", "");
+        return !id.isEmpty() && prefs.getBoolean(nodeSeenKey(id), false);
+    }
+    boolean isMediaSeen(JSONObject media) { return prefs.getBoolean(mediaSeenKey(media), false); }
+
+    void setNodeWatched(JSONObject node, boolean seen) {
+        String id = node.optString("id", "");
+        if (id.isEmpty()) return;
+        setNodeSeen(id, seen);
+        removeContinueForNode(id);
+        io.execute(() -> {
+            try {
+                JSONObject full = getJson("/api/v1/catalog/" + enc(id));
+                removeContinueForFiles(full.optJSONArray("files"));
+                if ("series".equals(node.optString("kind"))) {
+                    JSONArray seasons = full.optJSONArray("children");
+                    if (seasons != null) {
+                        for (int i = 0; i < seasons.length(); i++) {
+                            JSONObject season = seasons.optJSONObject(i);
+                            if (season != null) {
+                                removeContinueForNode(season.optString("id"));
+                                JSONObject fullSeason = getJson("/api/v1/catalog/" + enc(season.optString("id")));
+                                removeContinueForFiles(fullSeason.optJSONArray("files"));
+                            }
+                        }
+                    }
+                }
+                refreshWatchedAncestors(full.optString("parent_id", ""));
+            } catch (Exception ignored) { runOnUiThread(this::refreshCurrentScreen); }
+        });
+        Toast.makeText(this, seen ? "Marcado como visto" : "Marcado como no visto", Toast.LENGTH_SHORT).show();
+        refreshCurrentScreen();
+    }
+
+    void setNodeSeen(String id, boolean seen) {
+        SharedPreferences.Editor editor = prefs.edit();
+        if (seen) editor.putBoolean(nodeSeenKey(id), true);
+        else editor.remove(nodeSeenKey(id));
+        editor.apply();
+    }
+
+    void removeContinueForNode(String nodeId) {
+        SharedPreferences.Editor editor = prefs.edit();
+        for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
+            if (!entry.getKey().startsWith("watch:")) continue;
+            try {
+                JSONObject item = new JSONObject(String.valueOf(entry.getValue()));
+                if (nodeId.equals(item.optString("owner_node_id")) || nodeId.equals(item.optString("node_id"))) {
+                    editor.remove(entry.getKey());
+                }
+            } catch (JSONException ignored) { }
+        }
+        editor.apply();
+    }
+
+    void removeContinueForFiles(JSONArray files) {
+        if (files == null) return;
+        SharedPreferences.Editor editor = prefs.edit();
+        for (int i = 0; i < files.length(); i++) {
+            JSONObject file = files.optJSONObject(i);
+            if (file != null) editor.remove("watch:" + file.optString("stream_url", ""));
+        }
+        editor.apply();
+    }
+
+    void showMediaActions(JSONObject media, JSONObject owner) {
+        showMediaActions(media, owner, owner);
+    }
+
+    void showMediaActions(JSONObject media, JSONObject owner, JSONObject metadataNode) {
+        List<String> actions = new ArrayList<>();
+        List<Runnable> handlers = new ArrayList<>();
+        String metadataKind = metadataNode.optString("kind", "");
+        if (metadataKind.equals("movie") || metadataKind.equals("series")) {
+            actions.add("Reintentar metadata (TMDb)");
+            handlers.add(() -> retryMetadata(metadataNode));
+            actions.add("Metadata manual");
+            handlers.add(() -> showMetadataEditor(metadataNode, new JSONArray()));
+        }
+        actions.add("Marcar como visto");
+        handlers.add(() -> setMediaWatched(media, owner, true));
+        actions.add("Marcar como no visto");
+        handlers.add(() -> setMediaWatched(media, owner, false));
+        new AlertDialog.Builder(this).setTitle("Acciones")
+                .setItems(actions.toArray(new String[0]), (dialog, which) -> handlers.get(which).run())
+                .show();
+    }
+
+    void setMediaWatched(JSONObject media, JSONObject owner, boolean seen) {
+        String stream = media.optString("stream_url", media.optString("stream", ""));
+        String key = mediaSeenKey(media);
+        if (seen) prefs.edit().putBoolean(key, true).remove("watch:" + stream).apply();
+        else prefs.edit().remove(key).remove("watch:" + stream).apply();
+        if ("movie".equals(owner.optString("kind"))) setNodeSeen(owner.optString("id"), seen);
+        if ("season".equals(owner.optString("kind"))) {
+            if (owner.optJSONArray("files") != null) refreshSeasonSeen(owner);
+            else io.execute(() -> {
+                try {
+                    JSONObject fullSeason = getJson("/api/v1/catalog/" + enc(owner.optString("id")));
+                    runOnUiThread(() -> refreshSeasonSeen(fullSeason));
+                } catch (Exception ignored) { }
+            });
+        }
+        else refreshParentOfNode(owner.optString("id", ""));
+        Toast.makeText(this, seen ? "Marcado como visto" : "Marcado como no visto", Toast.LENGTH_SHORT).show();
+        refreshCurrentScreen();
+    }
+
+    void refreshSeasonSeen(JSONObject season) {
+        JSONArray files = season.optJSONArray("files");
+        boolean allSeen = files != null && files.length() > 0;
+        if (files != null) {
+            for (int i = 0; i < files.length(); i++) {
+                JSONObject file = files.optJSONObject(i);
+                if (file == null || !isMediaSeen(file)) { allSeen = false; break; }
+            }
+        }
+        setNodeSeen(season.optString("id"), allSeen);
+        refreshWatchedAncestors(season.optString("parent_id", ""));
+    }
+
+    void refreshParentOfNode(String nodeId) {
+        if (nodeId == null || nodeId.isEmpty() || nodeId.equals("null")) return;
+        io.execute(() -> {
+            try {
+                JSONObject node = getJson("/api/v1/catalog/" + enc(nodeId));
+                refreshWatchedAncestors(node.optString("parent_id", ""));
+            } catch (Exception ignored) { }
+        });
+    }
+
+    void refreshWatchedAncestors(String parentId) {
+        if (parentId == null || parentId.isEmpty() || parentId.equals("null")) return;
+        io.execute(() -> {
+            String nextParent = parentId;
+            while (!nextParent.isEmpty() && !nextParent.equals("null")) {
+                try {
+                    JSONObject parent = getJson("/api/v1/catalog/" + enc(nextParent));
+                    JSONArray children = parent.optJSONArray("children");
+                    boolean allSeen = children != null && children.length() > 0;
+                    if (children != null) {
+                        for (int i = 0; i < children.length(); i++) {
+                            JSONObject child = children.optJSONObject(i);
+                            if (child == null || !isNodeSeen(child)) { allSeen = false; break; }
+                        }
+                    }
+                    setNodeSeen(parent.optString("id"), allSeen);
+                    nextParent = parent.optString("parent_id", "");
+                } catch (Exception e) { break; }
+            }
+            runOnUiThread(this::refreshCurrentScreen);
+        });
+    }
+
+    void showResumeActions(JSONObject item) {
+        String[] actions = {"Marcar como visto", "Marcar como no visto", "Quitar de Seguir viendo"};
+        new AlertDialog.Builder(this).setTitle("Acciones")
+                .setItems(actions, (dialog, which) -> {
+                    if (which == 0) setResumeSeen(item, true);
+                    else if (which == 1) setResumeSeen(item, false);
+                    else prefs.edit().remove("watch:" + item.optString("path", item.optString("stream"))).apply();
+                    refreshCurrentScreen();
+                }).show();
+    }
+
+    void setResumeSeen(JSONObject item, boolean seen) {
+        String nodeId = item.optString("owner_node_id", item.optString("node_id", ""));
+        String kind = item.optString("owner_kind", "");
+        JSONObject media = mediaFromProgress(item);
+        String mediaKey = mediaSeenKey(media);
+        SharedPreferences.Editor editor = prefs.edit().remove("watch:" + item.optString("path", item.optString("stream")));
+        if (seen) editor.putBoolean(mediaKey, true); else editor.remove(mediaKey);
+        editor.apply();
+        if (kind.equals("movie") || kind.equals("series")) {
+            setNodeSeen(nodeId, seen);
+            removeContinueForNode(nodeId);
+        }
+        if (kind.equals("season") && !nodeId.isEmpty()) {
+            io.execute(() -> {
+                try {
+                    JSONObject season = getJson("/api/v1/catalog/" + enc(nodeId));
+                    runOnUiThread(() -> refreshSeasonSeen(season));
+                } catch (Exception ignored) { }
+            });
+        } else if (!nodeId.isEmpty()) refreshParentOfNode(nodeId);
+    }
+
+    JSONObject mediaFromProgress(JSONObject item) {
+        JSONObject media = new JSONObject();
+        try {
+            media.put("id", item.optString("media_id", ""));
+            media.put("stream", item.optString("stream", ""));
+        } catch (JSONException ignored) { }
+        return media;
+    }
+
+    void refreshCurrentScreen() {
+        if (content == null || movies.size() + series.size() == 0) return;
+        if (showingDetail && !detailNodeId.isEmpty()) {
+            String id = detailNodeId;
+            io.execute(() -> {
+                try {
+                    JSONObject updated = getJson("/api/v1/catalog/" + enc(id));
+                    runOnUiThread(() -> renderDetail(updated));
+                } catch (Exception ignored) { }
+            });
+        } else if (!breadcrumbs.isEmpty()) showCollectionContents(breadcrumbs.get(breadcrumbs.size() - 1));
+        else if (libraryMode) openLibrary(currentLibrary);
+        else if (lastSearchQuery != null) performSearch(lastSearchQuery);
+        else renderHome();
     }
 
     void retryMetadata(JSONObject node) {
@@ -875,12 +1124,21 @@ public class MainActivity extends Activity {
         for (int i = 0; i < values.length(); i++) {
             String value = values.optString(i, "").trim();
             if (value.isEmpty()) continue;
+            String normalized = normalizeGenre(value);
+            if (normalized.equals("animacion")) value = "Animación";
+            else if (normalized.equals("fantasia")) value = "Fantasía";
             boolean exists = false;
             for (String current : destination) {
-                if (current.equalsIgnoreCase(value)) { exists = true; break; }
+                if (normalizeGenre(current).equals(normalizeGenre(value))) { exists = true; break; }
             }
             if (!exists) destination.add(value);
         }
+    }
+
+    String normalizeGenre(String value) {
+        String normalized = Normalizer.normalize(value, Normalizer.Form.NFD)
+                .replaceAll("\\p{M}+", "").trim().toLowerCase(java.util.Locale.ROOT);
+        return normalized.replaceAll("\\s+", " ");
     }
 
     void showGenrePicker(Button button, List<String> options, List<String> selected) {
@@ -1151,6 +1409,11 @@ public class MainActivity extends Activity {
         TextView kind = label(node.optString("kind", "").toUpperCase(), 11, 0xFFFF646B, true);
         kind.setLetterSpacing(0.12f);
         info.addView(kind);
+        if (isNodeSeen(node)) {
+            TextView watched = label("✓  VISTO", 11, 0xFF79E3B7, true);
+            watched.setPadding(0, d(5), 0, 0);
+            info.addView(watched);
+        }
         info.addView(label(displayTitle(node), 30, Color.WHITE, true));
         String meta = node.optString("kind").equals("series")
                 ? cardSubtitle(node)
@@ -1197,7 +1460,10 @@ public class MainActivity extends Activity {
             addSectionHeader(node.optString("kind").equals("series") ? "Temporadas" : "Explorar", "Selecciona para continuar");
             addGrid(toList(children));
         }
-        if (files != null && files.length() > 0) addEpisodeList(files, node.optString("poster_url", ""));
+        if (files != null && files.length() > 0) {
+            if ("movie".equals(node.optString("kind"))) addMovieFileCard(files, node.optString("poster_url", ""), node);
+            else addEpisodeList(files, node.optString("poster_url", ""), node);
+        }
         if ((files == null || files.length() == 0) && (children == null || children.length() == 0)
                 && !node.optString("kind").equals("movie")) addEmpty("No se encontraron episodios.");
     }
@@ -1211,7 +1477,50 @@ public class MainActivity extends Activity {
         return result.toString();
     }
 
-    void addEpisodeList(JSONArray files, String fallbackPoster) {
+    void addMovieFileCard(JSONArray files, String fallbackPoster, JSONObject owner) {
+        addSectionHeader("Película", "Archivo de vídeo disponible");
+        for (int i = 0; i < files.length(); i++) {
+            JSONObject file = files.optJSONObject(i);
+            if (file == null) continue;
+            LinearLayout item = new LinearLayout(this);
+            item.setGravity(Gravity.CENTER_VERTICAL);
+            item.setPadding(d(12), d(12), d(16), d(12));
+            item.setBackground(round(PANEL, d(12)));
+            ImageView poster = new ImageView(this);
+            poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            poster.setBackground(round(BG, d(8)));
+            String cover = file.optString("poster_url", fallbackPoster);
+            loadImage(cover, poster, false);
+            item.addView(poster, new LinearLayout.LayoutParams(d(72), d(100)));
+
+            LinearLayout details = new LinearLayout(this);
+            details.setOrientation(LinearLayout.VERTICAL);
+            details.setPadding(d(14), 0, d(8), 0);
+            TextView name = label(file.optString("filename", file.optString("title", "Película")),
+                    15, Color.WHITE, true);
+            name.setMaxLines(2);
+            details.addView(name);
+            String extension = file.optString("extension", "").replace(".", "").toUpperCase();
+            TextView technical = label(extension + "   ·   " + formatSize(file.optLong("size_bytes")),
+                    12, MUTED, false);
+            LinearLayout.LayoutParams technicalParams = new LinearLayout.LayoutParams(-1, -2);
+            technicalParams.topMargin = d(6);
+            details.addView(technical, technicalParams);
+            TextView play = label("▶  Reproducir", 13, 0xFFFF858A, true);
+            LinearLayout.LayoutParams playParams = new LinearLayout.LayoutParams(-1, -2);
+            playParams.topMargin = d(12);
+            details.addView(play, playParams);
+            item.addView(details, new LinearLayout.LayoutParams(0, -2, 1));
+            LinearLayout.LayoutParams itemParams = new LinearLayout.LayoutParams(-1, -2);
+            itemParams.setMargins(d(16), 0, d(16), d(9));
+            content.addView(item, itemParams);
+            item.setOnClickListener(v -> launchPlayer(file.optString("stream_url"),
+                    file.optString("title", "Película"), cover, owner.optString("id", ""),
+                    file.optString("id", ""), owner.optString("kind", "")));
+        }
+    }
+
+    void addEpisodeList(JSONArray files, String fallbackPoster, JSONObject owner) {
         addSectionHeader("Episodios", files.length() + (files.length() == 1 ? " vídeo" : " vídeos"));
         for (int i = 0; i < files.length(); i++) {
             JSONObject file = files.optJSONObject(i);
@@ -1226,17 +1535,26 @@ public class MainActivity extends Activity {
             LinearLayout texts = new LinearLayout(this);
             texts.setOrientation(LinearLayout.VERTICAL);
             TextView name = label(file.optString("title", "Vídeo"), 15, Color.WHITE, true);
-            TextView sub = label(file.optString("extension", "").replace(".", "").toUpperCase() + "   ·   " + formatSize(file.optLong("size_bytes")), 12, MUTED, false);
+            String watched = isMediaSeen(file) ? "   ·   ✓ VISTO" : "";
+            TextView sub = label(file.optString("extension", "").replace(".", "").toUpperCase() + "   ·   " + formatSize(file.optLong("size_bytes")) + watched,
+                    12, isMediaSeen(file) ? 0xFF79E3B7 : MUTED, false);
             texts.addView(name);
             LinearLayout.LayoutParams subP = new LinearLayout.LayoutParams(-1, -2);
             subP.topMargin = d(4);
             texts.addView(sub, subP);
             item.addView(texts, new LinearLayout.LayoutParams(0, -2, 1));
+            TextView actions = label("⋮", 22, Color.WHITE, true);
+            actions.setGravity(Gravity.CENTER);
+            actions.setFocusable(true);
+            actions.setMinWidth(d(36));
+            item.addView(actions);
             LinearLayout.LayoutParams ip = new LinearLayout.LayoutParams(-1, -2);
             ip.setMargins(d(16), 0, d(16), d(8));
             content.addView(item, ip);
             item.setOnClickListener(v -> launchPlayer(file.optString("stream_url"),
-                    file.optString("title", "Zinema"), file.optString("poster_url", fallbackPoster)));
+                    file.optString("title", "Zinema"), file.optString("poster_url", fallbackPoster),
+                    owner.optString("id", ""), file.optString("id", ""), owner.optString("kind", "")));
+            actions.setOnClickListener(v -> showMediaActions(file, owner));
         }
     }
 
@@ -1245,7 +1563,8 @@ public class MainActivity extends Activity {
         if (files != null && files.length() > 0) {
             JSONObject file = files.optJSONObject(0);
             if (file != null) launchPlayer(file.optString("stream_url"),
-                    file.optString("title", displayTitle(node)), file.optString("poster_url", node.optString("poster_url", "")));
+                    file.optString("title", displayTitle(node)), file.optString("poster_url", node.optString("poster_url", "")),
+                    node.optString("id", ""), file.optString("id", ""), node.optString("kind", ""));
             return;
         }
         JSONArray children = node.optJSONArray("children");
@@ -1272,6 +1591,8 @@ public class MainActivity extends Activity {
 
     void showSearch() {
         showingDetail = false;
+        libraryMode = false;
+        breadcrumbs.clear();
         lastSearchQuery = null;
         if (backButton != null) backButton.setVisibility(View.VISIBLE);
         content.removeAllViews();
@@ -1336,6 +1657,7 @@ public class MainActivity extends Activity {
         textBox.setPadding(d(12), 0, d(8), 0);
         textBox.addView(label(result.optString("metadata_title", result.optString("title", "Vídeo")), 15, Color.WHITE, true));
         TextView detail = label(searchSubtitle(result) + "   ·   " + result.optString("extension", "").replace(".", "").toUpperCase(), 12, MUTED, false);
+        if (isMediaSeen(result)) detail.setText(detail.getText() + "   ·   ✓ VISTO");
         LinearLayout.LayoutParams detailP = new LinearLayout.LayoutParams(-1, -2);
         detailP.topMargin = d(5);
         textBox.addView(detail, detailP);
@@ -1350,18 +1672,23 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
         p.setMargins(d(16), 0, d(16), d(8));
         content.addView(row, p);
+        String seriesId = result.optString("series_id", "");
+        boolean isEpisode = !seriesId.isEmpty() && !seriesId.equals("null");
+        String metadataId = isEpisode ? seriesId : result.optString("node_id", "");
+        String ownerId = isEpisode ? result.optString("node_id", "") : metadataId;
+        JSONObject metadataNode = new JSONObject();
+        JSONObject owner = new JSONObject();
+        try {
+            metadataNode.put("id", metadataId);
+            metadataNode.put("kind", isEpisode ? "series" : "movie");
+            owner.put("id", ownerId);
+            owner.put("kind", isEpisode ? "season" : "movie");
+        } catch (JSONException ignored) { }
         row.setOnClickListener(v -> launchPlayer(
                 result.optString("stream_url", "/api/v1/items/" + result.optString("id") + "/stream"),
-                result.optString("title", "Zinema"), result.optString("poster_url", "")));
-        actions.setOnClickListener(v -> {
-            JSONObject target = new JSONObject();
-            try {
-                String metadataNode = result.optString("series_id", "");
-                if (metadataNode.isEmpty() || metadataNode.equals("null")) metadataNode = result.optString("node_id", "");
-                target.put("id", metadataNode);
-                showActions(target);
-            } catch (JSONException ignored) { }
-        });
+                result.optString("title", "Zinema"), result.optString("poster_url", ""),
+                ownerId, result.optString("id", ""), owner.optString("kind", "")));
+        actions.setOnClickListener(v -> showMediaActions(result, owner, metadataNode));
     }
 
     String searchSubtitle(JSONObject result) {
@@ -1400,6 +1727,7 @@ public class MainActivity extends Activity {
                     server = value;
                     prefs.edit().putString("server", server).apply();
                     imageCache.evictAll();
+                    requestedImages.clear();
                     loadHome();
                 }).show();
     }
@@ -1464,7 +1792,9 @@ public class MainActivity extends Activity {
             if (!entry.getKey().startsWith("watch:")) continue;
             try {
                 JSONObject item = new JSONObject(String.valueOf(entry.getValue()));
-                if (item.optInt("position") > 10000) list.add(item);
+                String ownerId = item.optString("owner_node_id", item.optString("node_id", ""));
+                if (item.optInt("position") > 10000 && !isMediaSeen(mediaFromProgress(item))
+                        && (ownerId.isEmpty() || !prefs.getBoolean(nodeSeenKey(ownerId), false))) list.add(item);
             } catch (JSONException ignored) { }
         }
         Collections.sort(list, (a, b) -> Long.compare(b.optLong("updated"), a.optLong("updated")));
@@ -1479,12 +1809,16 @@ public class MainActivity extends Activity {
         section.addView(heading);
         HorizontalScrollView horizontal = new HorizontalScrollView(this);
         horizontal.setHorizontalScrollBarEnabled(false);
+        horizontal.setClipToPadding(false);
+        horizontal.setTag("zinema-lazy-posters");
         LinearLayout cards = new LinearLayout(this);
         cards.setPadding(d(16), 0, d(16), d(8));
         for (JSONObject item : items) {
             FrameLayout card = new FrameLayout(this);
             card.setBackground(round(PANEL, d(12)));
             card.setClipToOutline(true);
+            card.setFocusable(true);
+            card.setClickable(true);
             ImageView poster = new ImageView(this);
             poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
             card.addView(poster, new FrameLayout.LayoutParams(-1, -1));
@@ -1500,23 +1834,32 @@ public class MainActivity extends Activity {
                     10, 0xFFFF858A, true));
             TextView name = label(item.optString("title", "Vídeo"), 14, Color.WHITE, true);
             name.setMaxLines(2);
-            LinearLayout.LayoutParams np = new LinearLayout.LayoutParams(-1, -2);
-            np.topMargin = d(5);
-            details.addView(name, np);
+            LinearLayout.LayoutParams nameParams = new LinearLayout.LayoutParams(-1, -2);
+            nameParams.topMargin = d(5);
+            details.addView(name, nameParams);
             card.addView(details, new FrameLayout.LayoutParams(-1, -1));
-            card.setFocusable(true);
-            card.setClickable(true);
             String cover = item.optString("poster_url", "");
             if (cover.isEmpty()) cover = posterByStream.get(item.optString("stream", ""));
-            final String resumePoster = cover == null ? "" : cover;
-            loadImage(resumePoster, poster, true);
+            String resumePoster = cover == null ? "" : cover;
+            showPoster(resumePoster, poster, true);
             card.setOnClickListener(v -> launchPlayer(item.optString("stream"),
-                    item.optString("title", "Zinema"), resumePoster));
-            LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(d(224), d(148));
-            cp.setMargins(0, 0, d(10), 0);
-            cards.addView(card, cp);
+                    item.optString("title", "Zinema"), resumePoster,
+                    item.optString("owner_node_id", item.optString("node_id", "")),
+                    item.optString("media_id", ""), item.optString("owner_kind", "")));
+            TextView actions = label("⋮", 20, Color.WHITE, true);
+            actions.setGravity(Gravity.CENTER);
+            actions.setFocusable(true);
+            actions.setBackground(round(0xCC111318, d(18)));
+            FrameLayout.LayoutParams actionParams = new FrameLayout.LayoutParams(d(34), d(34), Gravity.TOP | Gravity.RIGHT);
+            actionParams.setMargins(0, d(6), d(6), 0);
+            card.addView(actions, actionParams);
+            actions.setOnClickListener(v -> showResumeActions(item));
+            LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(d(224), d(148));
+            cardParams.setMargins(0, 0, d(10), 0);
+            cards.addView(card, cardParams);
         }
         horizontal.addView(cards);
+        installLazyRowScroll(horizontal);
         section.addView(horizontal);
         content.addView(section);
     }
@@ -1531,11 +1874,16 @@ public class MainActivity extends Activity {
     }
 
     void launchPlayer(String path, String title, String posterUrl) {
+        launchPlayer(path, title, posterUrl, "", "", "");
+    }
+
+    void launchPlayer(String path, String title, String posterUrl,
+                      String ownerNodeId, String mediaId, String ownerKind) {
         if (path == null || path.isEmpty()) return;
         String url = path.startsWith("http") ? path : server + (path.startsWith("/") ? path : "/" + path);
         String key = "watch:" + path;
-        int position = 0;
-        try { position = new JSONObject(prefs.getString(key, "{}")).optInt("position"); }
+        long position = 0L;
+        try { position = new JSONObject(prefs.getString(key, "{}")).optLong("position"); }
         catch (JSONException ignored) { }
         Intent intent = new Intent(this, PlayerActivity.class);
         intent.putExtra("url", url);
@@ -1543,6 +1891,9 @@ public class MainActivity extends Activity {
         intent.putExtra("title", title);
         intent.putExtra("poster_url", posterUrl);
         intent.putExtra("position", position);
+        intent.putExtra("owner_node_id", ownerNodeId);
+        intent.putExtra("media_id", mediaId);
+        intent.putExtra("owner_kind", ownerKind);
         startActivity(intent);
     }
 
