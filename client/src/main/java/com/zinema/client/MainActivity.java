@@ -89,6 +89,14 @@ public class MainActivity extends Activity {
     boolean showingAdmin;
     boolean introShowing;
     WebView introWebView;
+    boolean startupPrefetchStarted;
+    boolean startupPrefetchPending = true;
+    boolean startupPrefetchReady;
+    boolean startupHomeAwaiting;
+    List<JSONObject> startupMovies = new ArrayList<>();
+    List<JSONObject> startupSeries = new ArrayList<>();
+    JSONArray startupItems;
+    String startupPrefetchError;
     String adminReturnDetailId = "";
     boolean metadataEditorFromDetail;
     boolean metadataEditorMode;
@@ -106,6 +114,7 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         server = trimBase(prefs.getString("server", DEFAULT_SERVER));
         serverName = prefs.getString("server_name", "Zinema NAS");
+        startStartupPrefetch();
         showIntro();
     }
 
@@ -142,6 +151,66 @@ public class MainActivity extends Activity {
         }
         buildShell("Inicio");
         loadHome();
+    }
+
+    void startStartupPrefetch() {
+        synchronized (this) {
+            if (startupPrefetchStarted) return;
+            startupPrefetchStarted = true;
+        }
+        io.execute(() -> {
+            List<JSONObject> movieList = null;
+            List<JSONObject> seriesList = null;
+            JSONArray items = null;
+            String error = null;
+            try {
+                JSONArray movieRows = getArray("/api/v1/catalog?library=movies");
+                JSONArray seriesRows = getArray("/api/v1/catalog?library=series");
+                items = getArray("/api/v1/items?limit=500");
+                movieList = toList(movieRows);
+                seriesList = toList(seriesRows);
+                sortNewestFirst(movieList);
+                sortNewestFirst(seriesList);
+            } catch (Exception e) {
+                error = e.getMessage();
+            }
+            synchronized (MainActivity.this) {
+                startupMovies = movieList;
+                startupSeries = seriesList;
+                startupItems = items;
+                startupPrefetchError = error;
+                startupPrefetchReady = true;
+            }
+            runOnUiThread(this::consumeStartupPrefetch);
+        });
+    }
+
+    void consumeStartupPrefetch() {
+        List<JSONObject> movieList;
+        List<JSONObject> seriesList;
+        JSONArray items;
+        String error;
+        synchronized (this) {
+            if (!startupPrefetchPending || !startupPrefetchReady || !startupHomeAwaiting) return;
+            startupPrefetchPending = false;
+            startupHomeAwaiting = false;
+            movieList = startupMovies;
+            seriesList = startupSeries;
+            items = startupItems;
+            error = startupPrefetchError;
+        }
+        if (error != null) {
+            renderError(error);
+            return;
+        }
+        movies = movieList == null ? new ArrayList<>() : movieList;
+        series = seriesList == null ? new ArrayList<>() : seriesList;
+        if (items != null) cachePosterByStream(items);
+        renderHome();
+    }
+
+    void leaveStartupHomeWait() {
+        startupHomeAwaiting = false;
     }
 
     int d(float value) { return (int) (value * getResources().getDisplayMetrics().density + 0.5f); }
@@ -336,6 +405,15 @@ public class MainActivity extends Activity {
         breadcrumbs.clear();
         buildShell("Inicio");
         showLoading("Conectando con tu biblioteca…");
+        if (startupPrefetchPending) {
+            startupHomeAwaiting = true;
+            consumeStartupPrefetch();
+            return;
+        }
+        fetchHomeFromServer();
+    }
+
+    void fetchHomeFromServer() {
         io.execute(() -> {
             try {
                 JSONArray m = getArray("/api/v1/catalog?library=movies");
@@ -663,6 +741,7 @@ public class MainActivity extends Activity {
     }
 
     void openLibrary(String library) {
+        leaveStartupHomeWait();
         libraryMode = true;
         showingDetail = false;
         lastSearchQuery = null;
@@ -719,6 +798,7 @@ public class MainActivity extends Activity {
     }
 
     void openNode(JSONObject node) {
+        leaveStartupHomeWait();
         String kind = node.optString("kind");
         if (kind.equals("collection")) {
             showingDetail = false;
@@ -1906,6 +1986,7 @@ public class MainActivity extends Activity {
     }
 
     void showSearch() {
+        leaveStartupHomeWait();
         showingDetail = false;
         libraryMode = false;
         breadcrumbs.clear();
@@ -2018,6 +2099,7 @@ public class MainActivity extends Activity {
     }
 
     void showSettings() {
+        leaveStartupHomeWait();
         if (!showingAdmin) adminReturnDetailId = showingDetail ? detailNodeId : "";
         showingAdmin = true;
         showingDetail = false;
@@ -2136,8 +2218,13 @@ public class MainActivity extends Activity {
             String name = nameInput.getText().toString().trim();
             if (value.isEmpty()) { Toast.makeText(this, t("Escribe una URL válida."), Toast.LENGTH_LONG).show(); return; }
             if (name.isEmpty()) { Toast.makeText(this, t("El nombre del servidor no puede estar vacío."), Toast.LENGTH_LONG).show(); return; }
+            boolean serverChanged = !server.equals(value);
             server = value;
             serverName = name;
+            if (serverChanged) {
+                startupPrefetchPending = false;
+                startupHomeAwaiting = false;
+            }
             prefs.edit().putString("server", server).putString("server_name", serverName).apply();
             imageCache.evictAll();
             requestedImages.clear();
