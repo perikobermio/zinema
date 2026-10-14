@@ -4,7 +4,7 @@
 
     <application
         android:allowBackup="false"
-        android:icon="@drawable/ic_launcher"
+        android:icon="@drawable/ic_launcher_brand"
         android:label="Zinema"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="true">
