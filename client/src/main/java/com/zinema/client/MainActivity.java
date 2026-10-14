@@ -1733,7 +1733,11 @@ public class MainActivity extends Activity {
         ImageView bgImage = new ImageView(this);
         bgImage.setScaleType(ImageView.ScaleType.CENTER_CROP);
         banner.addView(bgImage, new FrameLayout.LayoutParams(-1, -1));
-        loadImage(node.optString("backdrop_url", node.optString("poster_url", "")), bgImage, true);
+        String detailBackdrop = node.optString("backdrop_url", "");
+        if (detailBackdrop.isEmpty() || "null".equalsIgnoreCase(detailBackdrop))
+            detailBackdrop = node.optString("poster_url", "");
+        if ("null".equalsIgnoreCase(detailBackdrop)) detailBackdrop = "";
+        loadImage(detailBackdrop, bgImage, true);
         View shade = new View(this);
         shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
                 new int[]{BG, 0xCC090A0D, 0x22090A0D}));
