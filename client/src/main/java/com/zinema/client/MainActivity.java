@@ -10,8 +10,6 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.util.LruCache;
@@ -65,7 +63,6 @@ public class MainActivity extends Activity {
     static final String PREFS = "zinema_client";
     static final String DEFAULT_SERVER = "https://zinema.ebu.freemyip.com";
     final ExecutorService io = Executors.newFixedThreadPool(4);
-    final Handler mainHandler = new Handler(Looper.getMainLooper());
     final LruCache<String, Bitmap> imageCache = new LruCache<>(24);
     final Map<String, List<ImageView>> pendingImageTargets = new HashMap<>();
     SharedPreferences prefs;
@@ -135,7 +132,7 @@ public class MainActivity extends Activity {
 
     public final class IntroBridge {
         @JavascriptInterface public void onIntroEnded() {
-            runOnUiThread(() -> mainHandler.postDelayed(MainActivity.this::finishIntro, 1000));
+            runOnUiThread(MainActivity.this::finishIntro);
         }
     }
 
@@ -253,6 +250,7 @@ public class MainActivity extends Activity {
                 ? new LinearLayout.LayoutParams(0, -2, 1)
                 : new LinearLayout.LayoutParams(d(132), d(42));
         bar.addView(brandButton, brandParams);
+        if (!showingAdmin) bar.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
         searchButton = navAction("⌕", "Buscar", v -> showSearch());
         searchButton.setBackground(round(PANEL, d(22)));
         searchButton.setElevation(d(4));
@@ -260,9 +258,7 @@ public class MainActivity extends Activity {
         settingsButton = navAction("⚙", "Servidor", v -> showSettings());
         settingsButton.setBackground(round(PANEL, d(22)));
         settingsButton.setElevation(d(4));
-        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(-2, -2);
-        sp.width = d(44);
-        sp.height = d(44);
+        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(d(44), d(44));
         sp.leftMargin = d(10);
         bar.addView(settingsButton, sp);
         if (showingAdmin) {
@@ -780,6 +776,8 @@ public class MainActivity extends Activity {
 
     void addGrid(List<JSONObject> nodes) {
         int columns = getResources().getConfiguration().orientation == 2 ? 5 : 2;
+        int gridWidth = getResources().getDisplayMetrics().widthPixels - d(32);
+        int cellWidth = Math.max(1, (gridWidth - d(columns * 8)) / columns);
         LinearLayout row = null;
         int count = 0;
         for (JSONObject node : nodes) {
@@ -790,7 +788,7 @@ public class MainActivity extends Activity {
                 content.addView(row, new LinearLayout.LayoutParams(-1, -2));
             }
             View card = posterCard(node);
-            LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, -2, 1);
+            LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(cellWidth, -2);
             p.setMargins(d(4), 0, d(4), 0);
             row.addView(card, p);
             count++;

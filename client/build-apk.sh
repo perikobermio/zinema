@@ -43,7 +43,7 @@ mkdir -p "$BUILD_DIR/outputs/apk/debug"
     --custom-package com.zinema.client \
     --min-sdk-version 23 \
     --target-sdk-version "$ANDROID_API" \
-    --version-code 28 \
+    --version-code 29 \
     --version-name 1.0.0 \
     --auto-add-overlay \
     "$BUILD_DIR/resources.zip"
