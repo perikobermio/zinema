@@ -49,8 +49,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -101,6 +103,7 @@ public class MainActivity extends Activity {
     List<JSONObject> movies = new ArrayList<>();
     List<JSONObject> series = new ArrayList<>();
     final Map<String, String> posterByStream = new HashMap<>();
+    final Map<String, Set<String>> selectedGenresByLibrary = new HashMap<>();
     final Map<ImageView, String> requestedImages = new WeakHashMap<>();
     final List<JSONObject> breadcrumbs = new ArrayList<>();
 
@@ -760,9 +763,119 @@ public class MainActivity extends Activity {
 
     void renderListing(String title, String subtitle, List<JSONObject> nodes) {
         content.removeAllViews();
-        addSectionHeader(title, subtitle);
-        addGrid(nodes);
-        if (nodes.isEmpty()) addEmpty("No hay títulos en esta sección.");
+        boolean showGenreFilter = breadcrumbs.isEmpty() && libraryMode
+                && ("movies".equals(selectedSection) || "series".equals(selectedSection));
+        List<JSONObject> visibleNodes = nodes;
+        Set<String> selected = null;
+        if (showGenreFilter) {
+            String library = selectedSection;
+            selected = selectedGenresByLibrary.get(library);
+            if (selected == null) {
+                selected = new HashSet<>();
+                selectedGenresByLibrary.put(library, selected);
+            }
+            visibleNodes = filterByGenres(nodes, selected);
+            addLibraryListingHeader(title, subtitle, library, nodes, selected);
+        } else {
+            addSectionHeader(title, subtitle);
+        }
+        addGrid(visibleNodes);
+        if (visibleNodes.isEmpty()) {
+            addEmpty(showGenreFilter && selected != null && !selected.isEmpty()
+                    ? "No hay títulos que coincidan con los géneros seleccionados."
+                    : "No hay títulos en esta sección.");
+        }
+    }
+
+    void addLibraryListingHeader(String title, String subtitle, String library,
+                                 List<JSONObject> allNodes, Set<String> selected) {
+        LinearLayout headerRow = new LinearLayout(this);
+        headerRow.setGravity(Gravity.CENTER_VERTICAL);
+        headerRow.setPadding(d(20), d(12), d(20), d(4));
+        TextView heading = label(title, 27, Color.WHITE, true);
+        headerRow.addView(heading, new LinearLayout.LayoutParams(0, -2, 1));
+        Button genreButton = actionButton(genreFilterButtonText(selected.size()), false);
+        genreButton.setTextSize(12);
+        genreButton.setMinHeight(d(42));
+        headerRow.addView(genreButton, new LinearLayout.LayoutParams(-2, d(42)));
+        genreButton.setOnClickListener(v -> showLibraryGenrePicker(
+                library, title, subtitle, allNodes, genreButton));
+        content.addView(headerRow);
+        TextView sub = label(subtitle, 14, MUTED, false);
+        sub.setPadding(d(20), 0, d(20), d(18));
+        content.addView(sub);
+    }
+
+    String genreFilterButtonText(int selectedCount) {
+        return selectedCount == 0 ? t("Todos los géneros")
+                : t("Géneros") + " · " + selectedCount;
+    }
+
+    List<String> availableGenres(List<JSONObject> nodes) {
+        Map<String, String> unique = new HashMap<>();
+        for (JSONObject node : nodes) {
+            JSONArray genres = node.optJSONArray("genres");
+            if (genres == null) continue;
+            for (int i = 0; i < genres.length(); i++) {
+                String genre = genres.optString(i, "").trim();
+                if (!genre.isEmpty() && !unique.containsKey(normalizeGenre(genre)))
+                    unique.put(normalizeGenre(genre), genre);
+            }
+        }
+        List<String> result = new ArrayList<>(unique.values());
+        Collections.sort(result, String.CASE_INSENSITIVE_ORDER);
+        return result;
+    }
+
+    List<JSONObject> filterByGenres(List<JSONObject> nodes, Set<String> selected) {
+        if (selected.isEmpty()) return nodes;
+        List<JSONObject> filtered = new ArrayList<>();
+        for (JSONObject node : nodes) {
+            JSONArray genres = node.optJSONArray("genres");
+            if (genres == null) continue;
+            boolean matches = false;
+            for (int i = 0; i < genres.length(); i++) {
+                if (selected.contains(normalizeGenre(genres.optString(i, "")))) {
+                    matches = true;
+                    break;
+                }
+            }
+            if (matches) filtered.add(node);
+        }
+        return filtered;
+    }
+
+    void showLibraryGenrePicker(String library, String title, String subtitle,
+                                List<JSONObject> nodes, Button button) {
+        List<String> options = availableGenres(nodes);
+        Set<String> selected = selectedGenresByLibrary.get(library);
+        if (selected == null) selected = new HashSet<>();
+        boolean[] checked = new boolean[options.size()];
+        String[] displayLabels = new String[options.size()];
+        for (int i = 0; i < options.size(); i++) {
+            checked[i] = selected.contains(normalizeGenre(options.get(i)));
+            displayLabels[i] = genreLabel(options.get(i));
+        }
+        AlertDialog.Builder dialog = new AlertDialog.Builder(this)
+                .setTitle(t("Filtrar por género"))
+                .setMultiChoiceItems(displayLabels, checked, (d, which, isChecked) ->
+                        checked[which] = isChecked)
+                .setPositiveButton(t("Aplicar"), (d, which) -> {
+                    Set<String> updated = new HashSet<>();
+                    for (int i = 0; i < options.size(); i++) {
+                        if (checked[i]) updated.add(normalizeGenre(options.get(i)));
+                    }
+                    selectedGenresByLibrary.put(library, updated);
+                    button.setText(genreFilterButtonText(updated.size()));
+                    renderListing(title, subtitle, nodes);
+                })
+                .setNegativeButton(t("Cancelar"), null)
+                .setNeutralButton(t("Limpiar"), (d, which) -> {
+                    selectedGenresByLibrary.put(library, new HashSet<>());
+                    button.setText(genreFilterButtonText(0));
+                    renderListing(title, subtitle, nodes);
+                });
+        dialog.show();
     }
 
     void addSectionHeader(String title, String subtitle) {
@@ -1749,6 +1862,13 @@ public class MainActivity extends Activity {
                 return "Zure liburutegia hutsik dago. Sinkronizatu katalogoa zerbitzarian.";
             case "Explora tu biblioteca": return "Arakatu zure liburutegia";
             case "No hay títulos en esta sección.": return "Atal honetan ez dago izenbururik.";
+            case "Todos los géneros": return "Genero guztiak";
+            case "Géneros": return "Generoak";
+            case "Filtrar por género": return "Iragazi generoaren arabera";
+            case "Aplicar": return "Aplikatu";
+            case "Limpiar": return "Garbitu";
+            case "No hay títulos que coincidan con los géneros seleccionados.":
+                return "Ez dago hautatutako generoekin bat datorren izenbururik.";
             case "Cargando catálogo…": return "Katalogoa kargatzen…";
             case "Cargando ficha…": return "Fitxa kargatzen…";
             case "Conectando con tu biblioteca…": return "Zure liburutegira konektatzen…";
