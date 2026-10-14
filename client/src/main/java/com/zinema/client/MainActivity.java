@@ -251,6 +251,7 @@ public class MainActivity extends Activity {
             brandButton = logo;
         }
         brandButton.setOnClickListener(v -> { showingAdmin = false; loadHome(); });
+        applyTvFocusStyle(brandButton, false);
         LinearLayout.LayoutParams brandParams = showingAdmin
                 ? new LinearLayout.LayoutParams(0, -2, 1)
                 : new LinearLayout.LayoutParams(d(132), d(42));
@@ -322,7 +323,26 @@ public class MainActivity extends Activity {
         view.setFocusable(true);
         view.setClickable(true);
         view.setOnClickListener(onClick);
+        applyTvFocusStyle(view, false);
         return view;
+    }
+
+    void applyTvFocusStyle(View view, boolean scaleOnFocus) {
+        view.setFocusable(true);
+        view.setFocusableInTouchMode(false);
+        GradientDrawable outline = new GradientDrawable();
+        outline.setColor(Color.TRANSPARENT);
+        outline.setCornerRadius(d(9));
+        outline.setStroke(d(1), Color.TRANSPARENT);
+        view.setForeground(outline);
+        view.setOnFocusChangeListener((focusedView, hasFocus) -> {
+            outline.setStroke(d(hasFocus ? 2 : 1), hasFocus ? RED : Color.TRANSPARENT);
+            focusedView.setForeground(outline);
+            focusedView.animate().cancel();
+            float scale = hasFocus && scaleOnFocus ? 1.045f : 1f;
+            focusedView.animate().scaleX(scale).scaleY(scale).setDuration(120).start();
+            focusedView.setElevation(hasFocus ? d(7) : 0);
+        });
     }
 
     View navChip(String title, Runnable action, boolean active) {
@@ -341,6 +361,7 @@ public class MainActivity extends Activity {
         tab.setFocusable(true);
         tab.setClickable(true);
         tab.setOnClickListener(v -> action.run());
+        applyTvFocusStyle(tab, false);
         return tab;
     }
 
@@ -512,6 +533,7 @@ public class MainActivity extends Activity {
         card.setOrientation(LinearLayout.VERTICAL);
         card.setFocusable(true);
         card.setClickable(true);
+        applyTvFocusStyle(card, true);
         int width = d(142);
         FrameLayout art = new FrameLayout(this);
         art.setBackground(round(PANEL, d(10)));
@@ -568,6 +590,7 @@ public class MainActivity extends Activity {
         actions.setFocusable(true);
         actions.setBackground(round(0xCC111318, d(18)));
         actions.setElevation(d(4));
+        applyTvFocusStyle(actions, false);
         FrameLayout.LayoutParams actionParams = new FrameLayout.LayoutParams(d(36), d(36), Gravity.TOP | Gravity.RIGHT);
         actionParams.setMargins(0, d(6), d(6), 0);
         art.addView(actions, actionParams);
@@ -1426,6 +1449,7 @@ public class MainActivity extends Activity {
             LinearLayout card = new LinearLayout(this);
             card.setOrientation(LinearLayout.VERTICAL);
             card.setPadding(d(4), d(4), d(10), d(4));
+            applyTvFocusStyle(card, true);
             ImageView poster = new ImageView(this);
             poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
             poster.setBackground(round(PANEL, d(7)));
@@ -1611,6 +1635,7 @@ public class MainActivity extends Activity {
                         LinearLayout card = new LinearLayout(this);
                         card.setOrientation(LinearLayout.VERTICAL);
                         card.setPadding(d(4), d(4), d(8), d(4));
+                        applyTvFocusStyle(card, true);
                         ImageView image = new ImageView(this);
                         image.setScaleType(ImageView.ScaleType.CENTER_CROP);
                         image.setBackground(round(PANEL, d(7)));
@@ -1804,6 +1829,7 @@ public class MainActivity extends Activity {
         actions.setFocusable(true);
         actions.setBackground(round(0xCC111318, d(18)));
         actions.setElevation(d(5));
+        applyTvFocusStyle(actions, false);
         FrameLayout.LayoutParams actionsParams = new FrameLayout.LayoutParams(d(42), d(42), Gravity.TOP | Gravity.RIGHT);
         actionsParams.setMargins(0, d(14), d(14), 0);
         banner.addView(actions, actionsParams);
@@ -2117,6 +2143,9 @@ public class MainActivity extends Activity {
             item.setGravity(Gravity.CENTER_VERTICAL);
             item.setPadding(d(18), d(13), d(18), d(13));
             item.setBackground(round(PANEL, d(10)));
+            item.setFocusable(true);
+            item.setClickable(true);
+            applyTvFocusStyle(item, true);
             TextView play = label("▶", 20, Color.WHITE, true);
             play.setGravity(Gravity.CENTER);
             item.addView(play, new LinearLayout.LayoutParams(d(48), d(48)));
@@ -2135,6 +2164,7 @@ public class MainActivity extends Activity {
             actions.setGravity(Gravity.CENTER);
             actions.setFocusable(true);
             actions.setMinWidth(d(36));
+            applyTvFocusStyle(actions, false);
             item.addView(actions);
             LinearLayout.LayoutParams ip = new LinearLayout.LayoutParams(-1, -2);
             ip.setMargins(d(16), 0, d(16), d(8));
@@ -2174,6 +2204,7 @@ public class MainActivity extends Activity {
         button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         button.setPadding(d(15), 0, d(15), 0);
         button.setBackground(round(primary ? RED : 0xCC22252C, d(8)));
+        applyTvFocusStyle(button, false);
         return button;
     }
 
@@ -2237,6 +2268,9 @@ public class MainActivity extends Activity {
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(d(14), d(10), d(14), d(10));
         row.setBackground(round(PANEL, d(10)));
+        row.setFocusable(true);
+        row.setClickable(true);
+        applyTvFocusStyle(row, true);
         ImageView poster = new ImageView(this);
         poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
         poster.setBackground(round(BG, d(6)));
@@ -2258,6 +2292,7 @@ public class MainActivity extends Activity {
         actions.setGravity(Gravity.CENTER);
         actions.setMinWidth(d(34));
         actions.setFocusable(true);
+        applyTvFocusStyle(actions, false);
         row.addView(actions);
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
         p.setMargins(d(16), 0, d(16), d(8));
@@ -2540,6 +2575,7 @@ public class MainActivity extends Activity {
             card.setClipToOutline(true);
             card.setFocusable(true);
             card.setClickable(true);
+            applyTvFocusStyle(card, true);
             card.setTag("resume-item:" + item.optString("path", item.optString("stream", "")));
             ImageView poster = new ImageView(this);
             poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
@@ -2572,6 +2608,7 @@ public class MainActivity extends Activity {
             actions.setGravity(Gravity.CENTER);
             actions.setFocusable(true);
             actions.setBackground(round(0xCC111318, d(18)));
+            applyTvFocusStyle(actions, false);
             FrameLayout.LayoutParams actionParams = new FrameLayout.LayoutParams(d(34), d(34), Gravity.TOP | Gravity.RIGHT);
             actionParams.setMargins(0, d(6), d(6), 0);
             card.addView(actions, actionParams);
