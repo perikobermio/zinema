@@ -68,7 +68,7 @@ public class MainActivity extends Activity {
     LinearLayout content;
     ScrollView contentScroller;
     TextView backButton;
-    TextView brandButton;
+    View brandButton;
     TextView searchButton;
     TextView settingsButton;
     HorizontalScrollView navScroll;
@@ -127,10 +127,21 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(d(36), d(42));
         backParams.rightMargin = d(8);
         bar.addView(backButton, backParams);
-        brandButton = label(showingAdmin ? serverName : "ZINEMA", 22, Color.WHITE, true);
-        brandButton.setLetterSpacing(0.12f);
+        if (showingAdmin) {
+            brandButton = label(serverName, 22, Color.WHITE, true);
+        } else {
+            ImageView logo = new ImageView(this);
+            logo.setImageResource(R.drawable.zinema_wordmark);
+            logo.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            logo.setAdjustViewBounds(true);
+            logo.setContentDescription("Zinema");
+            brandButton = logo;
+        }
         brandButton.setOnClickListener(v -> { showingAdmin = false; loadHome(); });
-        bar.addView(brandButton, new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout.LayoutParams brandParams = showingAdmin
+                ? new LinearLayout.LayoutParams(0, -2, 1)
+                : new LinearLayout.LayoutParams(d(132), d(42));
+        bar.addView(brandButton, brandParams);
         searchButton = navAction("⌕", "Buscar", v -> showSearch());
         bar.addView(searchButton);
         settingsButton = navAction("⚙", "Servidor", v -> showSettings());
