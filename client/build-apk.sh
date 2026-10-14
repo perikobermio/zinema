@@ -38,11 +38,12 @@ mkdir -p "$BUILD_DIR/outputs/apk/debug"
     -o "$BUILD_DIR/unsigned.apk" \
     --manifest "$CLIENT_DIR/src/main/AndroidManifest.xml" \
     -I "$ANDROID_JAR" \
+    -A "$CLIENT_DIR/src/main/assets" \
     --java "$BUILD_DIR/generated" \
     --custom-package com.zinema.client \
     --min-sdk-version 23 \
     --target-sdk-version "$ANDROID_API" \
-    --version-code 26 \
+    --version-code 27 \
     --version-name 1.0.0 \
     --auto-add-overlay \
     "$BUILD_DIR/resources.zip"
