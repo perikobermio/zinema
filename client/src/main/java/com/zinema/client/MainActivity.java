@@ -1403,7 +1403,7 @@ public class MainActivity extends Activity {
         saveParams.topMargin = d(14);
         form.addView(save, saveParams);
         save.setOnClickListener(v -> saveMetadata(node, title, year, selectedGenres, overview,
-                selectedTmdbId[0], selectedImagePath[0], selectedImageType[0]));
+                selectedTmdbId[0], selectedImagePath[0], selectedImageType[0], save));
 
         io.execute(() -> {
             try {
@@ -1666,7 +1666,8 @@ public class MainActivity extends Activity {
     }
 
     void saveMetadata(JSONObject node, EditText title, EditText year, List<String> selectedGenres,
-                      EditText overview, long tmdbId, String imagePath, String imageType) {
+                      EditText overview, long tmdbId, String imagePath, String imageType,
+                      Button saveButton) {
         String itemTitle = title.getText().toString().trim();
         if (itemTitle.isEmpty()) {
             Toast.makeText(this, "El título no puede estar vacío.", Toast.LENGTH_SHORT).show();
@@ -1689,38 +1690,52 @@ public class MainActivity extends Activity {
             return;
         }
         String nodeId = node.optString("id");
-        showLoading("Guardando metadata…");
+        saveButton.setEnabled(false);
+        saveButton.setText(t("Guardando metadata…"));
         io.execute(() -> {
             try {
                 postJson("/api/v1/catalog/" + enc(nodeId) + "/metadata/manual", payload);
                 imageCache.evictAll();
                 runOnUiThread(() -> finishMetadataRetry(nodeId, "Metadata guardada y cliente actualizado."));
             } catch (Exception e) {
-                runOnUiThread(() -> Toast.makeText(this, "No se pudo guardar: " + e.getMessage(),
-                        Toast.LENGTH_LONG).show());
+                runOnUiThread(() -> {
+                    saveButton.setEnabled(true);
+                    saveButton.setText(t("Guardar metadata"));
+                    Toast.makeText(this, "No se pudo guardar: " + e.getMessage(),
+                            Toast.LENGTH_LONG).show();
+                });
             }
         });
     }
 
     void finishMetadataRetry(String requestedNodeId, String summary) {
         Toast.makeText(this, summary, Toast.LENGTH_LONG).show();
+        boolean returnToDetail = metadataEditorFromDetail && requestedNodeId.equals(detailNodeId);
         setMetadataEditorChrome(false);
-        if ((showingDetail || metadataEditorFromDetail) && requestedNodeId.equals(detailNodeId)) {
+        if (returnToDetail) {
             metadataEditorFromDetail = false;
             io.execute(() -> {
                 try {
                     JSONObject updated = getJson("/api/v1/catalog/" + enc(detailNodeId));
                     runOnUiThread(() -> renderDetail(updated));
-                } catch (Exception e) { runOnUiThread(() -> Toast.makeText(this,
-                        "Metadata guardada; no se pudo recargar la ficha.", Toast.LENGTH_LONG).show()); }
+                } catch (Exception e) { runOnUiThread(() -> {
+                    setMetadataEditorChrome(true);
+                    metadataEditorFromDetail = true;
+                    Toast.makeText(this, "Metadata guardada; no se pudo recargar la ficha.",
+                            Toast.LENGTH_LONG).show();
+                }); }
             });
-        } else if (!showingDetail) {
-            io.execute(() -> {
-                try {
-                    JSONObject updated = getJson("/api/v1/catalog/" + enc(requestedNodeId));
-                    runOnUiThread(() -> refreshPosterCard(updated));
-                } catch (Exception ignored) { }
-            });
+        } else {
+            metadataEditorFromDetail = false;
+            if (!breadcrumbs.isEmpty()) {
+                showCollectionContents(breadcrumbs.get(breadcrumbs.size() - 1));
+            } else if (lastSearchQuery != null) {
+                performSearch(lastSearchQuery);
+            } else if (libraryMode) {
+                openLibrary(currentLibrary);
+            } else {
+                loadHome();
+            }
         }
     }
 
