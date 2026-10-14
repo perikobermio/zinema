@@ -83,6 +83,8 @@ public class MainActivity extends Activity {
     String selectedSection = "home";
     String lastSearchQuery;
     String detailNodeId = "";
+    int detailReturnScrollY;
+    int pendingListingRestoreY = -1;
     boolean libraryMode;
     boolean showingDetail;
     boolean showingAdmin;
@@ -582,7 +584,9 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(width, -2);
         cp.setMargins(0, 0, d(12), 0);
         card.setOnClickListener(v -> openNode(node));
-        return wrap(card, cp);
+        View wrapped = wrap(card, cp);
+        wrapped.setTag("catalog-node:" + node.optString("id", ""));
+        return wrapped;
     }
 
     View wrap(View view, LinearLayout.LayoutParams params) {
@@ -785,6 +789,14 @@ public class MainActivity extends Activity {
                     ? "No hay títulos que coincidan con los géneros seleccionados."
                     : "No hay títulos en esta sección.");
         }
+        restoreListingScrollIfPending();
+    }
+
+    void restoreListingScrollIfPending() {
+        if (pendingListingRestoreY < 0 || contentScroller == null) return;
+        int restoreY = pendingListingRestoreY;
+        pendingListingRestoreY = -1;
+        contentScroller.post(() -> contentScroller.scrollTo(0, restoreY));
     }
 
     void addLibraryListingHeader(String title, String subtitle, String library,
@@ -918,6 +930,7 @@ public class MainActivity extends Activity {
             currentLibrary = node.optString("library", currentLibrary);
             showCollectionContents(node);
         } else {
+            detailReturnScrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
             showingDetail = true;
             if (backButton != null) backButton.setVisibility(View.VISIBLE);
             io.execute(() -> {
@@ -1012,7 +1025,7 @@ public class MainActivity extends Activity {
             actions.add(showingMosaic ? "Usar póster manual" : "Usar mosaico de pósters");
             handlers.add(() -> {
                 prefs.edit().putBoolean(collectionMosaicKey(node), !showingMosaic).apply();
-                refreshCurrentScreen();
+                refreshPosterCard(node);
             });
         }
         actions.add("Metadata manual");
@@ -1033,6 +1046,32 @@ public class MainActivity extends Activity {
         return "collection:mosaic:" + node.optString("id", "");
     }
 
+    void refreshPosterCard(JSONObject node) {
+        if (content == null) return;
+        String tag = "catalog-node:" + node.optString("id", "");
+        View existing = findTaggedView(content, tag);
+        if (existing == null) return;
+        ViewGroup parent = (ViewGroup) existing.getParent();
+        int index = parent.indexOfChild(existing);
+        View replacement = posterCard(node);
+        replacement.setLayoutParams(existing.getLayoutParams());
+        parent.removeViewAt(index);
+        parent.addView(replacement, index);
+        loadVisibleLazyRows();
+    }
+
+    View findTaggedView(View view, String tag) {
+        if (tag.equals(view.getTag())) return view;
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                View match = findTaggedView(group.getChildAt(i), tag);
+                if (match != null) return match;
+            }
+        }
+        return null;
+    }
+
     String nodeSeenKey(String nodeId) { return "seen:node:" + nodeId; }
     String mediaSeenKey(JSONObject media) {
         String id = media.optString("id", "");
@@ -1050,6 +1089,7 @@ public class MainActivity extends Activity {
         if (id.isEmpty()) return;
         setNodeSeen(id, seen);
         removeContinueForNode(id);
+        refreshPosterCard(node);
         io.execute(() -> {
             try {
                 JSONObject full = getJson("/api/v1/catalog/" + enc(id));
@@ -1068,10 +1108,9 @@ public class MainActivity extends Activity {
                     }
                 }
                 refreshWatchedAncestors(full.optString("parent_id", ""));
-            } catch (Exception ignored) { runOnUiThread(this::refreshCurrentScreen); }
+            } catch (Exception ignored) { }
         });
         Toast.makeText(this, seen ? "Marcado como visto" : "Marcado como no visto", Toast.LENGTH_SHORT).show();
-        refreshCurrentScreen();
     }
 
     void setNodeSeen(String id, boolean seen) {
@@ -1144,8 +1183,8 @@ public class MainActivity extends Activity {
             });
         }
         else refreshParentOfNode(owner.optString("id", ""));
+        refreshPosterCard(owner);
         Toast.makeText(this, seen ? "Marcado como visto" : "Marcado como no visto", Toast.LENGTH_SHORT).show();
-        refreshCurrentScreen();
     }
 
     void refreshSeasonSeen(JSONObject season) {
@@ -1175,6 +1214,7 @@ public class MainActivity extends Activity {
         if (parentId == null || parentId.isEmpty() || parentId.equals("null")) return;
         io.execute(() -> {
             String nextParent = parentId;
+            List<JSONObject> changedParents = new ArrayList<>();
             while (!nextParent.isEmpty() && !nextParent.equals("null")) {
                 try {
                     JSONObject parent = getJson("/api/v1/catalog/" + enc(nextParent));
@@ -1187,10 +1227,13 @@ public class MainActivity extends Activity {
                         }
                     }
                     setNodeSeen(parent.optString("id"), allSeen);
+                    changedParents.add(parent);
                     nextParent = parent.optString("parent_id", "");
                 } catch (Exception e) { break; }
             }
-            runOnUiThread(this::refreshCurrentScreen);
+            runOnUiThread(() -> {
+                for (JSONObject parent : changedParents) refreshPosterCard(parent);
+            });
         });
     }
 
@@ -1201,8 +1244,21 @@ public class MainActivity extends Activity {
                     if (which == 0) setResumeSeen(item, true);
                     else if (which == 1) setResumeSeen(item, false);
                     else prefs.edit().remove("watch:" + item.optString("path", item.optString("stream"))).apply();
-                    refreshCurrentScreen();
+                    removeResumeCard(item);
                 }).show();
+    }
+
+    void removeResumeCard(JSONObject item) {
+        if (content == null) return;
+        String key = "resume-item:" + item.optString("path", item.optString("stream", ""));
+        View card = findTaggedView(content, key);
+        if (card == null || !(card.getParent() instanceof ViewGroup)) return;
+        ViewGroup cards = (ViewGroup) card.getParent();
+        cards.removeView(card);
+        if (cards.getChildCount() == 0 && cards.getParent() instanceof View) {
+            View horizontal = (View) cards.getParent();
+            if (horizontal.getParent() instanceof View) content.removeView((View) horizontal.getParent());
+        }
     }
 
     void setResumeSeen(JSONObject item, boolean seen) {
@@ -1658,14 +1714,13 @@ public class MainActivity extends Activity {
                 } catch (Exception e) { runOnUiThread(() -> Toast.makeText(this,
                         "Metadata guardada; no se pudo recargar la ficha.", Toast.LENGTH_LONG).show()); }
             });
-        } else if (!showingDetail && !breadcrumbs.isEmpty()) {
-            showCollectionContents(breadcrumbs.get(breadcrumbs.size() - 1));
-        } else if (!showingDetail && lastSearchQuery != null) {
-            performSearch(lastSearchQuery);
-        } else if (!showingDetail && libraryMode) {
-            openLibrary(currentLibrary);
         } else if (!showingDetail) {
-            loadHome();
+            io.execute(() -> {
+                try {
+                    JSONObject updated = getJson("/api/v1/catalog/" + enc(requestedNodeId));
+                    runOnUiThread(() -> refreshPosterCard(updated));
+                } catch (Exception ignored) { }
+            });
         }
     }
 
@@ -2152,6 +2207,7 @@ public class MainActivity extends Activity {
                         if (result != null) addSearchResult(result);
                     }
                     if (results.length() == 0) addEmpty("No encontramos resultados para “" + query + "”.");
+                    restoreListingScrollIfPending();
                 });
             } catch (Exception e) { runOnUiThread(() -> renderError(e.getMessage())); }
         });
@@ -2465,6 +2521,7 @@ public class MainActivity extends Activity {
             card.setClipToOutline(true);
             card.setFocusable(true);
             card.setClickable(true);
+            card.setTag("resume-item:" + item.optString("path", item.optString("stream", "")));
             ImageView poster = new ImageView(this);
             poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
             card.addView(poster, new FrameLayout.LayoutParams(-1, -1));
@@ -2545,16 +2602,12 @@ public class MainActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
-        if (prefs != null && page != null) {
-            List<JSONObject> resume = readContinueWatching();
-            if (!resume.isEmpty() && content != null && movies.size() + series.size() > 0) {
-                libraryMode = false;
-                showingDetail = false;
-                selectedSection = "home";
-                breadcrumbs.clear();
-                buildShell("Inicio");
-                renderHome();
-            }
+        if (prefs != null && page != null && "home".equals(selectedSection)
+                && !showingDetail && !showingAdmin && content != null
+                && movies.size() + series.size() > 0) {
+            int scrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
+            renderHome();
+            if (contentScroller != null) contentScroller.post(() -> contentScroller.scrollTo(0, scrollY));
         }
     }
 
@@ -2602,9 +2655,14 @@ public class MainActivity extends Activity {
         if (showingDetail) {
             showingDetail = false;
             if (!breadcrumbs.isEmpty()) {
+                pendingListingRestoreY = detailReturnScrollY;
                 showCollectionContents(breadcrumbs.get(breadcrumbs.size() - 1));
             } else if (libraryMode) {
+                pendingListingRestoreY = detailReturnScrollY;
                 openLibrary(currentLibrary);
+            } else if (lastSearchQuery != null) {
+                pendingListingRestoreY = detailReturnScrollY;
+                performSearch(lastSearchQuery);
             } else {
                 loadHome();
             }

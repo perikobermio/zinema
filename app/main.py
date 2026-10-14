@@ -262,6 +262,13 @@ def _collection_artwork(connection: sqlite3.Connection, collection_id: str) -> d
         f"/api/v1/catalog/{item['id']}/images/poster"
         for item in items if item["poster_file"]
     ][:4]
+    # Keep the four-tile layout complete when one of the titles has no
+    # individual artwork. A collection's own poster is a useful last resort.
+    collection = connection.execute(
+        "SELECT poster_file FROM catalog_nodes WHERE id=?", (collection_id,),
+    ).fetchone()
+    if len(mosaic) == 3 and collection and collection["poster_file"]:
+        mosaic.append(f"/api/v1/catalog/{collection_id}/images/poster")
     single_poster_url = None
     if len(items) == 1:
         item = items[0]
