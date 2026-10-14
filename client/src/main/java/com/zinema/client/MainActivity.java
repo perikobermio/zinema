@@ -108,6 +108,7 @@ public class MainActivity extends Activity {
     final Map<String, Set<String>> selectedGenresByLibrary = new HashMap<>();
     final Map<ImageView, String> requestedImages = new WeakHashMap<>();
     final List<JSONObject> breadcrumbs = new ArrayList<>();
+    final List<Integer> breadcrumbScrollPositions = new ArrayList<>();
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -287,6 +288,8 @@ public class MainActivity extends Activity {
         contentScroller = new ScrollView(this);
         contentScroller.setFillViewport(true);
         contentScroller.setVerticalScrollBarEnabled(false);
+        contentScroller.setBackgroundColor("series".equals(selectedSection)
+                ? Color.rgb(13, 16, 23) : BG);
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.setPadding(0, 0, 0, d(28));
@@ -425,6 +428,7 @@ public class MainActivity extends Activity {
         lastSearchQuery = null;
         selectedSection = "home";
         breadcrumbs.clear();
+        breadcrumbScrollPositions.clear();
         buildShell("Inicio");
         showLoading("Conectando con tu biblioteca…");
         if (startupPrefetchPending) {
@@ -484,6 +488,7 @@ public class MainActivity extends Activity {
             empty.setPadding(d(24), d(36), d(24), d(32));
             content.addView(empty);
         }
+        restoreListingScrollIfPending();
     }
 
     void cachePosterByStream(JSONArray items) {
@@ -774,6 +779,7 @@ public class MainActivity extends Activity {
         selectedSection = library;
         currentLibrary = library;
         breadcrumbs.clear();
+        breadcrumbScrollPositions.clear();
         buildShell(library.equals("movies") ? "Películas" : "Series");
         showLoading("Cargando catálogo…");
         io.execute(() -> {
@@ -949,6 +955,7 @@ public class MainActivity extends Activity {
         if (kind.equals("collection")) {
             showingDetail = false;
             if (backButton != null) backButton.setVisibility(View.VISIBLE);
+            breadcrumbScrollPositions.add(contentScroller == null ? 0 : contentScroller.getScrollY());
             breadcrumbs.add(node);
             currentLibrary = node.optString("library", currentLibrary);
             showCollectionContents(node);
@@ -2213,6 +2220,7 @@ public class MainActivity extends Activity {
         showingDetail = false;
         libraryMode = false;
         breadcrumbs.clear();
+        breadcrumbScrollPositions.clear();
         lastSearchQuery = null;
         if (backButton != null) backButton.setVisibility(View.VISIBLE);
         content.removeAllViews();
@@ -2726,6 +2734,9 @@ public class MainActivity extends Activity {
         }
         if (!breadcrumbs.isEmpty()) {
             breadcrumbs.remove(breadcrumbs.size() - 1);
+            int returnScrollY = breadcrumbScrollPositions.isEmpty()
+                    ? 0 : breadcrumbScrollPositions.remove(breadcrumbScrollPositions.size() - 1);
+            pendingListingRestoreY = returnScrollY;
             if (breadcrumbs.isEmpty()) {
                 if (libraryMode) openLibrary(currentLibrary);
                 else loadHome();
