@@ -1498,6 +1498,7 @@ public class MainActivity extends Activity {
             card.setClipToOutline(true);
             ImageView portrait = new ImageView(this);
             portrait.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            portrait.setImageResource(R.drawable.ic_actor_placeholder);
             card.addView(portrait, new FrameLayout.LayoutParams(-1, -1));
             String profilePath = member.optString("profile_path", "");
             if (!profilePath.isEmpty() && !profilePath.equals("null")) {
