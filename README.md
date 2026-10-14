@@ -101,6 +101,8 @@ curl 'http://localhost:8180/api/v1/catalog?library=series&parent_id=ID_DEL_NODO'
 curl 'http://localhost:8180/api/v1/catalog/ID_DEL_NODO'
 ```
 
+El cliente puede solicitar un nuevo intento de metadata con `POST /api/v1/catalog/ID_DEL_NODO/metadata/retry`. En películas y series se actualiza ese título; en una temporada se actualiza su serie, y en una colección se reintentan sus películas y series descendientes. El servidor limita solicitudes repetidas durante diez minutos por elemento y las ejecuta en segundo plano.
+
 Cada nodo incluye `kind`, `display_title`, `overview`, `year`, `genres`, `poster_url`, `backdrop_url`, `children`, `files` y `mosaic_images`. Los archivos reproducibles conservan sus IDs y URL de streaming:
 
 ```text

@@ -36,6 +36,11 @@ TMDB_REQUEST_DELAY_SECONDS = max(0.0, float(os.getenv("TMDB_REQUEST_DELAY_SECOND
 ARTWORK_DIR = DATABASE_PATH.parent / "artwork"
 CHUNK_SIZE = 1024 * 1024
 SYNC_LOCK = threading.Lock()
+METADATA_RETRY_LOCK = threading.Lock()
+METADATA_RETRY_LAST_REQUEST: dict[str, float] = {}
+METADATA_RETRY_COOLDOWN_SECONDS = 600
+METADATA_RETRY_GLOBAL_LAST_REQUEST = 0.0
+METADATA_RETRY_GLOBAL_COOLDOWN_SECONDS = 10
 SCHEDULER_STARTED = False
 
 app = FastAPI(title="Zinema Server", version="0.1.0")
@@ -53,6 +58,7 @@ class LibraryItem(BaseModel):
     series_id: str | None = None
     season_number: int | None = None
     episode_number: int | None = None
+    season_count: int = 0
     metadata_title: str | None = None
     overview: str | None = None
     year: int | None = None
@@ -196,6 +202,26 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     node.pop("poster_file", None)
     node.pop("backdrop_file", None)
     node.pop("metadata_error", None)
+    if node["kind"] == "collection":
+        genre_rows = connection.execute(
+            """WITH RECURSIVE descendants(id) AS (
+                   SELECT id FROM catalog_nodes WHERE parent_id=? AND available=1
+                   UNION ALL
+                   SELECT child.id FROM catalog_nodes child
+                   JOIN descendants parent ON child.parent_id=parent.id
+                   WHERE child.available=1
+               )
+               SELECT genres FROM catalog_nodes
+               WHERE id IN (SELECT id FROM descendants) AND genres!='[]'
+               ORDER BY title COLLATE NOCASE""",
+            (node["id"],),
+        ).fetchall()
+        aggregated_genres = []
+        for genre_row in genre_rows:
+            for genre in json.loads(genre_row["genres"] or "[]"):
+                if genre not in aggregated_genres:
+                    aggregated_genres.append(genre)
+        node["genres"] = aggregated_genres
 
     child_rows = connection.execute(
         """SELECT id, kind, title, metadata_title, poster_file, season_number
@@ -251,6 +277,8 @@ def _item_select() -> str:
                      li.size_bytes, li.modified_at, li.node_id,
                      li.series_node_id AS series_id, li.season_number, li.episode_number,
                      n.metadata_title, n.overview, n.year, n.genres AS genres_json,
+                     (SELECT COUNT(*) FROM catalog_nodes s
+                      WHERE s.parent_id=n.id AND s.kind='season' AND s.available=1) AS season_count,
                      n.id AS metadata_node_id, n.poster_file
               FROM library_items li
               LEFT JOIN catalog_nodes n ON n.id=COALESCE(li.series_node_id, li.node_id)
@@ -353,6 +381,103 @@ def _start_sync_job() -> str | None:
             connection.commit()
         threading.Thread(target=_run_sync_job, args=(job_id,), daemon=True,
                          name=f"zinema-sync-{job_id[:8]}").start()
+    except Exception:
+        SYNC_LOCK.release()
+        raise
+    return job_id
+
+
+def _metadata_retry_targets(connection: sqlite3.Connection, node_id: str) -> list[str]:
+    node = connection.execute(
+        "SELECT id, kind, parent_id FROM catalog_nodes WHERE id=? AND available=1",
+        (node_id,),
+    ).fetchone()
+    if node is None:
+        raise HTTPException(status_code=404, detail="Catalog node not found")
+    if node["kind"] in {"movie", "series"}:
+        return [node["id"]]
+    if node["kind"] == "season":
+        parent = connection.execute(
+            "SELECT id FROM catalog_nodes WHERE id=? AND kind='series' AND available=1",
+            (node["parent_id"],),
+        ).fetchone()
+        if parent is None:
+            raise HTTPException(status_code=422, detail="Season has no available series parent")
+        return [parent["id"]]
+    if node["kind"] == "collection":
+        rows = connection.execute(
+            """WITH RECURSIVE descendants(id, kind) AS (
+                   SELECT id, kind FROM catalog_nodes WHERE parent_id=? AND available=1
+                   UNION ALL
+                   SELECT child.id, child.kind FROM catalog_nodes child
+                   JOIN descendants parent ON child.parent_id=parent.id
+                   WHERE child.available=1
+               )
+               SELECT id FROM descendants WHERE kind IN ('movie', 'series')
+               ORDER BY id""",
+            (node_id,),
+        ).fetchall()
+        if rows:
+            return [row["id"] for row in rows]
+        raise HTTPException(status_code=422, detail="Collection has no movies or series to refresh")
+    raise HTTPException(status_code=422, detail="This catalog item has no TMDb metadata")
+
+
+def _run_metadata_retry_job(job_id: str, target_ids: list[str]) -> None:
+    try:
+        _update_sync_job(
+            job_id, status="running", stage="retry:metadata:0",
+            started_at=datetime.now(timezone.utc).isoformat(),
+        )
+        totals = {"matched": 0, "needs_review": 0, "not_found": 0,
+                  "errors": 0, "processed": 0}
+        for index, target_id in enumerate(target_ids, start=1):
+            with closing(database()) as connection:
+                connection.execute(
+                    """UPDATE catalog_nodes SET metadata_status='pending',
+                       metadata_checked_at=NULL, metadata_error=NULL,
+                       metadata_candidates=NULL WHERE id=? AND available=1""",
+                    (target_id,),
+                )
+                connection.commit()
+                result = enrich_pending(
+                    connection, TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, ARTWORK_DIR,
+                    batch_size=1, minimum_delay=TMDB_REQUEST_DELAY_SECONDS,
+                    api_key=TMDB_KEY, node_id=target_id,
+                )
+            for key, count in result.items():
+                totals[key] += count
+            _update_sync_job(job_id, stage=f"retry:metadata:{index}/{len(target_ids)}")
+        result_payload = {"metadata": totals, "requested_nodes": len(target_ids)}
+        _update_sync_job(
+            job_id, status="completed", stage="retry:complete",
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            result=json.dumps(result_payload, ensure_ascii=False), error=None,
+        )
+    except Exception as exc:
+        _update_sync_job(
+            job_id, status="failed", stage="retry:failed",
+            completed_at=datetime.now(timezone.utc).isoformat(), error=str(exc)[:1000],
+        )
+    finally:
+        SYNC_LOCK.release()
+
+
+def _start_metadata_retry_job(target_ids: list[str]) -> str | None:
+    if not TMDB_CONFIGURED or not SYNC_LOCK.acquire(blocking=False):
+        return None
+    job_id = uuid4().hex
+    try:
+        with closing(database()) as connection:
+            connection.execute(
+                "INSERT INTO sync_runs (id, status, stage, started_at) VALUES (?, 'queued', 'retry:queued', ?)",
+                (job_id, datetime.now(timezone.utc).isoformat()),
+            )
+            connection.commit()
+        threading.Thread(
+            target=_run_metadata_retry_job, args=(job_id, target_ids),
+            daemon=True, name=f"zinema-metadata-retry-{job_id[:8]}",
+        ).start()
     except Exception:
         SYNC_LOCK.release()
         raise
@@ -470,6 +595,50 @@ def get_catalog_node(node_id: str) -> dict:
         if row is None:
             raise HTTPException(status_code=404, detail="Catalog node not found")
         return _node_payload(row, connection)
+
+
+@app.post("/api/v1/catalog/{node_id}/metadata/retry", status_code=202)
+def retry_catalog_metadata(node_id: str) -> dict[str, object]:
+    global METADATA_RETRY_GLOBAL_LAST_REQUEST
+    if not TMDB_CONFIGURED:
+        raise HTTPException(status_code=503, detail="TMDb credentials are not configured")
+    with closing(database()) as connection:
+        target_ids = _metadata_retry_targets(connection, node_id)
+    now = time.monotonic()
+    with METADATA_RETRY_LOCK:
+        global_wait = METADATA_RETRY_GLOBAL_COOLDOWN_SECONDS - (
+            now - METADATA_RETRY_GLOBAL_LAST_REQUEST
+        )
+        if global_wait > 0:
+            raise HTTPException(
+                status_code=429, detail="Metadata retry requests are temporarily rate limited",
+                headers={"Retry-After": str(max(1, int(global_wait)))},
+            )
+        previous = METADATA_RETRY_LAST_REQUEST.get(node_id)
+        if previous is not None and now - previous < METADATA_RETRY_COOLDOWN_SECONDS:
+            retry_after = int(METADATA_RETRY_COOLDOWN_SECONDS - (now - previous))
+            raise HTTPException(
+                status_code=429, detail="Metadata was recently requested for this item",
+                headers={"Retry-After": str(max(1, retry_after))},
+            )
+        job_id = _start_metadata_retry_job(target_ids)
+        if job_id is None:
+            raise HTTPException(status_code=409, detail="A catalog sync is already running")
+        METADATA_RETRY_LAST_REQUEST[node_id] = now
+        METADATA_RETRY_GLOBAL_LAST_REQUEST = now
+    return {
+        "id": job_id, "status": "queued", "items": len(target_ids),
+        "status_url": f"/api/v1/catalog/metadata/retry/{job_id}",
+    }
+
+
+@app.get("/api/v1/catalog/metadata/retry/{job_id}")
+def get_metadata_retry_status(job_id: str) -> SyncJob:
+    with closing(database()) as connection:
+        row = connection.execute("SELECT * FROM sync_runs WHERE id=?", (job_id,)).fetchone()
+    if row is None or not row["stage"].startswith("retry:"):
+        raise HTTPException(status_code=404, detail="Metadata retry job not found")
+    return _sync_job_payload(row)
 
 
 @app.get("/api/v1/catalog/{node_id}/images/{image_type}")

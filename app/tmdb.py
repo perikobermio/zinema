@@ -105,7 +105,8 @@ def _save_image(client: httpx.Client, base: str, size: str, image_path: str | No
 
 
 def _write_match(connection: sqlite3.Connection, node: sqlite3.Row, details: dict,
-                 artwork_dir: Path, client: httpx.Client, image_config: tuple[str, str, str]) -> None:
+                 artwork_dir: Path, client: httpx.Client, image_config: tuple[str, str, str],
+                 language: str, api_key: str = "") -> None:
     entity_kind = "movie" if node["kind"] == "movie" else "tv"
     external_ids = details.get("external_ids") or {}
     tmdb_id = int(details["id"])
@@ -131,6 +132,66 @@ def _write_match(connection: sqlite3.Connection, node: sqlite3.Row, details: dic
          details.get("overview") or "", year, genres, poster_file, backdrop_file,
          datetime.now(timezone.utc).isoformat(), safe_id),
     )
+    if entity_kind == "tv":
+        _write_season_artwork(connection, node, details, artwork_dir, client,
+                              image_config, language, api_key)
+
+
+def _write_season_artwork(connection: sqlite3.Connection, node: sqlite3.Row, details: dict,
+                          artwork_dir: Path, client: httpx.Client,
+                          image_config: tuple[str, str, str], language: str,
+                          api_key: str) -> None:
+    seasons = {int(item["season_number"]): item for item in details.get("seasons", [])
+               if item.get("season_number") is not None}
+    season_rows = connection.execute(
+        "SELECT id, season_number, poster_file FROM catalog_nodes "
+        "WHERE parent_id=? AND kind='season' AND available=1 "
+        "ORDER BY CASE WHEN season_number=0 THEN 1 ELSE 0 END, season_number",
+        (node["id"],),
+    ).fetchall()
+    image_base, poster_size, _ = image_config
+    first_available_poster = None
+    for season in season_rows:
+        season_number = int(season["season_number"] or 0)
+        tmdb_season = seasons.get(season_number, {})
+        image_path = tmdb_season.get("poster_path")
+        if not image_path and not season["poster_file"]:
+            try:
+                season_details = _api_get(
+                    client, f"/tv/{int(details['id'])}/season/{season_number}",
+                    {"language": language}, api_key,
+                )
+                episodes = sorted(
+                    season_details.get("episodes", []),
+                    key=lambda episode: int(episode.get("episode_number") or 0),
+                )
+                image_path = next((episode.get("still_path") for episode in episodes
+                                   if episode.get("still_path")), None)
+            except Exception:
+                image_path = None
+        poster_file = None
+        if image_path:
+            try:
+                poster_file = _save_image(
+                    client, image_base, poster_size, image_path,
+                    artwork_dir / f"{season['id']}-poster.jpg",
+                )
+            except Exception:
+                poster_file = None
+        if poster_file:
+            connection.execute(
+                "UPDATE catalog_nodes SET poster_file=? WHERE id=?",
+                (poster_file, season["id"]),
+            )
+        else:
+            poster_file = season["poster_file"]
+        if first_available_poster is None and poster_file:
+            first_available_poster = poster_file
+    if first_available_poster:
+        connection.execute(
+            "UPDATE catalog_nodes SET poster_file=COALESCE(poster_file, ?) WHERE id=?",
+            (first_available_poster, node["id"]),
+        )
 
 
 def _fetch_details(client: httpx.Client, kind: str, tmdb_id: int, language: str,
@@ -141,7 +202,8 @@ def _fetch_details(client: httpx.Client, kind: str, tmdb_id: int, language: str,
 
 def enrich_pending(connection: sqlite3.Connection, access_token: str, language: str,
                    artwork_dir: Path, batch_size: int = 100,
-                   minimum_delay: float = 0.25, api_key: str = "") -> dict[str, int]:
+                   minimum_delay: float = 0.25, api_key: str = "",
+                   node_id: str | None = None) -> dict[str, int]:
     """Match pending movie/series nodes, then save TMDb metadata and local artwork."""
     now = datetime.now(timezone.utc)
     cutoff = (now - timedelta(days=30)).isoformat()
@@ -149,12 +211,13 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
     rows = connection.execute(
         """SELECT * FROM catalog_nodes
            WHERE available=1 AND kind IN ('movie', 'series')
+             AND (? IS NULL OR id=?)
              AND (metadata_checked_at IS NULL
                   OR (metadata_status='error' AND metadata_checked_at < ?)
                   OR (metadata_status!='error' AND metadata_checked_at < ?))
            ORDER BY CASE WHEN tmdb_id IS NOT NULL THEN 1 ELSE 0 END, scanned_at
            LIMIT ?""",
-        (error_cutoff, cutoff, batch_size),
+        (node_id, node_id, error_cutoff, cutoff, batch_size),
     ).fetchall()
     if not rows:
         return {"matched": 0, "needs_review": 0, "not_found": 0, "errors": 0, "processed": 0}
@@ -171,7 +234,8 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
                 kind = "movie" if node["kind"] == "movie" else "tv"
                 if node["tmdb_id"]:
                     details = _fetch_details(client, kind, int(node["tmdb_id"]), language, api_key)
-                    _write_match(connection, node, details, artwork_dir, client, config)
+                    _write_match(connection, node, details, artwork_dir, client, config,
+                                 language, api_key)
                     counts["matched"] += 1
                     connection.commit()
                     continue
@@ -204,7 +268,8 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
                     margin = best["score"] - candidates[1]["score"] if len(candidates) > 1 else 1.0
                     if best["score"] >= 0.93 and margin >= 0.04:
                         details = _fetch_details(client, kind, int(best["tmdb_id"]), language, api_key)
-                        _write_match(connection, node, details, artwork_dir, client, config)
+                        _write_match(connection, node, details, artwork_dir, client, config,
+                                     language, api_key)
                         counts["matched"] += 1
                     else:
                         connection.execute(
@@ -240,5 +305,6 @@ def apply_tmdb_id(connection: sqlite3.Connection, node: sqlite3.Row, tmdb_id: in
         details = _fetch_details(client, kind, tmdb_id, language, api_key)
         if int(details.get("id", -1)) != tmdb_id:
             raise ValueError("TMDb returned a different item id")
-        _write_match(connection, node, details, artwork_dir, client, config)
+        _write_match(connection, node, details, artwork_dir, client, config,
+                     language, api_key)
     connection.commit()

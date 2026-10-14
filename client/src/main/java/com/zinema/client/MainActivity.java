@@ -61,8 +61,12 @@ public class MainActivity extends Activity {
     FrameLayout frame;
     LinearLayout page;
     LinearLayout content;
+    TextView backButton;
     String server;
     String currentLibrary = "movies";
+    String detailNodeId = "";
+    boolean libraryMode;
+    boolean showingDetail;
     List<JSONObject> movies = new ArrayList<>();
     List<JSONObject> series = new ArrayList<>();
     final List<JSONObject> breadcrumbs = new ArrayList<>();
@@ -96,6 +100,12 @@ public class MainActivity extends Activity {
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setPadding(d(20), d(12), d(16), d(10));
         bar.setBackgroundColor(BG);
+        backButton = navAction("‹", "Atrás", v -> onBackPressed());
+        backButton.setTextSize(30);
+        backButton.setVisibility(title.equals("Inicio") ? View.GONE : View.VISIBLE);
+        LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(d(36), d(42));
+        backParams.rightMargin = d(8);
+        bar.addView(backButton, backParams);
         TextView brand = label("ZINEMA", 22, Color.WHITE, true);
         brand.setLetterSpacing(0.12f);
         brand.setOnClickListener(v -> loadHome());
@@ -143,6 +153,8 @@ public class MainActivity extends Activity {
         view.setContentDescription(hint);
         view.setGravity(Gravity.CENTER);
         view.setMinWidth(d(40));
+        view.setFocusable(true);
+        view.setClickable(true);
         view.setOnClickListener(onClick);
         return view;
     }
@@ -151,6 +163,8 @@ public class MainActivity extends Activity {
         TextView chip = label(title, 14, active ? Color.WHITE : MUTED, active);
         chip.setGravity(Gravity.CENTER);
         chip.setPadding(d(14), 0, d(14), 0);
+        chip.setFocusable(true);
+        chip.setClickable(true);
         chip.setOnClickListener(v -> action.run());
         return chip;
     }
@@ -210,6 +224,9 @@ public class MainActivity extends Activity {
     }
 
     void loadHome() {
+        libraryMode = false;
+        showingDetail = false;
+        breadcrumbs.clear();
         buildShell("Inicio");
         showLoading("Conectando con tu biblioteca…");
         io.execute(() -> {
@@ -296,6 +313,15 @@ public class MainActivity extends Activity {
         info.addView(button, bp);
         button.setOnClickListener(v -> openNode(node));
         hero.addView(info, new FrameLayout.LayoutParams(-1, -1));
+        TextView heroActions = label("⋮", 23, Color.WHITE, true);
+        heroActions.setGravity(Gravity.CENTER);
+        heroActions.setFocusable(true);
+        heroActions.setBackground(round(0xCC111318, d(18)));
+        heroActions.setElevation(d(5));
+        FrameLayout.LayoutParams heroActionParams = new FrameLayout.LayoutParams(d(42), d(42), Gravity.TOP | Gravity.RIGHT);
+        heroActionParams.setMargins(0, d(14), d(14), 0);
+        hero.addView(heroActions, heroActionParams);
+        heroActions.setOnClickListener(v -> showActions(node));
         LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(-1, d(350));
         hp.setMargins(d(16), d(8), d(16), d(14));
         content.addView(hero, hp);
@@ -365,9 +391,18 @@ public class MainActivity extends Activity {
         name.setMaxLines(2);
         name.setPadding(d(2), d(7), d(2), 0);
         card.addView(name, new LinearLayout.LayoutParams(width, -2));
-        TextView meta = label(node.optString("year", node.optString("kind", "").equals("collection") ? "Colección" : ""), 11, MUTED, false);
+        TextView meta = label(cardSubtitle(node), 11, MUTED, false);
         meta.setPadding(d(2), d(3), d(2), 0);
         card.addView(meta);
+        TextView actions = label("⋮", 22, Color.WHITE, true);
+        actions.setGravity(Gravity.CENTER);
+        actions.setFocusable(true);
+        actions.setBackground(round(0xCC111318, d(18)));
+        actions.setElevation(d(4));
+        FrameLayout.LayoutParams actionParams = new FrameLayout.LayoutParams(d(36), d(36), Gravity.TOP | Gravity.RIGHT);
+        actionParams.setMargins(0, d(6), d(6), 0);
+        art.addView(actions, actionParams);
+        actions.setOnClickListener(v -> showActions(node));
         LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(width, -2);
         cp.setMargins(0, 0, d(12), 0);
         card.setOnClickListener(v -> openNode(node));
@@ -377,6 +412,29 @@ public class MainActivity extends Activity {
     View wrap(View view, LinearLayout.LayoutParams params) {
         view.setLayoutParams(params);
         return view;
+    }
+
+    String cardSubtitle(JSONObject node) {
+        String kind = node.optString("kind");
+        if (kind.equals("series")) {
+            JSONArray children = node.optJSONArray("children");
+            int seasons = 0;
+            if (children != null) {
+                for (int i = 0; i < children.length(); i++) {
+                    JSONObject child = children.optJSONObject(i);
+                    if (child != null && "season".equals(child.optString("kind"))) seasons++;
+                }
+            }
+            return seasons + (seasons == 1 ? " temporada" : " temporadas");
+        }
+        if (kind.equals("season")) return "Temporada " + String.format("%02d", node.optInt("season_number"));
+        JSONArray genres = node.optJSONArray("genres");
+        if (genres != null && genres.length() > 0) {
+            List<String> shown = new ArrayList<>();
+            for (int i = 0; i < Math.min(2, genres.length()); i++) shown.add(genres.optString(i));
+            return join(new JSONArray(shown));
+        }
+        return kind.equals("collection") || kind.equals("movie") ? "Sin género disponible" : "";
     }
 
     GradientDrawable round(int color, int radius) {
@@ -413,6 +471,8 @@ public class MainActivity extends Activity {
     }
 
     void openLibrary(String library) {
+        libraryMode = true;
+        showingDetail = false;
         currentLibrary = library;
         breadcrumbs.clear();
         buildShell(library.equals("movies") ? "Películas" : "Series");
@@ -463,16 +523,14 @@ public class MainActivity extends Activity {
     void openNode(JSONObject node) {
         String kind = node.optString("kind");
         if (kind.equals("collection")) {
+            showingDetail = false;
+            if (backButton != null) backButton.setVisibility(View.VISIBLE);
             breadcrumbs.add(node);
             currentLibrary = node.optString("library", currentLibrary);
-            showLoading("Abriendo " + displayTitle(node) + "…");
-            io.execute(() -> {
-                try {
-                    JSONArray children = getArray("/api/v1/catalog?library=" + currentLibrary + "&parent_id=" + enc(node.optString("id")));
-                    runOnUiThread(() -> renderListing(displayTitle(node), toList(children)));
-                } catch (Exception e) { runOnUiThread(() -> renderError(e.getMessage())); }
-            });
+            showCollectionContents(node);
         } else {
+            showingDetail = true;
+            if (backButton != null) backButton.setVisibility(View.VISIBLE);
             io.execute(() -> {
                 try {
                     JSONObject full = getJson("/api/v1/catalog/" + enc(node.optString("id")));
@@ -483,7 +541,103 @@ public class MainActivity extends Activity {
         }
     }
 
+    void showCollectionContents(JSONObject collection) {
+        showLoading("Abriendo " + displayTitle(collection) + "…");
+        io.execute(() -> {
+            try {
+                JSONArray children = getArray("/api/v1/catalog?library=" + currentLibrary +
+                        "&parent_id=" + enc(collection.optString("id")));
+                runOnUiThread(() -> renderListing(displayTitle(collection), toList(children)));
+            } catch (Exception e) { runOnUiThread(() -> renderError(e.getMessage())); }
+        });
+    }
+
+    JSONObject postJson(String path) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(server + path).openConnection();
+        connection.setRequestMethod("POST");
+        connection.setConnectTimeout(12000);
+        connection.setReadTimeout(20000);
+        connection.setDoOutput(true);
+        connection.setRequestProperty("Accept", "application/json");
+        connection.getOutputStream().close();
+        int status = connection.getResponseCode();
+        InputStream input = status < 400 ? connection.getInputStream() : connection.getErrorStream();
+        String body = readText(input);
+        connection.disconnect();
+        if (status < 200 || status >= 300) {
+            String detail = "";
+            try { detail = new JSONObject(body).optString("detail", ""); }
+            catch (JSONException ignored) { }
+            throw new Exception(detail.isEmpty() ? "HTTP " + status : detail);
+        }
+        return new JSONObject(body);
+    }
+
+    void showActions(JSONObject node) {
+        new AlertDialog.Builder(this)
+                .setTitle("Acciones")
+                .setItems(new String[]{"Reintentar obtención de metadata"}, (dialog, which) -> retryMetadata(node))
+                .show();
+    }
+
+    void retryMetadata(JSONObject node) {
+        String nodeId = node.optString("id");
+        if (nodeId.isEmpty()) return;
+        io.execute(() -> {
+            try {
+                JSONObject result = postJson("/api/v1/catalog/" + enc(nodeId) + "/metadata/retry");
+                int items = result.optInt("items", 1);
+                String jobId = result.optString("id");
+                runOnUiThread(() -> Toast.makeText(this,
+                        "Reintento iniciado para " + items + (items == 1 ? " elemento" : " elementos") +
+                                ". Te avisaremos al terminar.", Toast.LENGTH_LONG).show());
+                for (int attempt = 0; attempt < 300; attempt++) {
+                    JSONObject status = getJson("/api/v1/catalog/metadata/retry/" + enc(jobId));
+                    if ("completed".equals(status.optString("status"))) {
+                        imageCache.evictAll();
+                        runOnUiThread(() -> finishMetadataRetry(nodeId));
+                        return;
+                    }
+                    if ("failed".equals(status.optString("status"))) {
+                        String error = status.optString("error", "Fallo al consultar TMDb");
+                        runOnUiThread(() -> Toast.makeText(this, "Falló el reintento: " + error,
+                                Toast.LENGTH_LONG).show());
+                        return;
+                    }
+                    Thread.sleep(2000);
+                }
+                runOnUiThread(() -> Toast.makeText(this,
+                        "El reintento sigue en curso. Consulta el servidor más tarde.", Toast.LENGTH_LONG).show());
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(this, "No se pudo reintentar: " + e.getMessage(),
+                        Toast.LENGTH_LONG).show());
+            }
+        });
+    }
+
+    void finishMetadataRetry(String requestedNodeId) {
+        Toast.makeText(this, "Metadata actualizada.", Toast.LENGTH_SHORT).show();
+        if (showingDetail && requestedNodeId.equals(detailNodeId)) {
+            io.execute(() -> {
+                try {
+                    JSONObject updated = getJson("/api/v1/catalog/" + enc(detailNodeId));
+                    runOnUiThread(() -> renderDetail(updated));
+                } catch (Exception e) { runOnUiThread(() -> Toast.makeText(this,
+                        "Metadata guardada; no se pudo recargar la ficha.", Toast.LENGTH_LONG).show()); }
+            });
+        } else if (!showingDetail && !breadcrumbs.isEmpty()) {
+            showCollectionContents(breadcrumbs.get(breadcrumbs.size() - 1));
+        } else if (!showingDetail && libraryMode) {
+            openLibrary(currentLibrary);
+        } else if (!showingDetail) {
+            loadHome();
+        }
+    }
+
     void renderDetail(JSONObject node) {
+        showingDetail = true;
+        detailNodeId = node.optString("id");
+        if (backButton != null) backButton.setVisibility(View.VISIBLE);
         content.removeAllViews();
         FrameLayout banner = new FrameLayout(this);
         ImageView bgImage = new ImageView(this);
@@ -502,7 +656,9 @@ public class MainActivity extends Activity {
         kind.setLetterSpacing(0.12f);
         info.addView(kind);
         info.addView(label(displayTitle(node), 30, Color.WHITE, true));
-        String meta = node.optString("year", "") + (node.optJSONArray("genres") == null ? "" : "   •   " + join(node.optJSONArray("genres")));
+        String meta = node.optString("kind").equals("series")
+                ? cardSubtitle(node)
+                : node.optString("year", "") + (node.optJSONArray("genres") == null ? "" : "   •   " + join(node.optJSONArray("genres")));
         TextView metadata = label(meta, 13, 0xFFD7D9DF, false);
         LinearLayout.LayoutParams mp = new LinearLayout.LayoutParams(-1, -2);
         mp.topMargin = d(5);
@@ -526,6 +682,15 @@ public class MainActivity extends Activity {
         play.setOnClickListener(v -> playFirst(node));
         save.setOnClickListener(v -> { toggleFavorite(node); save.setText(isFavorite(node) ? "✓ Mi lista" : "+ Mi lista"); });
         banner.addView(info, new FrameLayout.LayoutParams(-1, -1));
+        TextView actions = label("⋮", 23, Color.WHITE, true);
+        actions.setGravity(Gravity.CENTER);
+        actions.setFocusable(true);
+        actions.setBackground(round(0xCC111318, d(18)));
+        actions.setElevation(d(5));
+        FrameLayout.LayoutParams actionsParams = new FrameLayout.LayoutParams(d(42), d(42), Gravity.TOP | Gravity.RIGHT);
+        actionsParams.setMargins(0, d(14), d(14), 0);
+        banner.addView(actions, actionsParams);
+        actions.setOnClickListener(v -> showActions(node));
         LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(-1, d(390));
         bp.setMargins(d(16), d(10), d(16), d(10));
         content.addView(banner, bp);
@@ -608,6 +773,8 @@ public class MainActivity extends Activity {
     }
 
     void showSearch() {
+        showingDetail = false;
+        if (backButton != null) backButton.setVisibility(View.VISIBLE);
         content.removeAllViews();
         addSectionHeader("Buscar", "Encuentra películas, series y episodios");
         LinearLayout line = new LinearLayout(this);
@@ -668,17 +835,41 @@ public class MainActivity extends Activity {
         textBox.setOrientation(LinearLayout.VERTICAL);
         textBox.setPadding(d(12), 0, d(8), 0);
         textBox.addView(label(result.optString("metadata_title", result.optString("title", "Vídeo")), 15, Color.WHITE, true));
-        TextView detail = label(result.optString("year", "") + "   ·   " + result.optString("extension", "").replace(".", "").toUpperCase(), 12, MUTED, false);
+        TextView detail = label(searchSubtitle(result) + "   ·   " + result.optString("extension", "").replace(".", "").toUpperCase(), 12, MUTED, false);
         LinearLayout.LayoutParams detailP = new LinearLayout.LayoutParams(-1, -2);
         detailP.topMargin = d(5);
         textBox.addView(detail, detailP);
         row.addView(textBox, new LinearLayout.LayoutParams(0, -2, 1));
         TextView play = label("▶", 18, Color.WHITE, true);
         row.addView(play);
+        TextView actions = label("⋮", 22, Color.WHITE, true);
+        actions.setGravity(Gravity.CENTER);
+        actions.setMinWidth(d(34));
+        actions.setFocusable(true);
+        row.addView(actions);
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
         p.setMargins(d(16), 0, d(16), d(8));
         content.addView(row, p);
         row.setOnClickListener(v -> launchPlayer(result.optString("stream_url", "/api/v1/items/" + result.optString("id") + "/stream"), result.optString("title", "Zinema")));
+        actions.setOnClickListener(v -> {
+            JSONObject target = new JSONObject();
+            try {
+                String metadataNode = result.optString("series_id", "");
+                if (metadataNode.isEmpty() || metadataNode.equals("null")) metadataNode = result.optString("node_id", "");
+                target.put("id", metadataNode);
+                showActions(target);
+            } catch (JSONException ignored) { }
+        });
+    }
+
+    String searchSubtitle(JSONObject result) {
+        if (!result.optString("series_id").isEmpty()) {
+            int seasons = result.optInt("season_count");
+            return seasons + (seasons == 1 ? " temporada" : " temporadas");
+        }
+        JSONArray genres = result.optJSONArray("genres");
+        if (genres != null && genres.length() > 0) return join(genres);
+        return "Sin género disponible";
     }
 
     void showSettings() {
@@ -693,6 +884,11 @@ public class MainActivity extends Activity {
         input.setText(server);
         input.setSelectAllOnFocus(true);
         box.addView(input);
+        TextView attribution = label(
+                "This product uses the TMDB API but is not endorsed or certified by TMDB.",
+                11, MUTED, false);
+        attribution.setPadding(0, d(12), 0, d(4));
+        box.addView(attribution);
         new AlertDialog.Builder(this).setTitle("Conectar con el servidor").setView(box)
                 .setNegativeButton("Cancelar", null)
                 .setPositiveButton("Guardar y conectar", (dialog, which) -> {
@@ -832,25 +1028,36 @@ public class MainActivity extends Activity {
         super.onResume();
         if (prefs != null && page != null) {
             List<JSONObject> resume = readContinueWatching();
-            if (!resume.isEmpty() && content != null && movies.size() + series.size() > 0) renderHome();
+            if (!resume.isEmpty() && content != null && movies.size() + series.size() > 0) {
+                libraryMode = false;
+                showingDetail = false;
+                breadcrumbs.clear();
+                if (backButton != null) backButton.setVisibility(View.GONE);
+                renderHome();
+            }
         }
     }
 
     @Override public void onBackPressed() {
+        if (showingDetail) {
+            showingDetail = false;
+            if (!breadcrumbs.isEmpty()) {
+                showCollectionContents(breadcrumbs.get(breadcrumbs.size() - 1));
+            } else if (libraryMode) {
+                openLibrary(currentLibrary);
+            } else {
+                loadHome();
+            }
+            return;
+        }
         if (!breadcrumbs.isEmpty()) {
             breadcrumbs.remove(breadcrumbs.size() - 1);
             if (breadcrumbs.isEmpty()) {
-                openLibrary(currentLibrary);
+                if (libraryMode) openLibrary(currentLibrary);
+                else loadHome();
             } else {
                 JSONObject parent = breadcrumbs.get(breadcrumbs.size() - 1);
-                showLoading("Volviendo a " + displayTitle(parent) + "…");
-                io.execute(() -> {
-                    try {
-                        JSONArray children = getArray("/api/v1/catalog?library=" + currentLibrary +
-                                "&parent_id=" + enc(parent.optString("id")));
-                        runOnUiThread(() -> renderListing(displayTitle(parent), toList(children)));
-                    } catch (Exception e) { runOnUiThread(() -> renderError(e.getMessage())); }
-                });
+                showCollectionContents(parent);
             }
             return;
         }

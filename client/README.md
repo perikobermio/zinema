@@ -5,9 +5,12 @@ Cliente Android nativo conectado a la API pública de Zinema. La interfaz usa un
 ## Funciones
 
 - Explorar películas, series, colecciones, temporadas y episodios.
+- Ver géneros de películas y colecciones, y el número de temporadas de cada serie.
+- Navegar atrás con el botón visible en pantalla o con la tecla atrás del dispositivo.
 - Buscar en el catálogo del servidor.
 - Ver fichas con sinopsis, año, géneros e imágenes.
 - Guardar títulos en «Mi lista» y conservar el progreso local para continuar viendo.
+- Reintentar la metadata desde el menú de tres puntos de cada tarjeta o ficha.
 - Reproducir el contenido del NAS con los controles nativos de Android.
 - Configurar el dominio público o una dirección local del servidor desde el icono de ajustes.
 
@@ -21,6 +24,6 @@ Necesitas un JDK, Android SDK Platform 35 y Android Build Tools 36.0.0. Ejecuta:
 ./build-apk.sh
 ```
 
-El APK firmado para depuración queda en `build/outputs/apk/debug/zinema-client-debug.apk`. El script compila y firma el paquete, pero no instala nada. Puedes indicar otra ubicación del SDK con `ANDROID_SDK_ROOT`.
+El APK firmado para depuración queda en `build/outputs/apk/debug/zinema-client-debug.apk`. El script compila y firma el paquete, pero no instala nada. La clave local de depuración se conserva en `.debug.keystore` (ignorada por Git) para que las compilaciones siguientes puedan instalarse como actualización. Puedes indicar otra ubicación del SDK con `ANDROID_SDK_ROOT`.
 
 La primera apertura conecta al dominio configurado en `MainActivity`; puedes cambiarlo desde «Servidor». La compatibilidad de reproducción depende de los formatos y códecs que soporte el dispositivo Android.

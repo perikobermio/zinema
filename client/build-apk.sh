@@ -9,6 +9,7 @@ ANDROID_API=${ANDROID_API:-35}
 TOOLS="$SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION"
 ANDROID_JAR="$SDK_ROOT/platforms/android-$ANDROID_API/android.jar"
 BUILD_DIR="$CLIENT_DIR/build"
+DEBUG_KEYSTORE="$CLIENT_DIR/.debug.keystore"
 
 fail() {
     printf 'ERROR: %s\n' "$1" >&2
@@ -25,6 +26,9 @@ command -v jar >/dev/null 2>&1 || fail "Falta jar (instala un JDK)."
 command -v zip >/dev/null 2>&1 || fail "Falta zip."
 command -v keytool >/dev/null 2>&1 || fail "Falta keytool (instala un JDK)."
 
+if [ ! -f "$DEBUG_KEYSTORE" ] && [ -f "$BUILD_DIR/debug.keystore" ]; then
+    cp "$BUILD_DIR/debug.keystore" "$DEBUG_KEYSTORE"
+fi
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR/generated" "$BUILD_DIR/classes" "$BUILD_DIR/dex"
 mkdir -p "$BUILD_DIR/outputs/apk/debug"
@@ -38,8 +42,8 @@ mkdir -p "$BUILD_DIR/outputs/apk/debug"
     --custom-package com.zinema.client \
     --min-sdk-version 23 \
     --target-sdk-version "$ANDROID_API" \
-    --version-code 1 \
-    --version-name 0.1.0 \
+    --version-code 2 \
+    --version-name 0.2.0 \
     --auto-add-overlay \
     "$BUILD_DIR/resources.zip"
 
@@ -57,15 +61,15 @@ cp "$BUILD_DIR/unsigned.apk" "$BUILD_DIR/with-dex.apk"
 )
 "$TOOLS/zipalign" -f 4 "$BUILD_DIR/with-dex.apk" "$BUILD_DIR/aligned.apk"
 
-if [ ! -f "$BUILD_DIR/debug.keystore" ]; then
+if [ ! -f "$DEBUG_KEYSTORE" ]; then
     keytool -genkeypair -noprompt \
-        -keystore "$BUILD_DIR/debug.keystore" \
+        -keystore "$DEBUG_KEYSTORE" \
         -storepass android -keypass android -alias androiddebugkey \
         -dname "CN=Android Debug,O=Zinema,C=ES" \
         -keyalg RSA -keysize 2048 -validity 10000 >/dev/null 2>&1
 fi
 "$TOOLS/apksigner" sign \
-    --ks "$BUILD_DIR/debug.keystore" \
+    --ks "$DEBUG_KEYSTORE" \
     --ks-key-alias androiddebugkey \
     --ks-pass pass:android --key-pass pass:android \
     --out "$BUILD_DIR/outputs/apk/debug/zinema-client-debug.apk" \
