@@ -546,7 +546,8 @@ public class MainActivity extends Activity {
     }
 
     void loadVisibleLazyRowsIn(View view) {
-        if (view instanceof HorizontalScrollView && "zinema-lazy-posters".equals(view.getTag())) {
+        if (view instanceof HorizontalScrollView &&
+                ("zinema-lazy-posters".equals(view.getTag()) || "zinema-lazy-cast".equals(view.getTag()))) {
             loadLazyRow((HorizontalScrollView) view);
             return;
         }
@@ -1486,6 +1487,7 @@ public class MainActivity extends Activity {
         addSectionHeader("Reparto", "Reparto principal");
         HorizontalScrollView horizontal = new HorizontalScrollView(this);
         horizontal.setHorizontalScrollBarEnabled(false);
+        horizontal.setTag("zinema-lazy-cast");
         LinearLayout cards = new LinearLayout(this);
         cards.setPadding(d(16), 0, d(16), d(16));
         for (int i = 0; i < cast.length(); i++) {
@@ -1499,7 +1501,7 @@ public class MainActivity extends Activity {
             card.addView(portrait, new FrameLayout.LayoutParams(-1, -1));
             String profilePath = member.optString("profile_path", "");
             if (!profilePath.isEmpty() && !profilePath.equals("null")) {
-                loadImage("https://image.tmdb.org/t/p/w342" + profilePath, portrait, false);
+                portrait.setTag("https://image.tmdb.org/t/p/w342" + profilePath);
             }
             View shade = new View(this);
             shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
@@ -1527,6 +1529,7 @@ public class MainActivity extends Activity {
         }
         horizontal.addView(cards);
         content.addView(horizontal, new LinearLayout.LayoutParams(-1, -2));
+        installLazyRowScroll(horizontal);
     }
 
     void showMovieFileDetails(JSONObject node) {
