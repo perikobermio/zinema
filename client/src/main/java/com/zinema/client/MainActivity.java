@@ -288,8 +288,13 @@ public class MainActivity extends Activity {
         contentScroller = new ScrollView(this);
         contentScroller.setFillViewport(true);
         contentScroller.setVerticalScrollBarEnabled(false);
-        contentScroller.setBackgroundColor("series".equals(selectedSection)
-                ? Color.rgb(13, 16, 23) : BG);
+        if ("series".equals(selectedSection)) {
+            contentScroller.setBackground(new GradientDrawable(
+                    GradientDrawable.Orientation.TOP_BOTTOM,
+                    new int[]{Color.rgb(15, 21, 31), Color.rgb(21, 30, 45)}));
+        } else {
+            contentScroller.setBackgroundColor(BG);
+        }
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.setPadding(0, 0, 0, d(28));
