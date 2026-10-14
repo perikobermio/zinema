@@ -146,6 +146,7 @@ def database() -> sqlite3.Connection:
             overview TEXT,
             year INTEGER,
             genres TEXT NOT NULL DEFAULT '[]',
+            cast_json TEXT,
             tmdb_id INTEGER,
             imdb_id TEXT,
             poster_file TEXT,
@@ -165,6 +166,8 @@ def database() -> sqlite3.Connection:
     node_columns = {row["name"] for row in connection.execute("PRAGMA table_info(catalog_nodes)")}
     if "episode_metadata_checked_at" not in node_columns:
         connection.execute("ALTER TABLE catalog_nodes ADD COLUMN episode_metadata_checked_at TEXT")
+    if "cast_json" not in node_columns:
+        connection.execute("ALTER TABLE catalog_nodes ADD COLUMN cast_json TEXT")
     if "added_at" not in node_columns:
         connection.execute("ALTER TABLE catalog_nodes ADD COLUMN added_at TEXT NOT NULL DEFAULT ''")
     connection.execute("UPDATE catalog_nodes SET added_at=scanned_at WHERE added_at='' ")
@@ -273,6 +276,7 @@ def _collection_artwork(connection: sqlite3.Connection, collection_id: str) -> d
 def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     node = dict(row)
     genres = normalize_genres(json.loads(node.pop("genres", "[]") or "[]"))
+    node["cast"] = json.loads(node.pop("cast_json", None) or "[]")
     node["display_title"] = node.pop("metadata_title", None) or node["title"]
     node["year"] = node.get("year") or node.get("source_year")
     inherited_genres = _inherited_collection_value(connection, node.get("parent_id"), "genres")

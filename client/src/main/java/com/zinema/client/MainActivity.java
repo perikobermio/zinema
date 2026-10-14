@@ -1431,15 +1431,10 @@ public class MainActivity extends Activity {
         controls.setGravity(Gravity.CENTER_VERTICAL);
         Button play = actionButton(node.optString("kind").equals("series") ? "Ver episodios" : "Reproducir", true);
         controls.addView(play, new LinearLayout.LayoutParams(-2, d(44)));
-        Button save = actionButton(isFavorite(node) ? "✓ Mi lista" : "+ Mi lista", false);
-        LinearLayout.LayoutParams fp = new LinearLayout.LayoutParams(-2, d(44));
-        fp.leftMargin = d(10);
-        controls.addView(save, fp);
         LinearLayout.LayoutParams controlsP = new LinearLayout.LayoutParams(-1, -2);
         controlsP.topMargin = d(14);
         info.addView(controls, controlsP);
         play.setOnClickListener(v -> playFirst(node));
-        save.setOnClickListener(v -> { toggleFavorite(node); save.setText(isFavorite(node) ? "✓ Mi lista" : "+ Mi lista"); });
         banner.addView(info, new FrameLayout.LayoutParams(-1, -1));
         TextView actions = label("⋮", 23, Color.WHITE, true);
         actions.setGravity(Gravity.CENTER);
@@ -1454,6 +1449,9 @@ public class MainActivity extends Activity {
         bp.setMargins(d(16), d(10), d(16), d(10));
         content.addView(banner, bp);
 
+        if ("movie".equals(node.optString("kind")) || "series".equals(node.optString("kind"))) {
+            addCastSection(node.optJSONArray("cast"));
+        }
         JSONArray children = node.optJSONArray("children");
         JSONArray files = node.optJSONArray("files");
         if (children != null && children.length() > 0) {
@@ -1477,8 +1475,40 @@ public class MainActivity extends Activity {
         return result.toString();
     }
 
+    void addCastSection(JSONArray cast) {
+        if (cast == null || cast.length() == 0) return;
+        addSectionHeader("Reparto", "Reparto principal");
+        HorizontalScrollView horizontal = new HorizontalScrollView(this);
+        horizontal.setHorizontalScrollBarEnabled(false);
+        LinearLayout cards = new LinearLayout(this);
+        cards.setPadding(d(16), 0, d(16), d(16));
+        for (int i = 0; i < cast.length(); i++) {
+            JSONObject member = cast.optJSONObject(i);
+            if (member == null) continue;
+            LinearLayout card = new LinearLayout(this);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(d(12), d(12), d(12), d(12));
+            card.setBackground(round(PANEL, d(10)));
+            TextView name = label(member.optString("name"), 14, Color.WHITE, true);
+            name.setMaxLines(2);
+            card.addView(name);
+            String character = member.optString("character", "").trim();
+            if (!character.isEmpty()) {
+                TextView role = label(character, 12, MUTED, false);
+                role.setMaxLines(2);
+                LinearLayout.LayoutParams roleParams = new LinearLayout.LayoutParams(-1, -2);
+                roleParams.topMargin = d(5);
+                card.addView(role, roleParams);
+            }
+            LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(d(164), d(88));
+            cardParams.setMargins(0, 0, d(8), 0);
+            cards.addView(card, cardParams);
+        }
+        horizontal.addView(cards);
+        content.addView(horizontal, new LinearLayout.LayoutParams(-1, -2));
+    }
+
     void addMovieFileCard(JSONArray files, String fallbackPoster, JSONObject owner) {
-        addSectionHeader("Película", "Archivo de vídeo disponible");
         for (int i = 0; i < files.length(); i++) {
             JSONObject file = files.optJSONObject(i);
             if (file == null) continue;
