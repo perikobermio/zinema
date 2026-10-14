@@ -39,11 +39,14 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -64,9 +67,17 @@ public class MainActivity extends Activity {
     static final int RED = Color.rgb(229, 9, 20);
     static final String PREFS = "zinema_client";
     static final String DEFAULT_SERVER = "https://zinema.ebu.freemyip.com";
+    static final long CATALOG_CACHE_TTL_MS = 30000L;
+    static final long IMAGE_DISK_CACHE_MAX_BYTES = 160L * 1024L * 1024L;
     final ExecutorService io = Executors.newFixedThreadPool(4);
-    final LruCache<String, Bitmap> imageCache = new LruCache<>(24);
+    final LruCache<String, Bitmap> imageCache = new LruCache<String, Bitmap>(bitmapCacheBytes()) {
+        @Override protected int sizeOf(String key, Bitmap value) {
+            return Math.max(1, value.getAllocationByteCount());
+        }
+    };
     final Map<String, List<ImageView>> pendingImageTargets = new HashMap<>();
+    final Map<String, List<JSONObject>> catalogCache = new HashMap<>();
+    final Map<String, Long> catalogCacheUpdatedAt = new HashMap<>();
     SharedPreferences prefs;
     FrameLayout frame;
     LinearLayout page;
@@ -83,8 +94,11 @@ public class MainActivity extends Activity {
     String selectedSection = "home";
     String lastSearchQuery;
     String detailNodeId = "";
+    String catalogVersion = "";
     int detailReturnScrollY;
     int pendingListingRestoreY = -1;
+    long lastCatalogVersionCheckMs;
+    boolean catalogVersionCheckRunning;
     boolean libraryMode;
     boolean showingDetail;
     boolean showingAdmin;
@@ -98,6 +112,7 @@ public class MainActivity extends Activity {
     List<JSONObject> startupSeries = new ArrayList<>();
     JSONArray startupItems;
     String startupPrefetchError;
+    String startupCatalogVersion = "";
     String adminReturnDetailId = "";
     boolean metadataEditorFromDetail;
     boolean metadataEditorMode;
@@ -109,6 +124,11 @@ public class MainActivity extends Activity {
     final Map<ImageView, String> requestedImages = new WeakHashMap<>();
     final List<JSONObject> breadcrumbs = new ArrayList<>();
     final List<Integer> breadcrumbScrollPositions = new ArrayList<>();
+
+    static int bitmapCacheBytes() {
+        return (int) Math.min(32L * 1024L * 1024L,
+                Math.max(8L * 1024L * 1024L, Runtime.getRuntime().maxMemory() / 10L));
+    }
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -166,10 +186,13 @@ public class MainActivity extends Activity {
             List<JSONObject> seriesList = null;
             JSONArray items = null;
             String error = null;
+            String version = "";
             try {
                 JSONArray movieRows = getArray("/api/v1/catalog?library=movies");
                 JSONArray seriesRows = getArray("/api/v1/catalog?library=series");
                 items = getArray("/api/v1/items?limit=500");
+                try { version = getJson("/api/v1/catalog/version").optString("version", ""); }
+                catch (Exception ignored) { }
                 movieList = toList(movieRows);
                 seriesList = toList(seriesRows);
                 sortNewestFirst(movieList);
@@ -181,6 +204,7 @@ public class MainActivity extends Activity {
                 startupMovies = movieList;
                 startupSeries = seriesList;
                 startupItems = items;
+                startupCatalogVersion = version;
                 startupPrefetchError = error;
                 startupPrefetchReady = true;
             }
@@ -193,6 +217,7 @@ public class MainActivity extends Activity {
         List<JSONObject> seriesList;
         JSONArray items;
         String error;
+        String version;
         synchronized (this) {
             if (!startupPrefetchPending || !startupPrefetchReady || !startupHomeAwaiting) return;
             startupPrefetchPending = false;
@@ -200,6 +225,7 @@ public class MainActivity extends Activity {
             movieList = startupMovies;
             seriesList = startupSeries;
             items = startupItems;
+            version = startupCatalogVersion;
             error = startupPrefetchError;
         }
         if (error != null) {
@@ -208,6 +234,10 @@ public class MainActivity extends Activity {
         }
         movies = movieList == null ? new ArrayList<>() : movieList;
         series = seriesList == null ? new ArrayList<>() : seriesList;
+        putCatalogList("movies", null, movies);
+        putCatalogList("series", null, series);
+        catalogVersion = version == null ? "" : version;
+        lastCatalogVersionCheckMs = System.currentTimeMillis();
         if (items != null) cachePosterByStream(items);
         renderHome();
     }
@@ -435,6 +465,15 @@ public class MainActivity extends Activity {
         breadcrumbs.clear();
         breadcrumbScrollPositions.clear();
         buildShell("Inicio");
+        List<JSONObject> cachedMovies = getCachedCatalogList("movies", null);
+        List<JSONObject> cachedSeries = getCachedCatalogList("series", null);
+        if (cachedMovies != null && cachedSeries != null) {
+            movies = cachedMovies;
+            series = cachedSeries;
+            renderHome();
+            maybeRefreshHomeCatalog();
+            return;
+        }
         showLoading("Conectando con tu biblioteca…");
         if (startupPrefetchPending) {
             startupHomeAwaiting = true;
@@ -450,6 +489,7 @@ public class MainActivity extends Activity {
                 JSONArray m = getArray("/api/v1/catalog?library=movies");
                 JSONArray s = getArray("/api/v1/catalog?library=series");
                 JSONArray allItems = getArray("/api/v1/items?limit=500");
+                String version = fetchCatalogVersionSafely();
                 List<JSONObject> movieList = toList(m);
                 List<JSONObject> seriesList = toList(s);
                 sortNewestFirst(movieList);
@@ -458,6 +498,10 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     movies = movieList;
                     series = seriesList;
+                    putCatalogList("movies", null, movieList);
+                    putCatalogList("series", null, seriesList);
+                    catalogVersion = version;
+                    lastCatalogVersionCheckMs = System.currentTimeMillis();
                     renderHome();
                 });
             } catch (Exception e) {
@@ -478,6 +522,137 @@ public class MainActivity extends Activity {
     void sortNewestFirst(List<JSONObject> nodes) {
         Collections.sort(nodes, (left, right) ->
                 right.optString("added_at", "").compareTo(left.optString("added_at", "")));
+    }
+
+    String catalogCacheKey(String library, String parentId) {
+        return library + "|" + (parentId == null ? "root" : parentId);
+    }
+
+    List<JSONObject> getCachedCatalogList(String library, String parentId) {
+        List<JSONObject> cached = catalogCache.get(catalogCacheKey(library, parentId));
+        return cached == null ? null : new ArrayList<>(cached);
+    }
+
+    void putCatalogList(String library, String parentId, List<JSONObject> rows) {
+        String key = catalogCacheKey(library, parentId);
+        catalogCache.put(key, new ArrayList<>(rows));
+        catalogCacheUpdatedAt.put(key, System.currentTimeMillis());
+    }
+
+    void clearCatalogCache() {
+        catalogCache.clear();
+        catalogCacheUpdatedAt.clear();
+    }
+
+    String fetchCatalogVersionSafely() {
+        try { return getJson("/api/v1/catalog/version").optString("version", ""); }
+        catch (Exception ignored) { return ""; }
+    }
+
+    String catalogListingPath(String library, String parentId) {
+        String path = "/api/v1/catalog?library=" + enc(library);
+        if (parentId != null) path += "&parent_id=" + enc(parentId);
+        return path;
+    }
+
+    boolean isListingVisible(String library, String parentId) {
+        if (!libraryMode || !library.equals(currentLibrary)) return false;
+        if (parentId == null) return breadcrumbs.isEmpty();
+        return !breadcrumbs.isEmpty() && parentId.equals(
+                breadcrumbs.get(breadcrumbs.size() - 1).optString("id"));
+    }
+
+    void maybeRefreshCatalogListing(String library, String parentId) {
+        long now = System.currentTimeMillis();
+        if (catalogVersionCheckRunning || now - lastCatalogVersionCheckMs < CATALOG_CACHE_TTL_MS) return;
+        catalogVersionCheckRunning = true;
+        lastCatalogVersionCheckMs = now;
+        String knownVersion = catalogVersion;
+        io.execute(() -> {
+            String remoteVersion = fetchCatalogVersionSafely();
+            if (!remoteVersion.isEmpty() && remoteVersion.equals(knownVersion)) {
+                runOnUiThread(() -> catalogVersionCheckRunning = false);
+                return;
+            }
+            try {
+                List<JSONObject> rows = toList(getArray(catalogListingPath(library, parentId)));
+                if (parentId == null) sortNewestFirst(rows);
+                runOnUiThread(() -> {
+                    catalogVersionCheckRunning = false;
+                    if (!remoteVersion.isEmpty() && !remoteVersion.equals(catalogVersion)) clearCatalogCache();
+                    if (!remoteVersion.isEmpty()) catalogVersion = remoteVersion;
+                    putCatalogList(library, parentId, rows);
+                    if (parentId == null) {
+                        if ("movies".equals(library)) movies = new ArrayList<>(rows);
+                        else series = new ArrayList<>(rows);
+                    }
+                    if (isListingVisible(library, parentId)) {
+                        int previousY = contentScroller == null ? 0 : contentScroller.getScrollY();
+                        pendingListingRestoreY = previousY;
+                        if (parentId == null) {
+                            renderListing(library.equals("movies") ? "Películas" : "Series", rows);
+                        } else {
+                            JSONObject collection = breadcrumbs.get(breadcrumbs.size() - 1);
+                            renderListing(displayTitle(collection), collectionSubtitle(rows), rows);
+                        }
+                    }
+                });
+            } catch (Exception ignored) {
+                runOnUiThread(() -> catalogVersionCheckRunning = false);
+            }
+        });
+    }
+
+    void maybeRefreshHomeCatalog() {
+        long now = System.currentTimeMillis();
+        if (catalogVersionCheckRunning || now - lastCatalogVersionCheckMs < CATALOG_CACHE_TTL_MS) return;
+        catalogVersionCheckRunning = true;
+        lastCatalogVersionCheckMs = now;
+        String knownVersion = catalogVersion;
+        io.execute(() -> {
+            String remoteVersion = fetchCatalogVersionSafely();
+            if (!remoteVersion.isEmpty() && remoteVersion.equals(knownVersion)) {
+                runOnUiThread(() -> catalogVersionCheckRunning = false);
+                return;
+            }
+            try {
+                List<JSONObject> movieList = toList(getArray(catalogListingPath("movies", null)));
+                List<JSONObject> seriesList = toList(getArray(catalogListingPath("series", null)));
+                sortNewestFirst(movieList);
+                sortNewestFirst(seriesList);
+                JSONArray items = getArray("/api/v1/items?limit=500");
+                runOnUiThread(() -> {
+                    catalogVersionCheckRunning = false;
+                    if (!remoteVersion.isEmpty() && !remoteVersion.equals(catalogVersion)) clearCatalogCache();
+                    if (!remoteVersion.isEmpty()) catalogVersion = remoteVersion;
+                    putCatalogList("movies", null, movieList);
+                    putCatalogList("series", null, seriesList);
+                    movies = movieList;
+                    series = seriesList;
+                    cachePosterByStream(items);
+                    if (!libraryMode && !showingDetail && !showingAdmin && !metadataEditorMode) {
+                        int previousY = contentScroller == null ? 0 : contentScroller.getScrollY();
+                        pendingListingRestoreY = previousY;
+                        renderHome();
+                    }
+                });
+            } catch (Exception ignored) {
+                runOnUiThread(() -> catalogVersionCheckRunning = false);
+            }
+        });
+    }
+
+    String collectionSubtitle(List<JSONObject> items) {
+        int movieCount = 0;
+        int collectionCount = 0;
+        for (JSONObject item : items) {
+            if ("movie".equals(item.optString("kind"))) movieCount++;
+            else if ("collection".equals(item.optString("kind"))) collectionCount++;
+        }
+        String subtitle = movieCount + (movieCount == 1 ? " película" : " películas");
+        if (collectionCount > 0) subtitle += " · " + collectionCount +
+                (collectionCount == 1 ? " colección" : " colecciones");
+        return subtitle;
     }
 
     void renderHome() {
@@ -665,6 +840,76 @@ public class MainActivity extends Activity {
         return drawable;
     }
 
+    File imageDiskFile(String url) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(url.getBytes(StandardCharsets.UTF_8));
+            StringBuilder name = new StringBuilder();
+            for (byte value : digest) name.append(String.format(java.util.Locale.ROOT, "%02x", value & 0xff));
+            File directory = new File(getCacheDir(), "zinema-images");
+            if (!directory.exists()) directory.mkdirs();
+            return new File(directory, name + ".img");
+        } catch (Exception ignored) { return null; }
+    }
+
+    Bitmap readDiskImage(String url) {
+        File file = imageDiskFile(url);
+        if (file == null || !file.isFile()) return null;
+        Bitmap bitmap = BitmapFactory.decodeFile(file.getAbsolutePath());
+        if (bitmap == null) file.delete();
+        else file.setLastModified(System.currentTimeMillis());
+        return bitmap;
+    }
+
+    byte[] downloadImage(String url) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        connection.setConnectTimeout(10000);
+        connection.setReadTimeout(15000);
+        connection.setInstanceFollowRedirects(true);
+        try {
+            InputStream input = connection.getInputStream();
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buffer = new byte[16384];
+            int count;
+            while ((count = input.read(buffer)) != -1) out.write(buffer, 0, count);
+            input.close();
+            return out.toByteArray();
+        } finally { connection.disconnect(); }
+    }
+
+    void writeDiskImage(String url, byte[] bytes) {
+        File file = imageDiskFile(url);
+        if (file == null || bytes == null || bytes.length == 0) return;
+        File temporary = new File(file.getParentFile(), file.getName() + ".tmp");
+        try {
+            FileOutputStream output = new FileOutputStream(temporary);
+            output.write(bytes);
+            output.close();
+            if (!temporary.renameTo(file)) {
+                FileOutputStream fallback = new FileOutputStream(file);
+                fallback.write(bytes);
+                fallback.close();
+                temporary.delete();
+            }
+            file.setLastModified(System.currentTimeMillis());
+            trimDiskImageCache(file.getParentFile());
+        } catch (Exception ignored) { temporary.delete(); }
+    }
+
+    void trimDiskImageCache(File directory) {
+        if (directory == null) return;
+        File[] files = directory.listFiles((dir, name) -> name.endsWith(".img"));
+        if (files == null) return;
+        long total = 0;
+        for (File file : files) total += file.length();
+        if (total <= IMAGE_DISK_CACHE_MAX_BYTES) return;
+        java.util.Arrays.sort(files, Comparator.comparingLong(File::lastModified));
+        for (File file : files) {
+            if (total <= IMAGE_DISK_CACHE_MAX_BYTES) break;
+            long size = file.length();
+            if (file.delete()) total -= size;
+        }
+    }
+
     void loadImage(String path, ImageView target, boolean backdrop) {
         if (path == null || path.trim().isEmpty()) {
             target.setBackground(round(PANEL, d(8)));
@@ -685,16 +930,16 @@ public class MainActivity extends Activity {
         pending.add(target);
         pendingImageTargets.put(url, pending);
         io.execute(() -> {
-            HttpURLConnection connection = null;
             Bitmap bitmap = null;
             try {
-                connection = (HttpURLConnection) new URL(url).openConnection();
-                connection.setConnectTimeout(10000);
-                connection.setReadTimeout(15000);
-                connection.setInstanceFollowRedirects(true);
-                bitmap = BitmapFactory.decodeStream(connection.getInputStream());
+                bitmap = readDiskImage(url);
+                if (bitmap == null) {
+                    byte[] bytes = downloadImage(url);
+                    bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+                    if (bitmap != null) writeDiskImage(url, bytes);
+                }
             } catch (Exception ignored) {
-            } finally { if (connection != null) connection.disconnect(); }
+            }
             Bitmap result = bitmap;
             runOnUiThread(() -> {
                 List<ImageView> targets = pendingImageTargets.remove(url);
@@ -786,11 +1031,22 @@ public class MainActivity extends Activity {
         breadcrumbs.clear();
         breadcrumbScrollPositions.clear();
         buildShell(library.equals("movies") ? "Películas" : "Series");
+        List<JSONObject> cached = getCachedCatalogList(library, null);
+        if (cached != null) {
+            renderListing(library.equals("movies") ? "Películas" : "Series", cached);
+            maybeRefreshCatalogListing(library, null);
+            return;
+        }
         showLoading("Cargando catálogo…");
         io.execute(() -> {
             try {
                 JSONArray rows = getArray("/api/v1/catalog?library=" + library);
-                runOnUiThread(() -> renderListing(library.equals("movies") ? "Películas" : "Series", toList(rows)));
+                List<JSONObject> nodes = toList(rows);
+                sortNewestFirst(nodes);
+                runOnUiThread(() -> {
+                    putCatalogList(library, null, nodes);
+                    renderListing(library.equals("movies") ? "Películas" : "Series", nodes);
+                });
             } catch (Exception e) { runOnUiThread(() -> renderError(e.getMessage())); }
         });
     }
@@ -979,23 +1235,24 @@ public class MainActivity extends Activity {
     }
 
     void showCollectionContents(JSONObject collection) {
+        String listingLibrary = currentLibrary;
+        String collectionId = collection.optString("id");
+        List<JSONObject> cached = getCachedCatalogList(listingLibrary, collectionId);
+        if (cached != null) {
+            renderListing(displayTitle(collection), collectionSubtitle(cached), cached);
+            maybeRefreshCatalogListing(listingLibrary, collectionId);
+            return;
+        }
         showLoading("Abriendo " + displayTitle(collection) + "…");
         io.execute(() -> {
             try {
-                JSONArray children = getArray("/api/v1/catalog?library=" + currentLibrary +
-                        "&parent_id=" + enc(collection.optString("id")));
+                JSONArray children = getArray("/api/v1/catalog?library=" + listingLibrary +
+                        "&parent_id=" + enc(collectionId));
                 List<JSONObject> items = toList(children);
-                int movieCount = 0;
-                int collectionCount = 0;
-                for (JSONObject item : items) {
-                    if ("movie".equals(item.optString("kind"))) movieCount++;
-                    else if ("collection".equals(item.optString("kind"))) collectionCount++;
-                }
-                String subtitle = movieCount + (movieCount == 1 ? " película" : " películas");
-                if (collectionCount > 0) subtitle += " · " + collectionCount +
-                        (collectionCount == 1 ? " colección" : " colecciones");
-                String collectionSubtitle = subtitle;
-                runOnUiThread(() -> renderListing(displayTitle(collection), collectionSubtitle, items));
+                runOnUiThread(() -> {
+                    putCatalogList(listingLibrary, collectionId, items);
+                    renderListing(displayTitle(collection), collectionSubtitle(items), items);
+                });
             } catch (Exception e) { runOnUiThread(() -> renderError(e.getMessage())); }
         });
     }
@@ -1747,6 +2004,9 @@ public class MainActivity extends Activity {
 
     void finishMetadataRetry(String requestedNodeId, String summary) {
         Toast.makeText(this, summary, Toast.LENGTH_LONG).show();
+        clearCatalogCache();
+        catalogVersion = "";
+        lastCatalogVersionCheckMs = 0L;
         boolean returnToDetail = metadataEditorFromDetail && requestedNodeId.equals(detailNodeId);
         setMetadataEditorChrome(false);
         if (returnToDetail) {
@@ -2465,6 +2725,9 @@ public class MainActivity extends Activity {
             if (serverChanged) {
                 startupPrefetchPending = false;
                 startupHomeAwaiting = false;
+                clearCatalogCache();
+                catalogVersion = "";
+                lastCatalogVersionCheckMs = 0L;
             }
             prefs.edit().putString("server", server).putString("server_name", serverName).apply();
             imageCache.evictAll();
@@ -2677,6 +2940,11 @@ public class MainActivity extends Activity {
             int scrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
             renderHome();
             if (contentScroller != null) contentScroller.post(() -> contentScroller.scrollTo(0, scrollY));
+            maybeRefreshHomeCatalog();
+        } else if (prefs != null && libraryMode && !showingDetail && !showingAdmin && !metadataEditorMode) {
+            if (breadcrumbs.isEmpty()) maybeRefreshCatalogListing(currentLibrary, null);
+            else maybeRefreshCatalogListing(currentLibrary,
+                    breadcrumbs.get(breadcrumbs.size() - 1).optString("id"));
         }
     }
 

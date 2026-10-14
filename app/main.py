@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import mimetypes
 import os
 import re
@@ -206,6 +207,19 @@ def display_title(path: Path) -> str:
     return path.stem.replace(".", " ").replace("_", " ").strip()
 
 
+def _artwork_url(node_id: str, image_type: str, filename: str | None = None,
+                 fallback_version: str = "") -> str:
+    version = fallback_version or "0"
+    if filename:
+        image_path = ARTWORK_DIR / filename
+        try:
+            stat = image_path.stat()
+            version = f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
+        except OSError:
+            version = hashlib.sha256(filename.encode("utf-8")).hexdigest()[:16]
+    return f"/api/v1/catalog/{node_id}/images/{image_type}?v={version}"
+
+
 def item_from_row(row: sqlite3.Row, connection: sqlite3.Connection) -> LibraryItem:
     data = dict(row)
     data["genres"] = normalize_genres(json.loads(data.pop("genres_json", "[]") or "[]"))
@@ -217,11 +231,11 @@ def item_from_row(row: sqlite3.Row, connection: sqlite3.Connection) -> LibraryIt
         if inherited_genres:
             data["genres"] = normalize_genres(json.loads(inherited_genres[1] or "[]"))
     if metadata_node_id and poster_file:
-        data["poster_url"] = f"/api/v1/catalog/{metadata_node_id}/images/poster"
+        data["poster_url"] = _artwork_url(metadata_node_id, "poster", poster_file)
     elif metadata_node_id:
         inherited_poster = _inherited_collection_value(connection, metadata_parent_id, "poster_file")
         if inherited_poster:
-            data["poster_url"] = f"/api/v1/catalog/{inherited_poster[0]}/images/poster"
+            data["poster_url"] = _artwork_url(inherited_poster[0], "poster", inherited_poster[1])
     return LibraryItem(**data)
 
 
@@ -259,7 +273,7 @@ def _collection_artwork(connection: sqlite3.Connection, collection_id: str) -> d
         (collection_id,),
     ).fetchall()
     mosaic = [
-        f"/api/v1/catalog/{item['id']}/images/poster"
+        _artwork_url(item["id"], "poster", item["poster_file"])
         for item in items if item["poster_file"]
     ][:4]
     # Keep the four-tile layout complete when one of the titles has no
@@ -268,7 +282,7 @@ def _collection_artwork(connection: sqlite3.Connection, collection_id: str) -> d
         "SELECT poster_file FROM catalog_nodes WHERE id=?", (collection_id,),
     ).fetchone()
     if len(mosaic) == 3 and collection and collection["poster_file"]:
-        mosaic.append(f"/api/v1/catalog/{collection_id}/images/poster")
+        mosaic.append(_artwork_url(collection_id, "poster", collection["poster_file"]))
     single_poster_url = None
     if len(items) == 1:
         item = items[0]
@@ -278,7 +292,8 @@ def _collection_artwork(connection: sqlite3.Connection, collection_id: str) -> d
             if inherited:
                 poster_node_id = inherited[0]
         if poster_node_id:
-            single_poster_url = f"/api/v1/catalog/{poster_node_id}/images/poster"
+            poster_filename = item["poster_file"] if item["poster_file"] else inherited[1]
+            single_poster_url = _artwork_url(poster_node_id, "poster", poster_filename)
     return {"item_count": len(items), "mosaic_images": mosaic,
             "single_item_poster_url": single_poster_url}
 
@@ -303,15 +318,16 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     node["poster_available"] = bool(poster_file or single_item_poster or inherited_poster) or node["kind"] == "season"
     node["poster_is_assigned"] = bool(poster_file)
     if poster_file:
-        node["poster_url"] = f"/api/v1/catalog/{node['id']}/images/poster"
+        node["poster_url"] = _artwork_url(node["id"], "poster", poster_file)
     elif single_item_poster:
         node["poster_url"] = single_item_poster
     elif inherited_poster:
-        node["poster_url"] = f"/api/v1/catalog/{inherited_poster[0]}/images/poster"
+        node["poster_url"] = _artwork_url(inherited_poster[0], "poster", inherited_poster[1])
     else:
         node["poster_url"] = None
     node["backdrop_url"] = (
-        f"/api/v1/catalog/{node['id']}/images/backdrop" if node.get("backdrop_file") else None
+        _artwork_url(node["id"], "backdrop", node.get("backdrop_file"))
+        if node.get("backdrop_file") else None
     )
     node.pop("metadata_candidates", None)
     node.pop("poster_file", None)
@@ -354,7 +370,10 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
         child_payload = {"id": child["id"], "kind": child["kind"],
              "title": child["metadata_title"] or child["title"],
              "season_number": child["season_number"],
-             "poster_url": (f"/api/v1/catalog/{poster_node_id}/images/poster" if available else None),
+             "poster_url": (_artwork_url(poster_node_id, "poster",
+                                          child["poster_file"] or (inherited[1] if inherited else None),
+                                          fallback_version=f"season-{child['season_number']}")
+                            if available else None),
              "poster_available": available,
              "poster_is_assigned": bool(child["poster_file"])}
         if child["kind"] == "collection":
@@ -678,6 +697,30 @@ def get_item(item_id: str) -> LibraryItem:
         if row is None:
             raise HTTPException(status_code=404, detail="Item not found")
         return item_from_row(row, connection)
+
+
+@app.get("/api/v1/catalog/version")
+def get_catalog_version() -> dict[str, str]:
+    with closing(database()) as connection:
+        nodes = connection.execute(
+            """SELECT id, library, kind, relative_path, parent_id, title, season_number,
+                      source_year, metadata_title, original_title, overview, year, genres,
+                      cast_json, cast_version, tmdb_id, imdb_id, poster_file, backdrop_file,
+                      metadata_status, metadata_source, metadata_checked_at,
+                      episode_metadata_checked_at, scanned_at, added_at
+               FROM catalog_nodes WHERE available=1 ORDER BY id"""
+        ).fetchall()
+        files = connection.execute(
+            """SELECT id, library, title, relative_path, extension, size_bytes,
+                      modified_at, scanned_at, node_id, series_node_id, season_number,
+                      episode_number, episode_title
+               FROM library_items WHERE available=1 ORDER BY id"""
+        ).fetchall()
+    state = json.dumps(
+        [[tuple(row) for row in nodes], [tuple(row) for row in files]],
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    return {"version": hashlib.sha256(state.encode("utf-8")).hexdigest()}
 
 
 @app.get("/api/v1/catalog")
