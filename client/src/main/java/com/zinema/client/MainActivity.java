@@ -73,12 +73,15 @@ public class MainActivity extends Activity {
     TextView settingsButton;
     HorizontalScrollView navScroll;
     String server;
+    String serverName;
     String currentLibrary = "movies";
     String selectedSection = "home";
     String lastSearchQuery;
     String detailNodeId = "";
     boolean libraryMode;
     boolean showingDetail;
+    boolean showingAdmin;
+    String adminReturnDetailId = "";
     boolean metadataEditorFromDetail;
     boolean metadataEditorMode;
     boolean metadataEditorPreviousBackVisible;
@@ -94,6 +97,7 @@ public class MainActivity extends Activity {
         getWindow().setNavigationBarColor(BG);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         server = trimBase(prefs.getString("server", DEFAULT_SERVER));
+        serverName = prefs.getString("server_name", "Zinema NAS");
         buildShell("Inicio");
         loadHome();
     }
@@ -123,9 +127,9 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(d(36), d(42));
         backParams.rightMargin = d(8);
         bar.addView(backButton, backParams);
-        brandButton = label("ZINEMA", 22, Color.WHITE, true);
+        brandButton = label(showingAdmin ? serverName : "ZINEMA", 22, Color.WHITE, true);
         brandButton.setLetterSpacing(0.12f);
-        brandButton.setOnClickListener(v -> loadHome());
+        brandButton.setOnClickListener(v -> { showingAdmin = false; loadHome(); });
         bar.addView(brandButton, new LinearLayout.LayoutParams(0, -2, 1));
         searchButton = navAction("⌕", "Buscar", v -> showSearch());
         bar.addView(searchButton);
@@ -133,6 +137,10 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(-2, -2);
         sp.leftMargin = d(20);
         bar.addView(settingsButton, sp);
+        if (showingAdmin) {
+            searchButton.setVisibility(View.GONE);
+            settingsButton.setVisibility(View.GONE);
+        }
         page.addView(bar, new LinearLayout.LayoutParams(-1, d(58)));
 
         navScroll = new HorizontalScrollView(this);
@@ -144,6 +152,7 @@ public class MainActivity extends Activity {
         nav.addView(navChip("Series", () -> openLibrary("series"), selectedSection.equals("series")));
         navScroll.addView(nav);
         page.addView(navScroll, new LinearLayout.LayoutParams(-1, d(48)));
+        if (showingAdmin) navScroll.setVisibility(View.GONE);
 
         contentScroller = new ScrollView(this);
         contentScroller.setFillViewport(true);
@@ -160,7 +169,7 @@ public class MainActivity extends Activity {
 
     TextView label(String text, int size, int color, boolean bold) {
         TextView view = new TextView(this);
-        view.setText(text);
+        view.setText(t(text));
         view.setTextSize(size);
         view.setTextColor(color);
         if (bold) view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
@@ -169,7 +178,7 @@ public class MainActivity extends Activity {
 
     TextView navAction(String glyph, String hint, View.OnClickListener onClick) {
         TextView view = label(glyph, 23, Color.WHITE, true);
-        view.setContentDescription(hint);
+        view.setContentDescription(t(hint));
         view.setGravity(Gravity.CENTER);
         view.setMinWidth(d(40));
         view.setFocusable(true);
@@ -750,9 +759,15 @@ public class MainActivity extends Activity {
         actions.add("Metadata manual");
         handlers.add(() -> showMetadataEditor(node, new JSONArray()));
         new AlertDialog.Builder(this)
-                .setTitle("Acciones")
-                .setItems(actions.toArray(new String[0]), (dialog, which) -> handlers.get(which).run())
+                .setTitle(t("Acciones"))
+                .setItems(localizedOptions(actions), (dialog, which) -> handlers.get(which).run())
                 .show();
+    }
+
+    String[] localizedOptions(List<String> options) {
+        String[] result = new String[options.size()];
+        for (int i = 0; i < options.size(); i++) result[i] = t(options.get(i));
+        return result;
     }
 
     String collectionMosaicKey(JSONObject node) {
@@ -849,8 +864,8 @@ public class MainActivity extends Activity {
         handlers.add(() -> setMediaWatched(media, owner, true));
         actions.add("Marcar como no visto");
         handlers.add(() -> setMediaWatched(media, owner, false));
-        new AlertDialog.Builder(this).setTitle("Acciones")
-                .setItems(actions.toArray(new String[0]), (dialog, which) -> handlers.get(which).run())
+        new AlertDialog.Builder(this).setTitle(t("Acciones"))
+                .setItems(localizedOptions(actions), (dialog, which) -> handlers.get(which).run())
                 .show();
     }
 
@@ -922,8 +937,8 @@ public class MainActivity extends Activity {
 
     void showResumeActions(JSONObject item) {
         String[] actions = {"Marcar como visto", "Marcar como no visto", "Quitar de Seguir viendo"};
-        new AlertDialog.Builder(this).setTitle("Acciones")
-                .setItems(actions, (dialog, which) -> {
+        new AlertDialog.Builder(this).setTitle(t("Acciones"))
+                .setItems(localizedOptions(java.util.Arrays.asList(actions)), (dialog, which) -> {
                     if (which == 0) setResumeSeen(item, true);
                     else if (which == 1) setResumeSeen(item, false);
                     else prefs.edit().remove("watch:" + item.optString("path", item.optString("stream"))).apply();
@@ -1041,7 +1056,7 @@ public class MainActivity extends Activity {
         ArrayList<String> selectedGenres = new ArrayList<>();
         addGenreValues(genreOptions, node.optJSONArray("genres"));
         addGenreValues(selectedGenres, node.optJSONArray("genres"));
-        Button genres = actionButton("Seleccionar géneros (" + selectedGenres.size() + ")", false);
+        Button genres = actionButton(genrePickerText(selectedGenres.size()), false);
         genres.setOnClickListener(v -> showGenrePicker(genres, genreOptions, selectedGenres));
         form.addView(title, fieldMargins());
         form.addView(year, fieldMargins());
@@ -1144,42 +1159,48 @@ public class MainActivity extends Activity {
 
     void showGenrePicker(Button button, List<String> options, List<String> selected) {
         String[] labels = options.toArray(new String[0]);
+        String[] displayLabels = new String[labels.length];
         boolean[] checked = new boolean[labels.length];
         for (int i = 0; i < labels.length; i++) {
+            displayLabels[i] = genreLabel(labels[i]);
             for (String genre : selected) {
                 if (genre.equalsIgnoreCase(labels[i])) { checked[i] = true; break; }
             }
         }
         new AlertDialog.Builder(this)
-                .setTitle("Selecciona los géneros")
-                .setMultiChoiceItems(labels, checked, (dialog, which, isChecked) -> {
+                .setTitle(t("Selecciona los géneros"))
+                .setMultiChoiceItems(displayLabels, checked, (dialog, which, isChecked) -> {
                     String genre = labels[which];
                     selected.removeIf(item -> item.equalsIgnoreCase(genre));
                     if (isChecked) selected.add(genre);
-                    button.setText("Seleccionar géneros (" + selected.size() + ")");
+                    button.setText(genrePickerText(selected.size()));
                 })
-                .setPositiveButton("Listo", (dialog, which) ->
-                        button.setText("Seleccionar géneros (" + selected.size() + ")"))
-                .setNegativeButton("Cancelar", null)
-                .setNeutralButton("Añadir nuevo", (dialog, which) ->
+                .setPositiveButton(t("Listo"), (dialog, which) ->
+                        button.setText(genrePickerText(selected.size())))
+                .setNegativeButton(t("Cancelar"), null)
+                .setNeutralButton(t("Añadir nuevo"), (dialog, which) ->
                         promptNewGenre(button, options, selected))
                 .show();
+    }
+
+    String genrePickerText(int count) {
+        return t("Seleccionar géneros") + " (" + count + ")";
     }
 
     void promptNewGenre(Button button, List<String> options, List<String> selected) {
         EditText input = metadataField("", "Nombre del género", false);
         new AlertDialog.Builder(this)
-                .setTitle("Añadir género")
+                .setTitle(t("Añadir género"))
                 .setView(input)
-                .setNegativeButton("Cancelar", null)
-                .setPositiveButton("Añadir", (dialog, which) -> {
+                .setNegativeButton(t("Cancelar"), null)
+                .setPositiveButton(t("Añadir"), (dialog, which) -> {
                     String value = input.getText().toString().trim();
                     if (value.isEmpty()) return;
                     JSONArray added = new JSONArray();
                     added.put(value);
                     addGenreValues(options, added);
                     addGenreValues(selected, added);
-                    button.setText("Seleccionar géneros (" + selected.size() + ")");
+                    button.setText(genrePickerText(selected.size()));
                     button.post(() -> showGenrePicker(button, options, selected));
                 })
                 .show();
@@ -1477,9 +1498,121 @@ public class MainActivity extends Activity {
         StringBuilder result = new StringBuilder();
         for (int i = 0; i < values.length(); i++) {
             if (i > 0) result.append(" · ");
-            result.append(values.optString(i));
+            result.append(genreLabel(values.optString(i)));
         }
         return result.toString();
+    }
+
+    String genreLabel(String genre) {
+        if (prefs == null || !"eu".equals(prefs.getString("language", "es"))) return genre;
+        switch (genre) {
+            case "Acción": return "Ekintza";
+            case "Aventura": return "Abentura";
+            case "Animación": return "Animazioa";
+            case "Comedia": return "Komedia";
+            case "Crimen": return "Krimena";
+            case "Documental": return "Dokumentala";
+            case "Drama": return "Drama";
+            case "Familia": return "Familia";
+            case "Fantasía": return "Fantasia";
+            case "Historia": return "Historia";
+            case "Terror": return "Beldurrezkoa";
+            case "Música": return "Musika";
+            case "Misterio": return "Misterioa";
+            case "Romance": return "Erromantzea";
+            case "Ciencia ficción": return "Zientzia-fikzioa";
+            case "Suspense": return "Suspense";
+            case "Bélica": return "Gerra";
+            case "Reality": return "Reality";
+            case "Kids": return "Haurrak";
+            case "Soap": return "Telenobela";
+            case "Talk": return "Eztabaida";
+            case "News": return "Albisteak";
+            case "War & Politics": return "Gerra eta politika";
+            case "Sci-Fi & Fantasy": return "Zientzia-fikzioa eta fantasia";
+            case "Action & Adventure": return "Ekintza eta abentura";
+            case "TV Movie": return "Telebistarako filma";
+            default: return genre;
+        }
+    }
+
+    String t(String text) {
+        if (text == null || prefs == null || !"eu".equals(prefs.getString("language", "es"))) return text;
+        switch (text) {
+            case "Inicio": return "Hasiera";
+            case "Atrás": return "Atzera";
+            case "Buscar": return "Bilatu";
+            case "Servidor": return "Zerbitzaria";
+            case "Películas": return "Filmak";
+            case "Series": return "Telesailak";
+            case "Seguir viendo": return "Ikusten jarraitu";
+            case "Mi lista": return "Nire zerrenda";
+            case "Colección": return "Bilduma";
+            case "Temporada": return "Denboraldia";
+            case "Temporadas": return "Denboraldiak";
+            case "Explorar": return "Arakatu";
+            case "Acciones": return "Ekintzak";
+            case "Marcar como visto": return "Ikusitzat markatu";
+            case "Marcar como no visto": return "Ikusi gabe markatu";
+            case "Reintentar metadata (TMDb)": return "Metadatuak berriro bilatu (TMDb)";
+            case "Usar póster manual": return "Eskuzko posterra erabili";
+            case "Usar mosaico de pósters": return "Posterren mosaikoa erabili";
+            case "Metadata manual": return "Eskuzko metadatuak";
+            case "Quitar de Seguir viendo": return "Ikusten jarraitutik kendu";
+            case "Título": return "Izenburua";
+            case "Título…": return "Izenburua…";
+            case "Año": return "Urtea";
+            case "Sinopsis": return "Laburpena";
+            case "Seleccionar géneros": return "Generoak hautatu";
+            case "Buscar imágenes": return "Irudiak bilatu";
+            case "Guardar metadata": return "Metadatuak gorde";
+            case "Cancelar": return "Utzi";
+            case "Listo": return "Eginda";
+            case "Añadir": return "Gehitu";
+            case "Añadir nuevo": return "Berria gehitu";
+            case "Añadir género": return "Generoa gehitu";
+            case "Nombre del género": return "Generoaren izena";
+            case "Selecciona los géneros": return "Hautatu generoak";
+            case "Reproducir": return "Erreproduzitu";
+            case "Ver episodios": return "Atalak ikusi";
+            case "Reparto": return "Antzezleak";
+            case "Reparto principal": return "Antzezle nagusiak";
+            case "Episodios": return "Atalak";
+            case "Detalles del archivo": return "Fitxategiaren xehetasunak";
+            case "Selecciona un archivo": return "Hautatu fitxategi bat";
+            case "Cerrar": return "Itxi";
+            case "Selecciona para continuar": return "Hautatu jarraitzeko";
+            case "No se encontraron episodios.": return "Ez da atalik aurkitu.";
+            case "Sin género disponible": return "Generorik ez dago";
+            case "Encuentra películas, series y episodios": return "Bilatu filmak, telesailak eta atalak";
+            case "Resultados": return "Emaitzak";
+            case "Buscando…": return "Bilatzen…";
+            case "No se pudo conectar": return "Ezin izan da konektatu";
+            case "Comprueba que el servidor esté encendido.": return "Egiaztatu zerbitzaria piztuta dagoela.";
+            case "Reintentar": return "Berriro saiatu";
+            case "Configurar servidor": return "Zerbitzaria konfiguratu";
+            case "Administración": return "Administrazioa";
+            case "Configuración del servidor": return "Zerbitzariaren ezarpenak";
+            case "Nombre del servidor": return "Zerbitzariaren izena";
+            case "Dirección del servidor": return "Zerbitzariaren helbidea";
+            case "Idioma de la aplicación": return "Aplikazioaren hizkuntza";
+            case "Probar conexión": return "Konexioa probatu";
+            case "Guardar y conectar": return "Gorde eta konektatu";
+            case "Dirección pública o local de tu servidor Zinema.": return "Zure Zinema zerbitzariaren helbide publikoa edo lokala.";
+            case "Español": return "Español";
+            case "Euskara": return "Euskara";
+            case "Conectando…": return "Konektatzen…";
+            case "Conexión correcta": return "Konexioa ondo dago";
+            case "No se pudo conectar con esa dirección.": return "Ezin izan da helbide horretara konektatu.";
+            case "Escribe una URL válida.": return "Idatzi baliozko URL bat.";
+            case "El nombre del servidor no puede estar vacío.": return "Zerbitzariaren izena ezin da hutsik egon.";
+            case "Marcado como visto": return "Ikusitzat markatuta";
+            case "Marcado como no visto": return "Ikusi gabe markatuta";
+            case "No hay un vídeo disponible.": return "Ez dago bideorik.";
+            case "No se encontraron coincidencias. Puedes completar los campos manualmente.":
+                return "Ez da bat-etortzerik aurkitu. Eremuak eskuz bete ditzakezu.";
+            default: return text;
+        }
     }
 
     void addCastSection(JSONArray cast) {
@@ -1546,7 +1679,7 @@ public class MainActivity extends Activity {
             names[i] = file == null ? "Vídeo " + (i + 1)
                     : file.optString("filename", file.optString("title", "Vídeo " + (i + 1)));
         }
-        new AlertDialog.Builder(this).setTitle("Selecciona un archivo")
+        new AlertDialog.Builder(this).setTitle(t("Selecciona un archivo"))
                 .setItems(names, (dialog, which) ->
                         showVideoFileDetails(files.optJSONObject(which), node.optString("library", "")))
                 .show();
@@ -1566,8 +1699,8 @@ public class MainActivity extends Activity {
                 .append("\nRuta: ").append(file.optString("relative_path", "—"))
                 .append("\nBiblioteca: ").append(library.isEmpty() ? "—" : library);
         if (!modified.isEmpty()) message.append("\nModificado: ").append(modified);
-        new AlertDialog.Builder(this).setTitle("Detalles del archivo")
-                .setMessage(message.toString()).setPositiveButton("Cerrar", null).show();
+        new AlertDialog.Builder(this).setTitle(t("Detalles del archivo"))
+                .setMessage(message.toString()).setPositiveButton(t("Cerrar"), null).show();
     }
 
     String formatDetailedSize(long bytes) {
@@ -1638,7 +1771,7 @@ public class MainActivity extends Activity {
 
     Button actionButton(String title, boolean primary) {
         Button button = new Button(this);
-        button.setText(title);
+        button.setText(t(title));
         button.setTextSize(13);
         button.setTextColor(Color.WHITE);
         button.setAllCaps(false);
@@ -1761,34 +1894,159 @@ public class MainActivity extends Activity {
     }
 
     void showSettings() {
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(d(22), d(8), d(22), 0);
-        TextView explanation = label("Dirección pública o local de tu servidor Zinema.", 14, MUTED, false);
-        box.addView(explanation);
+        if (!showingAdmin) adminReturnDetailId = showingDetail ? detailNodeId : "";
+        showingAdmin = true;
+        showingDetail = false;
+        buildShell("Administración");
+        renderAdminWindow(serverName, server);
+    }
+
+    EditText settingsField(String value, String hint, boolean uri) {
         EditText input = new EditText(this);
         input.setSingleLine(true);
-        input.setInputType( android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI);
-        input.setText(server);
+        input.setTextColor(Color.WHITE);
+        input.setHintTextColor(MUTED);
+        input.setHint(t(hint));
+        if (uri) input.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_VARIATION_URI);
+        input.setText(value);
         input.setSelectAllOnFocus(true);
-        box.addView(input);
-        TextView attribution = label(
-                "This product uses the TMDB API but is not endorsed or certified by TMDB.",
+        input.setPadding(d(14), 0, d(14), 0);
+        input.setBackground(round(0xFF17191F, d(9)));
+        return input;
+    }
+
+    void renderAdminWindow(String initialName, String initialServer) {
+        content.removeAllViews();
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setPadding(d(20), d(14), d(20), d(24));
+        TextView heading = label("Administración", 27, Color.WHITE, true);
+        screen.addView(heading);
+        TextView intro = label("Configuración del servidor", 14, MUTED, false);
+        LinearLayout.LayoutParams introP = new LinearLayout.LayoutParams(-1, -2);
+        introP.topMargin = d(5);
+        introP.bottomMargin = d(20);
+        screen.addView(intro, introP);
+
+        LinearLayout serverCard = settingsCard();
+        serverCard.addView(label("Nombre del servidor", 13, MUTED, true));
+        EditText nameInput = settingsField(initialName, "Zinema NAS", false);
+        addSettingInput(serverCard, nameInput);
+        TextView urlLabel = label("Dirección del servidor", 13, MUTED, true);
+        LinearLayout.LayoutParams urlP = new LinearLayout.LayoutParams(-1, -2);
+        urlP.topMargin = d(16);
+        serverCard.addView(urlLabel, urlP);
+        EditText urlInput = settingsField(initialServer, "https://servidor", true);
+        addSettingInput(serverCard, urlInput);
+        LinearLayout connectButtons = new LinearLayout(this);
+        connectButtons.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams buttonsP = new LinearLayout.LayoutParams(-1, -2);
+        buttonsP.topMargin = d(16);
+        serverCard.addView(connectButtons, buttonsP);
+        Button check = actionButton("Probar conexión", false);
+        connectButtons.addView(check, new LinearLayout.LayoutParams(0, d(48), 1));
+        Button save = actionButton("Guardar y conectar", true);
+        LinearLayout.LayoutParams saveP = new LinearLayout.LayoutParams(0, d(48), 1);
+        saveP.leftMargin = d(9);
+        connectButtons.addView(save, saveP);
+        TextView status = label("Servidor actual: " + serverName, 12, MUTED, false);
+        LinearLayout.LayoutParams statusP = new LinearLayout.LayoutParams(-1, -2);
+        statusP.topMargin = d(12);
+        serverCard.addView(status, statusP);
+        screen.addView(serverCard);
+
+        LinearLayout languageCard = settingsCard();
+        LinearLayout.LayoutParams languageP = new LinearLayout.LayoutParams(-1, -2);
+        languageP.topMargin = d(14);
+        screen.addView(languageCard, languageP);
+        languageCard.addView(label("Idioma de la aplicación", 14, Color.WHITE, true));
+        LinearLayout languageButtons = new LinearLayout(this);
+        LinearLayout.LayoutParams langButtonsP = new LinearLayout.LayoutParams(-1, -2);
+        langButtonsP.topMargin = d(12);
+        languageCard.addView(languageButtons, langButtonsP);
+        String activeLanguage = prefs.getString("language", "es");
+        Button spanish = actionButton("Español", "es".equals(activeLanguage));
+        languageButtons.addView(spanish, new LinearLayout.LayoutParams(0, d(46), 1));
+        Button basque = actionButton("Euskara", "eu".equals(activeLanguage));
+        LinearLayout.LayoutParams basqueP = new LinearLayout.LayoutParams(0, d(46), 1);
+        basqueP.leftMargin = d(9);
+        languageButtons.addView(basque, basqueP);
+        spanish.setOnClickListener(v -> changeLanguage("es", nameInput, urlInput));
+        basque.setOnClickListener(v -> changeLanguage("eu", nameInput, urlInput));
+
+        TextView attribution = label("This product uses the TMDB API but is not endorsed or certified by TMDB.",
                 11, MUTED, false);
-        attribution.setPadding(0, d(12), 0, d(4));
-        box.addView(attribution);
-        new AlertDialog.Builder(this).setTitle("Conectar con el servidor").setView(box)
-                .setNegativeButton("Cancelar", null)
-                .setPositiveButton("Guardar y conectar", (dialog, which) -> {
-                    String value = trimBase(input.getText().toString());
-                    if (!value.startsWith("http://") && !value.startsWith("https://")) value = "https://" + value;
-                    if (value.length() < 10) { Toast.makeText(this, "Escribe una URL válida.", Toast.LENGTH_LONG).show(); return; }
-                    server = value;
-                    prefs.edit().putString("server", server).apply();
-                    imageCache.evictAll();
-                    requestedImages.clear();
-                    loadHome();
-                }).show();
+        attribution.setPadding(d(2), d(16), d(2), 0);
+        screen.addView(attribution);
+        content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
+
+        check.setOnClickListener(v -> {
+            String candidate = normalizeServerUrl(urlInput.getText().toString());
+            if (candidate.isEmpty()) {
+                Toast.makeText(this, t("Escribe una URL válida."), Toast.LENGTH_LONG).show();
+                return;
+            }
+            status.setText(t("Conectando…"));
+            io.execute(() -> {
+                boolean ok = false;
+                HttpURLConnection connection = null;
+                try {
+                    connection = (HttpURLConnection) new URL(candidate + "/health").openConnection();
+                    connection.setRequestMethod("GET");
+                    connection.setConnectTimeout(7000);
+                    connection.setReadTimeout(7000);
+                    ok = connection.getResponseCode() >= 200 && connection.getResponseCode() < 300;
+                } catch (Exception ignored) { }
+                finally { if (connection != null) connection.disconnect(); }
+                final boolean connected = ok;
+                runOnUiThread(() -> {
+                    status.setText(connected ? t("Conexión correcta") : t("No se pudo conectar con esa dirección."));
+                    Toast.makeText(this, connected ? t("Conexión correcta") : t("No se pudo conectar con esa dirección."),
+                            Toast.LENGTH_LONG).show();
+                });
+            });
+        });
+        save.setOnClickListener(v -> {
+            String value = normalizeServerUrl(urlInput.getText().toString());
+            String name = nameInput.getText().toString().trim();
+            if (value.isEmpty()) { Toast.makeText(this, t("Escribe una URL válida."), Toast.LENGTH_LONG).show(); return; }
+            if (name.isEmpty()) { Toast.makeText(this, t("El nombre del servidor no puede estar vacío."), Toast.LENGTH_LONG).show(); return; }
+            server = value;
+            serverName = name;
+            prefs.edit().putString("server", server).putString("server_name", serverName).apply();
+            imageCache.evictAll();
+            requestedImages.clear();
+            showingAdmin = false;
+            loadHome();
+        });
+    }
+
+    LinearLayout settingsCard() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(d(16), d(16), d(16), d(16));
+        card.setBackground(round(PANEL, d(13)));
+        return card;
+    }
+
+    void addSettingInput(LinearLayout parent, EditText input) {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, d(48));
+        p.topMargin = d(7);
+        parent.addView(input, p);
+    }
+
+    String normalizeServerUrl(String input) {
+        String value = trimBase(input);
+        if (!value.startsWith("http://") && !value.startsWith("https://")) value = "https://" + value;
+        return value.length() >= 10 ? value : "";
+    }
+
+    void changeLanguage(String language, EditText nameInput, EditText urlInput) {
+        String name = nameInput.getText().toString();
+        String address = urlInput.getText().toString();
+        prefs.edit().putString("language", language).apply();
+        renderAdminWindow(name, address);
     }
 
     void renderError(String error) {
@@ -1972,6 +2230,32 @@ public class MainActivity extends Activity {
     }
 
     @Override public void onBackPressed() {
+        if (showingAdmin) {
+            showingAdmin = false;
+            String returnDetailId = adminReturnDetailId;
+            adminReturnDetailId = "";
+            if (!returnDetailId.isEmpty()) {
+                buildShell("Inicio");
+                io.execute(() -> {
+                    try {
+                        JSONObject node = getJson("/api/v1/catalog/" + enc(returnDetailId));
+                        runOnUiThread(() -> renderDetail(node));
+                    } catch (Exception e) { runOnUiThread(this::loadHome); }
+                });
+            } else if (!breadcrumbs.isEmpty()) {
+                JSONObject parent = breadcrumbs.get(breadcrumbs.size() - 1);
+                buildShell("Inicio");
+                showCollectionContents(parent);
+            } else if (libraryMode) {
+                openLibrary(currentLibrary);
+            } else if (lastSearchQuery != null) {
+                buildShell("Inicio");
+                performSearch(lastSearchQuery);
+            } else {
+                loadHome();
+            }
+            return;
+        }
         if (metadataEditorMode) {
             setMetadataEditorChrome(false);
         }
