@@ -18,7 +18,7 @@ Series/
         episodio S00E01.mkv
 ```
 
-Los directorios anteriores a la carpeta de película o serie aparecen como colecciones. La API devuelve hasta cuatro carátulas descendientes en `mosaic_images` para que el cliente dibuje el mosaico. Las temporadas tienen una imagen de póster generada con su número. Los episodios se enlazan a la serie y temporada cuando están en una carpeta `Season NN`; los patrones `SxxEyy` y `xxXyy` se usan para identificar el número del episodio.
+Los directorios anteriores a la carpeta de película o serie aparecen como colecciones. La API devuelve el número de títulos descendientes en `item_count` y hasta cuatro carátulas de películas o series en `mosaic_images` para que el cliente dibuje el mosaico cuando la colección no tenga póster propio. Las temporadas tienen una imagen de póster generada con su número. Los episodios se enlazan a la serie y temporada cuando están en una carpeta `Season NN`; los patrones `SxxEyy` y `xxXyy` se usan para identificar el número del episodio.
 
 ## Configurar y arrancar
 

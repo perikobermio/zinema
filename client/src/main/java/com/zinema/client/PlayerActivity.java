@@ -18,6 +18,7 @@ public class PlayerActivity extends Activity {
     private Handler handler;
     private String path;
     private String title;
+    private String posterUrl;
     private boolean prepared;
     private final Runnable progressTick = new Runnable() {
         @Override public void run() {
@@ -36,6 +37,7 @@ public class PlayerActivity extends Activity {
         String url = getIntent().getStringExtra("url");
         path = getIntent().getStringExtra("path");
         title = getIntent().getStringExtra("title");
+        posterUrl = getIntent().getStringExtra("poster_url");
         int resumeAt = getIntent().getIntExtra("position", 0);
         video = new VideoView(this);
         video.setBackgroundColor(0xFF000000);
@@ -72,6 +74,7 @@ public class PlayerActivity extends Activity {
             item.put("title", title);
             item.put("path", path);
             item.put("stream", path);
+            item.put("poster_url", posterUrl == null ? "" : posterUrl);
             item.put("position", position);
             item.put("updated", System.currentTimeMillis());
             getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()

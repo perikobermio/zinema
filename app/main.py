@@ -246,6 +246,7 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     if not poster_file and node["kind"] != "season":
         inherited_poster = _inherited_collection_value(connection, node.get("parent_id"), "poster_file")
     node["poster_available"] = bool(poster_file or inherited_poster) or node["kind"] == "season"
+    node["poster_is_assigned"] = bool(poster_file)
     poster_node_id = node["id"] if poster_file else (inherited_poster[0] if inherited_poster else node["id"])
     node["poster_url"] = (
         f"/api/v1/catalog/{poster_node_id}/images/poster" if node["poster_available"] else None
@@ -294,7 +295,8 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
              "title": child["metadata_title"] or child["title"],
              "season_number": child["season_number"],
              "poster_url": (f"/api/v1/catalog/{poster_node_id}/images/poster" if available else None),
-             "poster_available": available}
+             "poster_available": available,
+             "poster_is_assigned": bool(child["poster_file"])}
         )
     file_rows = connection.execute(
         """SELECT id, COALESCE(episode_title, title) AS title, title AS filename,
@@ -305,11 +307,24 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
         (node["id"],),
     ).fetchall()
     node["files"] = [
-        {**dict(media), "stream_url": f"/api/v1/items/{media['id']}/stream"}
+        {**dict(media), "stream_url": f"/api/v1/items/{media['id']}/stream",
+         "poster_url": node["poster_url"]}
         for media in file_rows
     ]
     node["mosaic_images"] = []
     if node["kind"] == "collection":
+        count_row = connection.execute(
+            """WITH RECURSIVE descendants(id, kind) AS (
+                   SELECT id, kind FROM catalog_nodes WHERE parent_id=? AND available=1
+                   UNION ALL
+                   SELECT child.id, child.kind FROM catalog_nodes child
+                   JOIN descendants parent ON child.parent_id=parent.id
+                   WHERE child.available=1
+               )
+               SELECT COUNT(*) AS total FROM descendants WHERE kind IN ('movie', 'series')""",
+            (node["id"],),
+        ).fetchone()
+        node["item_count"] = int(count_row["total"] or 0)
         artwork_rows = connection.execute(
             """WITH RECURSIVE descendants(id) AS (
                    SELECT id FROM catalog_nodes WHERE parent_id=? AND available=1
@@ -320,6 +335,7 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
                )
                SELECT id FROM catalog_nodes
                WHERE id IN (SELECT id FROM descendants) AND poster_file IS NOT NULL
+                 AND kind IN ('movie', 'series')
                ORDER BY kind, title COLLATE NOCASE LIMIT 4""",
             (node["id"],),
         ).fetchall()

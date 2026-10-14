@@ -43,6 +43,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -78,6 +79,8 @@ public class MainActivity extends Activity {
     boolean metadataEditorPreviousBackVisible;
     List<JSONObject> movies = new ArrayList<>();
     List<JSONObject> series = new ArrayList<>();
+    List<JSONObject> recommendations = new ArrayList<>();
+    final Map<String, String> posterByStream = new HashMap<>();
     final List<JSONObject> breadcrumbs = new ArrayList<>();
 
     @Override public void onCreate(Bundle state) {
@@ -135,7 +138,7 @@ public class MainActivity extends Activity {
         nav.addView(navChip("Películas", () -> openLibrary("movies"), selectedSection.equals("movies")));
         nav.addView(navChip("Series", () -> openLibrary("series"), selectedSection.equals("series")));
         navScroll.addView(nav);
-        page.addView(navScroll, new LinearLayout.LayoutParams(-1, d(42)));
+        page.addView(navScroll, new LinearLayout.LayoutParams(-1, d(48)));
 
         ScrollView scroller = new ScrollView(this);
         scroller.setFillViewport(true);
@@ -169,14 +172,22 @@ public class MainActivity extends Activity {
     }
 
     View navChip(String title, Runnable action, boolean active) {
-        TextView chip = label(title, 14, active ? Color.WHITE : MUTED, active);
-        chip.setGravity(Gravity.CENTER);
-        chip.setPadding(d(14), 0, d(14), 0);
-        if (active) chip.setBackground(round(0xFF42151B, d(18)));
-        chip.setFocusable(true);
-        chip.setClickable(true);
-        chip.setOnClickListener(v -> action.run());
-        return chip;
+        LinearLayout tab = new LinearLayout(this);
+        tab.setOrientation(LinearLayout.VERTICAL);
+        tab.setGravity(Gravity.CENTER);
+        tab.setPadding(d(14), d(2), d(14), d(2));
+        TextView text = label(title, 14, active ? Color.WHITE : MUTED, active);
+        text.setGravity(Gravity.CENTER);
+        tab.addView(text, new LinearLayout.LayoutParams(-2, -2));
+        View indicator = new View(this);
+        indicator.setBackground(round(active ? RED : Color.TRANSPARENT, d(2)));
+        LinearLayout.LayoutParams indicatorParams = new LinearLayout.LayoutParams(d(24), d(3));
+        indicatorParams.topMargin = d(3);
+        tab.addView(indicator, indicatorParams);
+        tab.setFocusable(true);
+        tab.setClickable(true);
+        tab.setOnClickListener(v -> action.run());
+        return tab;
     }
 
     void showLoading(String message) {
@@ -244,11 +255,14 @@ public class MainActivity extends Activity {
             try {
                 JSONArray m = getArray("/api/v1/catalog?library=movies");
                 JSONArray s = getArray("/api/v1/catalog?library=series");
+                JSONArray allItems = getArray("/api/v1/items?limit=500");
                 List<JSONObject> movieList = toList(m);
                 List<JSONObject> seriesList = toList(s);
+                List<JSONObject> suggested = buildRecommendations(allItems);
                 runOnUiThread(() -> {
                     movies = movieList;
                     series = seriesList;
+                    recommendations = suggested;
                     renderHome();
                 });
             } catch (Exception e) {
@@ -268,12 +282,11 @@ public class MainActivity extends Activity {
 
     void renderHome() {
         content.removeAllViews();
-        JSONObject hero = firstPlayableOrPoster(movies, series);
-        if (hero != null) addHero(hero);
-        List<JSONObject> favorites = readFavorites();
-        if (!favorites.isEmpty()) addRow("Mi lista", favorites);
         List<JSONObject> resume = readContinueWatching();
         if (!resume.isEmpty()) addResumeRow("Seguir viendo", resume);
+        if (!recommendations.isEmpty()) addHeroCarousel();
+        List<JSONObject> favorites = readFavorites();
+        if (!favorites.isEmpty()) addRow("Mi lista", favorites);
         addRow("Películas", movies);
         addRow("Series", series);
         if (movies.isEmpty() && series.isEmpty()) {
@@ -283,6 +296,46 @@ public class MainActivity extends Activity {
         }
     }
 
+    List<JSONObject> buildRecommendations(JSONArray items) {
+        List<JSONObject> result = new ArrayList<>();
+        java.util.HashSet<String> seen = new java.util.HashSet<>();
+        posterByStream.clear();
+        for (int i = 0; i < items.length() && result.size() < 5; i++) {
+            JSONObject item = items.optJSONObject(i);
+            if (item == null) continue;
+            String stream = item.optString("stream_url", "");
+            String poster = item.optString("poster_url", "");
+            if (!stream.isEmpty() && !poster.isEmpty()) posterByStream.put(stream, poster);
+            String seriesId = item.optString("series_id", "");
+            boolean isSeries = !seriesId.isEmpty() && !seriesId.equals("null");
+            String nodeId = isSeries ? seriesId : item.optString("node_id", "");
+            if (nodeId.isEmpty() || nodeId.equals("null") || !seen.add(nodeId)) continue;
+            JSONObject suggestion = new JSONObject();
+            try {
+                suggestion.put("id", nodeId);
+                suggestion.put("kind", isSeries ? "series" : "movie");
+                suggestion.put("library", item.optString("library", isSeries ? "series" : "movies"));
+                suggestion.put("display_title", item.optString("metadata_title", item.optString("title", "")));
+                suggestion.put("overview", item.optString("overview", ""));
+                suggestion.put("year", item.opt("year"));
+                suggestion.put("genres", item.optJSONArray("genres") == null ? new JSONArray() : item.optJSONArray("genres"));
+                suggestion.put("poster_url", item.optString("poster_url", ""));
+                result.add(suggestion);
+            } catch (JSONException ignored) { }
+        }
+        if (result.isEmpty()) {
+            for (JSONObject node : movies) {
+                if (result.size() == 5) break;
+                if (node.optString("kind").equals("movie")) result.add(node);
+            }
+            for (JSONObject node : series) {
+                if (result.size() == 5) break;
+                if (node.optString("kind").equals("series")) result.add(node);
+            }
+        }
+        return result;
+    }
+
     JSONObject firstPlayableOrPoster(List<JSONObject> a, List<JSONObject> b) {
         for (JSONObject item : a) if (item.optString("backdrop_url", "").length() > 0) return item;
         for (JSONObject item : b) if (item.optString("backdrop_url", "").length() > 0) return item;
@@ -290,52 +343,95 @@ public class MainActivity extends Activity {
         return b.isEmpty() ? null : b.get(0);
     }
 
-    void addHero(JSONObject node) {
+    void addHeroCarousel() {
+        if (recommendations.isEmpty()) return;
         FrameLayout hero = new FrameLayout(this);
-        hero.setBackground(round(PANEL, 0));
+        hero.setBackground(round(PANEL, d(14)));
+        hero.setClipToOutline(true);
         ImageView image = new ImageView(this);
         image.setScaleType(ImageView.ScaleType.CENTER_CROP);
         hero.addView(image, new FrameLayout.LayoutParams(-1, -1));
-        loadImage(node.optString("backdrop_url", node.optString("poster_url", "")), image, true);
+        JSONObject[] activeNode = {recommendations.get(0)};
         View shade = new View(this);
         shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
-                new int[]{Color.rgb(9, 10, 13), 0x99090A0D, 0x22090A0D}));
+                new int[]{0xFF090A0D, 0xCC090A0D, 0x11090A0D}));
         hero.addView(shade, new FrameLayout.LayoutParams(-1, -1));
         LinearLayout info = new LinearLayout(this);
         info.setOrientation(LinearLayout.VERTICAL);
         info.setGravity(Gravity.BOTTOM);
-        info.setPadding(d(24), d(20), d(24), d(22));
-        TextView eyebrow = label("RECOMENDADO PARA TI", 11, Color.WHITE, true);
+        info.setPadding(d(64), d(20), d(64), d(22));
+        TextView eyebrow = label("RECOMENDADO PARA TI", 11, 0xFFFF777E, true);
         eyebrow.setLetterSpacing(0.12f);
         info.addView(eyebrow);
-        TextView title = label(displayTitle(node), 30, Color.WHITE, true);
+        TextView title = label(displayTitle(activeNode[0]), 29, Color.WHITE, true);
         title.setMaxLines(2);
         LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(-1, -2);
         tp.topMargin = d(6);
         info.addView(title, tp);
-        TextView desc = label(node.optString("overview", ""), 13, 0xFFE2E3E8, false);
+        TextView desc = label(activeNode[0].optString("overview", ""), 13, 0xFFE2E3E8, false);
         desc.setMaxLines(2);
         LinearLayout.LayoutParams dp = new LinearLayout.LayoutParams(-1, -2);
         dp.topMargin = d(6);
         info.addView(desc, dp);
-        Button button = actionButton("Ver ahora", true);
+        LinearLayout buttons = new LinearLayout(this);
+        buttons.setGravity(Gravity.CENTER_VERTICAL);
+        Button button = actionButton("Ver ficha", true);
         LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(-2, d(42));
-        bp.topMargin = d(14);
-        info.addView(button, bp);
-        button.setOnClickListener(v -> openNode(node));
+        bp.topMargin = d(12);
+        buttons.addView(button, bp);
+        TextView counter = label("1 / " + recommendations.size(), 12, Color.WHITE, true);
+        counter.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams counterParams = new LinearLayout.LayoutParams(-2, d(42));
+        counterParams.leftMargin = d(14);
+        counterParams.topMargin = d(12);
+        buttons.addView(counter, counterParams);
+        info.addView(buttons);
+        button.setOnClickListener(v -> openNode(activeNode[0]));
         hero.addView(info, new FrameLayout.LayoutParams(-1, -1));
-        TextView heroActions = label("⋮", 23, Color.WHITE, true);
-        heroActions.setGravity(Gravity.CENTER);
-        heroActions.setFocusable(true);
-        heroActions.setBackground(round(0xCC111318, d(18)));
-        heroActions.setElevation(d(5));
-        FrameLayout.LayoutParams heroActionParams = new FrameLayout.LayoutParams(d(42), d(42), Gravity.TOP | Gravity.RIGHT);
-        heroActionParams.setMargins(0, d(14), d(14), 0);
-        hero.addView(heroActions, heroActionParams);
-        heroActions.setOnClickListener(v -> showActions(node));
-        LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(-1, d(350));
+        TextView actions = heroControl("⋮", "Acciones", v -> showActions(activeNode[0]));
+        FrameLayout.LayoutParams actionParams = new FrameLayout.LayoutParams(d(42), d(42), Gravity.TOP | Gravity.RIGHT);
+        actionParams.setMargins(0, d(12), d(12), 0);
+        hero.addView(actions, actionParams);
+        TextView previous = heroControl("‹", "Sugerencia anterior", v -> { });
+        TextView next = heroControl("›", "Siguiente sugerencia", v -> { });
+        FrameLayout.LayoutParams previousParams = new FrameLayout.LayoutParams(d(42), d(54), Gravity.CENTER_VERTICAL | Gravity.LEFT);
+        previousParams.leftMargin = d(10);
+        FrameLayout.LayoutParams nextParams = new FrameLayout.LayoutParams(d(42), d(54), Gravity.CENTER_VERTICAL | Gravity.RIGHT);
+        nextParams.rightMargin = d(10);
+        hero.addView(previous, previousParams);
+        hero.addView(next, nextParams);
+        int[] current = {0};
+        Runnable update = () -> {
+            JSONObject selected = recommendations.get(current[0]);
+            activeNode[0] = selected;
+            loadImage(selected.optString("poster_url", ""), image, true);
+            title.setText(displayTitle(selected));
+            desc.setText(selected.optString("overview", ""));
+            counter.setText((current[0] + 1) + " / " + recommendations.size());
+            previous.setAlpha(current[0] == 0 ? 0.35f : 1f);
+            next.setAlpha(current[0] == recommendations.size() - 1 ? 0.35f : 1f);
+        };
+        previous.setOnClickListener(v -> {
+            if (current[0] > 0) { current[0]--; update.run(); }
+        });
+        next.setOnClickListener(v -> {
+            if (current[0] < recommendations.size() - 1) { current[0]++; update.run(); }
+        });
+        update.run();
+        LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(-1, d(330));
         hp.setMargins(d(16), d(8), d(16), d(14));
         content.addView(hero, hp);
+    }
+
+    TextView heroControl(String glyph, String hint, View.OnClickListener listener) {
+        TextView control = label(glyph, 28, Color.WHITE, true);
+        control.setGravity(Gravity.CENTER);
+        control.setContentDescription(hint);
+        control.setBackground(round(0xB8000000, d(22)));
+        control.setFocusable(true);
+        control.setClickable(true);
+        control.setOnClickListener(listener);
+        return control;
     }
 
     String displayTitle(JSONObject node) {
@@ -348,8 +444,8 @@ public class MainActivity extends Activity {
         if (nodes == null || nodes.isEmpty()) return;
         LinearLayout section = new LinearLayout(this);
         section.setOrientation(LinearLayout.VERTICAL);
-        TextView heading = label(title, 19, Color.WHITE, true);
-        heading.setPadding(d(20), d(8), d(20), d(10));
+        TextView heading = label(title, 22, Color.WHITE, true);
+        heading.setPadding(d(20), d(8), d(20), d(12));
         section.addView(heading);
         HorizontalScrollView horizontal = new HorizontalScrollView(this);
         horizontal.setHorizontalScrollBarEnabled(false);
@@ -373,7 +469,7 @@ public class MainActivity extends Activity {
         art.setBackground(round(PANEL, d(10)));
         JSONArray mosaic = node.optJSONArray("mosaic_images");
         if (node.optString("kind").equals("collection")
-                && node.optString("poster_url").isEmpty() && mosaic != null && mosaic.length() > 0) {
+                && !node.optBoolean("poster_is_assigned") && mosaic != null && mosaic.length() > 0) {
             LinearLayout mosaicBox = new LinearLayout(this);
             mosaicBox.setOrientation(LinearLayout.VERTICAL);
             for (int r = 0; r < 2; r++) {
@@ -441,12 +537,20 @@ public class MainActivity extends Activity {
         }
         if (kind.equals("season")) return "Temporada " + String.format("%02d", node.optInt("season_number"));
         JSONArray genres = node.optJSONArray("genres");
+        if (kind.equals("collection")) {
+            int count = node.optInt("item_count");
+            String countLabel = count + (count == 1 ? " título" : " títulos");
+            if (genres == null || genres.length() == 0) return countLabel;
+            List<String> shown = new ArrayList<>();
+            for (int i = 0; i < Math.min(2, genres.length()); i++) shown.add(genres.optString(i));
+            return countLabel + " · " + join(new JSONArray(shown));
+        }
         if (genres != null && genres.length() > 0) {
             List<String> shown = new ArrayList<>();
             for (int i = 0; i < Math.min(2, genres.length()); i++) shown.add(genres.optString(i));
             return join(new JSONArray(shown));
         }
-        return kind.equals("collection") || kind.equals("movie") ? "Sin género disponible" : "";
+        return kind.equals("movie") ? "Sin género disponible" : "";
     }
 
     GradientDrawable round(int color, int radius) {
@@ -798,6 +902,27 @@ public class MainActivity extends Activity {
                 .setPositiveButton("Listo", (dialog, which) ->
                         button.setText("Seleccionar géneros (" + selected.size() + ")"))
                 .setNegativeButton("Cancelar", null)
+                .setNeutralButton("Añadir nuevo", (dialog, which) ->
+                        promptNewGenre(button, options, selected))
+                .show();
+    }
+
+    void promptNewGenre(Button button, List<String> options, List<String> selected) {
+        EditText input = metadataField("", "Nombre del género", false);
+        new AlertDialog.Builder(this)
+                .setTitle("Añadir género")
+                .setView(input)
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Añadir", (dialog, which) -> {
+                    String value = input.getText().toString().trim();
+                    if (value.isEmpty()) return;
+                    JSONArray added = new JSONArray();
+                    added.put(value);
+                    addGenreValues(options, added);
+                    addGenreValues(selected, added);
+                    button.setText("Seleccionar géneros (" + selected.size() + ")");
+                    button.post(() -> showGenrePicker(button, options, selected));
+                })
                 .show();
     }
 
@@ -1072,7 +1197,7 @@ public class MainActivity extends Activity {
             addSectionHeader(node.optString("kind").equals("series") ? "Temporadas" : "Explorar", "Selecciona para continuar");
             addGrid(toList(children));
         }
-        if (files != null && files.length() > 0) addEpisodeList(files);
+        if (files != null && files.length() > 0) addEpisodeList(files, node.optString("poster_url", ""));
         if ((files == null || files.length() == 0) && (children == null || children.length() == 0)
                 && !node.optString("kind").equals("movie")) addEmpty("No se encontraron episodios.");
     }
@@ -1086,7 +1211,7 @@ public class MainActivity extends Activity {
         return result.toString();
     }
 
-    void addEpisodeList(JSONArray files) {
+    void addEpisodeList(JSONArray files, String fallbackPoster) {
         addSectionHeader("Episodios", files.length() + (files.length() == 1 ? " vídeo" : " vídeos"));
         for (int i = 0; i < files.length(); i++) {
             JSONObject file = files.optJSONObject(i);
@@ -1110,7 +1235,8 @@ public class MainActivity extends Activity {
             LinearLayout.LayoutParams ip = new LinearLayout.LayoutParams(-1, -2);
             ip.setMargins(d(16), 0, d(16), d(8));
             content.addView(item, ip);
-            item.setOnClickListener(v -> launchPlayer(file.optString("stream_url"), file.optString("title", "Zinema")));
+            item.setOnClickListener(v -> launchPlayer(file.optString("stream_url"),
+                    file.optString("title", "Zinema"), file.optString("poster_url", fallbackPoster)));
         }
     }
 
@@ -1118,7 +1244,8 @@ public class MainActivity extends Activity {
         JSONArray files = node.optJSONArray("files");
         if (files != null && files.length() > 0) {
             JSONObject file = files.optJSONObject(0);
-            if (file != null) launchPlayer(file.optString("stream_url"), file.optString("title", displayTitle(node)));
+            if (file != null) launchPlayer(file.optString("stream_url"),
+                    file.optString("title", displayTitle(node)), file.optString("poster_url", node.optString("poster_url", "")));
             return;
         }
         JSONArray children = node.optJSONArray("children");
@@ -1223,7 +1350,9 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
         p.setMargins(d(16), 0, d(16), d(8));
         content.addView(row, p);
-        row.setOnClickListener(v -> launchPlayer(result.optString("stream_url", "/api/v1/items/" + result.optString("id") + "/stream"), result.optString("title", "Zinema")));
+        row.setOnClickListener(v -> launchPlayer(
+                result.optString("stream_url", "/api/v1/items/" + result.optString("id") + "/stream"),
+                result.optString("title", "Zinema"), result.optString("poster_url", "")));
         actions.setOnClickListener(v -> {
             JSONObject target = new JSONObject();
             try {
@@ -1345,30 +1474,45 @@ public class MainActivity extends Activity {
     void addResumeRow(String title, List<JSONObject> items) {
         LinearLayout section = new LinearLayout(this);
         section.setOrientation(LinearLayout.VERTICAL);
-        TextView heading = label(title, 19, Color.WHITE, true);
-        heading.setPadding(d(20), d(8), d(20), d(10));
+        TextView heading = label(title, 22, Color.WHITE, true);
+        heading.setPadding(d(20), d(8), d(20), d(12));
         section.addView(heading);
         HorizontalScrollView horizontal = new HorizontalScrollView(this);
         horizontal.setHorizontalScrollBarEnabled(false);
         LinearLayout cards = new LinearLayout(this);
         cards.setPadding(d(16), 0, d(16), d(8));
         for (JSONObject item : items) {
-            LinearLayout card = new LinearLayout(this);
-            card.setOrientation(LinearLayout.VERTICAL);
-            card.setPadding(d(14), d(14), d(14), d(14));
-            card.setBackground(round(PANEL, d(10)));
-            card.addView(label("▶  Continuar", 14, Color.WHITE, true));
-            TextView name = label(item.optString("title", "Vídeo"), 13, MUTED, false);
+            FrameLayout card = new FrameLayout(this);
+            card.setBackground(round(PANEL, d(12)));
+            card.setClipToOutline(true);
+            ImageView poster = new ImageView(this);
+            poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            card.addView(poster, new FrameLayout.LayoutParams(-1, -1));
+            View shade = new View(this);
+            shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
+                    new int[]{0xFF090A0D, 0xAA090A0D, 0x11090A0D}));
+            card.addView(shade, new FrameLayout.LayoutParams(-1, -1));
+            LinearLayout details = new LinearLayout(this);
+            details.setOrientation(LinearLayout.VERTICAL);
+            details.setGravity(Gravity.BOTTOM);
+            details.setPadding(d(14), d(12), d(14), d(12));
+            details.addView(label("▶  CONTINUAR · " + formatTime(item.optInt("position")),
+                    10, 0xFFFF858A, true));
+            TextView name = label(item.optString("title", "Vídeo"), 14, Color.WHITE, true);
             name.setMaxLines(2);
-            LinearLayout.LayoutParams np = new LinearLayout.LayoutParams(d(180), -2);
-            np.topMargin = d(9);
-            card.addView(name, np);
-            TextView progress = label("Retomar desde " + formatTime(item.optInt("position")), 11, MUTED, false);
-            LinearLayout.LayoutParams pp = new LinearLayout.LayoutParams(-2, -2);
-            pp.topMargin = d(7);
-            card.addView(progress, pp);
-            card.setOnClickListener(v -> launchPlayer(item.optString("stream"), item.optString("title", "Zinema")));
-            LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(-2, -2);
+            LinearLayout.LayoutParams np = new LinearLayout.LayoutParams(-1, -2);
+            np.topMargin = d(5);
+            details.addView(name, np);
+            card.addView(details, new FrameLayout.LayoutParams(-1, -1));
+            card.setFocusable(true);
+            card.setClickable(true);
+            String cover = item.optString("poster_url", "");
+            if (cover.isEmpty()) cover = posterByStream.get(item.optString("stream", ""));
+            final String resumePoster = cover == null ? "" : cover;
+            loadImage(resumePoster, poster, true);
+            card.setOnClickListener(v -> launchPlayer(item.optString("stream"),
+                    item.optString("title", "Zinema"), resumePoster));
+            LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(d(224), d(148));
             cp.setMargins(0, 0, d(10), 0);
             cards.addView(card, cp);
         }
@@ -1383,6 +1527,10 @@ public class MainActivity extends Activity {
     }
 
     void launchPlayer(String path, String title) {
+        launchPlayer(path, title, "");
+    }
+
+    void launchPlayer(String path, String title, String posterUrl) {
         if (path == null || path.isEmpty()) return;
         String url = path.startsWith("http") ? path : server + (path.startsWith("/") ? path : "/" + path);
         String key = "watch:" + path;
@@ -1393,6 +1541,7 @@ public class MainActivity extends Activity {
         intent.putExtra("url", url);
         intent.putExtra("path", path);
         intent.putExtra("title", title);
+        intent.putExtra("poster_url", posterUrl);
         intent.putExtra("position", position);
         startActivity(intent);
     }
@@ -1404,8 +1553,9 @@ public class MainActivity extends Activity {
             if (!resume.isEmpty() && content != null && movies.size() + series.size() > 0) {
                 libraryMode = false;
                 showingDetail = false;
+                selectedSection = "home";
                 breadcrumbs.clear();
-                if (backButton != null) backButton.setVisibility(View.GONE);
+                buildShell("Inicio");
                 renderHome();
             }
         }

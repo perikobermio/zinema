@@ -5,6 +5,8 @@ Cliente Android nativo conectado a la API pública de Zinema. La interfaz usa un
 ## Funciones
 
 - Explorar películas, series, colecciones, temporadas y episodios.
+- Mostrar el número de títulos en cada colección y un mosaico con sus pósteres si no tiene uno propio.
+- Navegar cinco sugerencias desde la portada y retomar vídeos empezados desde una fila prioritaria con sus pósteres.
 - Ver géneros de películas y colecciones, y el número de temporadas de cada serie.
 - Navegar atrás con el botón visible en pantalla o con la tecla atrás del dispositivo.
 - Buscar en el catálogo del servidor.
