@@ -147,6 +147,7 @@ def database() -> sqlite3.Connection:
             year INTEGER,
             genres TEXT NOT NULL DEFAULT '[]',
             cast_json TEXT,
+            cast_version INTEGER NOT NULL DEFAULT 0,
             tmdb_id INTEGER,
             imdb_id TEXT,
             poster_file TEXT,
@@ -168,6 +169,8 @@ def database() -> sqlite3.Connection:
         connection.execute("ALTER TABLE catalog_nodes ADD COLUMN episode_metadata_checked_at TEXT")
     if "cast_json" not in node_columns:
         connection.execute("ALTER TABLE catalog_nodes ADD COLUMN cast_json TEXT")
+    if "cast_version" not in node_columns:
+        connection.execute("ALTER TABLE catalog_nodes ADD COLUMN cast_version INTEGER NOT NULL DEFAULT 0")
     if "added_at" not in node_columns:
         connection.execute("ALTER TABLE catalog_nodes ADD COLUMN added_at TEXT NOT NULL DEFAULT ''")
     connection.execute("UPDATE catalog_nodes SET added_at=scanned_at WHERE added_at='' ")
@@ -277,6 +280,7 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     node = dict(row)
     genres = normalize_genres(json.loads(node.pop("genres", "[]") or "[]"))
     node["cast"] = json.loads(node.pop("cast_json", None) or "[]")
+    node.pop("cast_version", None)
     node["display_title"] = node.pop("metadata_title", None) or node["title"]
     node["year"] = node.get("year") or node.get("source_year")
     inherited_genres = _inherited_collection_value(connection, node.get("parent_id"), "genres")
@@ -356,7 +360,7 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
         node["children"].append(child_payload)
     file_rows = connection.execute(
         """SELECT id, COALESCE(episode_title, title) AS title, title AS filename,
-                  relative_path, extension, size_bytes, season_number,
+                  relative_path, extension, size_bytes, modified_at, season_number,
                   episode_number
            FROM library_items WHERE node_id=? AND available=1
            ORDER BY season_number, episode_number, title COLLATE NOCASE""",

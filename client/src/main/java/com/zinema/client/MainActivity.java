@@ -1427,10 +1427,18 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams op = new LinearLayout.LayoutParams(-1, -2);
         op.topMargin = d(10);
         info.addView(overview, op);
+        JSONArray files = node.optJSONArray("files");
         LinearLayout controls = new LinearLayout(this);
         controls.setGravity(Gravity.CENTER_VERTICAL);
         Button play = actionButton(node.optString("kind").equals("series") ? "Ver episodios" : "Reproducir", true);
         controls.addView(play, new LinearLayout.LayoutParams(-2, d(44)));
+        if ("movie".equals(node.optString("kind")) && files != null && files.length() > 0) {
+            Button details = actionButton("ⓘ  Details", false);
+            LinearLayout.LayoutParams detailsParams = new LinearLayout.LayoutParams(-2, d(44));
+            detailsParams.leftMargin = d(8);
+            controls.addView(details, detailsParams);
+            details.setOnClickListener(v -> showMovieFileDetails(node));
+        }
         LinearLayout.LayoutParams controlsP = new LinearLayout.LayoutParams(-1, -2);
         controlsP.topMargin = d(14);
         info.addView(controls, controlsP);
@@ -1453,14 +1461,12 @@ public class MainActivity extends Activity {
             addCastSection(node.optJSONArray("cast"));
         }
         JSONArray children = node.optJSONArray("children");
-        JSONArray files = node.optJSONArray("files");
         if (children != null && children.length() > 0) {
             addSectionHeader(node.optString("kind").equals("series") ? "Temporadas" : "Explorar", "Selecciona para continuar");
             addGrid(toList(children));
         }
         if (files != null && files.length() > 0) {
-            if ("movie".equals(node.optString("kind"))) addMovieFileCard(files, node.optString("poster_url", ""), node);
-            else addEpisodeList(files, node.optString("poster_url", ""), node);
+            if (!"movie".equals(node.optString("kind"))) addEpisodeList(files, node.optString("poster_url", ""), node);
         }
         if ((files == null || files.length() == 0) && (children == null || children.length() == 0)
                 && !node.optString("kind").equals("movie")) addEmpty("No se encontraron episodios.");
@@ -1485,22 +1491,37 @@ public class MainActivity extends Activity {
         for (int i = 0; i < cast.length(); i++) {
             JSONObject member = cast.optJSONObject(i);
             if (member == null) continue;
-            LinearLayout card = new LinearLayout(this);
-            card.setOrientation(LinearLayout.VERTICAL);
-            card.setPadding(d(12), d(12), d(12), d(12));
+            FrameLayout card = new FrameLayout(this);
             card.setBackground(round(PANEL, d(10)));
+            card.setClipToOutline(true);
+            ImageView portrait = new ImageView(this);
+            portrait.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            card.addView(portrait, new FrameLayout.LayoutParams(-1, -1));
+            String profilePath = member.optString("profile_path", "");
+            if (!profilePath.isEmpty() && !profilePath.equals("null")) {
+                loadImage("https://image.tmdb.org/t/p/w342" + profilePath, portrait, false);
+            }
+            View shade = new View(this);
+            shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
+                    new int[]{0xEE090A0D, 0x66090A0D, 0x11090A0D}));
+            card.addView(shade, new FrameLayout.LayoutParams(-1, -1));
+            LinearLayout text = new LinearLayout(this);
+            text.setOrientation(LinearLayout.VERTICAL);
+            text.setGravity(Gravity.BOTTOM);
+            text.setPadding(d(12), d(10), d(12), d(10));
             TextView name = label(member.optString("name"), 14, Color.WHITE, true);
             name.setMaxLines(2);
-            card.addView(name);
+            text.addView(name);
             String character = member.optString("character", "").trim();
             if (!character.isEmpty()) {
                 TextView role = label(character, 12, MUTED, false);
                 role.setMaxLines(2);
                 LinearLayout.LayoutParams roleParams = new LinearLayout.LayoutParams(-1, -2);
                 roleParams.topMargin = d(5);
-                card.addView(role, roleParams);
+                text.addView(role, roleParams);
             }
-            LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(d(164), d(88));
+            card.addView(text, new FrameLayout.LayoutParams(-1, -1));
+            LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(d(164), d(112));
             cardParams.setMargins(0, 0, d(8), 0);
             cards.addView(card, cardParams);
         }
@@ -1508,46 +1529,50 @@ public class MainActivity extends Activity {
         content.addView(horizontal, new LinearLayout.LayoutParams(-1, -2));
     }
 
-    void addMovieFileCard(JSONArray files, String fallbackPoster, JSONObject owner) {
+    void showMovieFileDetails(JSONObject node) {
+        JSONArray files = node.optJSONArray("files");
+        if (files == null || files.length() == 0) return;
+        if (files.length() == 1) {
+            showVideoFileDetails(files.optJSONObject(0), node.optString("library", ""));
+            return;
+        }
+        String[] names = new String[files.length()];
         for (int i = 0; i < files.length(); i++) {
             JSONObject file = files.optJSONObject(i);
-            if (file == null) continue;
-            LinearLayout item = new LinearLayout(this);
-            item.setGravity(Gravity.CENTER_VERTICAL);
-            item.setPadding(d(12), d(12), d(16), d(12));
-            item.setBackground(round(PANEL, d(12)));
-            ImageView poster = new ImageView(this);
-            poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
-            poster.setBackground(round(BG, d(8)));
-            String cover = file.optString("poster_url", fallbackPoster);
-            loadImage(cover, poster, false);
-            item.addView(poster, new LinearLayout.LayoutParams(d(72), d(100)));
-
-            LinearLayout details = new LinearLayout(this);
-            details.setOrientation(LinearLayout.VERTICAL);
-            details.setPadding(d(14), 0, d(8), 0);
-            TextView name = label(file.optString("filename", file.optString("title", "Película")),
-                    15, Color.WHITE, true);
-            name.setMaxLines(2);
-            details.addView(name);
-            String extension = file.optString("extension", "").replace(".", "").toUpperCase();
-            TextView technical = label(extension + "   ·   " + formatSize(file.optLong("size_bytes")),
-                    12, MUTED, false);
-            LinearLayout.LayoutParams technicalParams = new LinearLayout.LayoutParams(-1, -2);
-            technicalParams.topMargin = d(6);
-            details.addView(technical, technicalParams);
-            TextView play = label("▶  Reproducir", 13, 0xFFFF858A, true);
-            LinearLayout.LayoutParams playParams = new LinearLayout.LayoutParams(-1, -2);
-            playParams.topMargin = d(12);
-            details.addView(play, playParams);
-            item.addView(details, new LinearLayout.LayoutParams(0, -2, 1));
-            LinearLayout.LayoutParams itemParams = new LinearLayout.LayoutParams(-1, -2);
-            itemParams.setMargins(d(16), 0, d(16), d(9));
-            content.addView(item, itemParams);
-            item.setOnClickListener(v -> launchPlayer(file.optString("stream_url"),
-                    file.optString("title", "Película"), cover, owner.optString("id", ""),
-                    file.optString("id", ""), owner.optString("kind", "")));
+            names[i] = file == null ? "Vídeo " + (i + 1)
+                    : file.optString("filename", file.optString("title", "Vídeo " + (i + 1)));
         }
+        new AlertDialog.Builder(this).setTitle("Selecciona un archivo")
+                .setItems(names, (dialog, which) ->
+                        showVideoFileDetails(files.optJSONObject(which), node.optString("library", "")))
+                .show();
+    }
+
+    void showVideoFileDetails(JSONObject file, String library) {
+        if (file == null) return;
+        String filename = file.optString("filename", file.optString("title", "Vídeo"));
+        String extension = file.optString("extension", "");
+        long bytes = file.optLong("size_bytes", 0);
+        String modified = file.optString("modified_at", "");
+        StringBuilder message = new StringBuilder();
+        message.append("Nombre: ").append(filename)
+                .append("\nTítulo: ").append(file.optString("title", ""))
+                .append("\nExtensión: ").append(extension.isEmpty() ? "—" : extension)
+                .append("\nTamaño: ").append(formatDetailedSize(bytes))
+                .append("\nRuta: ").append(file.optString("relative_path", "—"))
+                .append("\nBiblioteca: ").append(library.isEmpty() ? "—" : library);
+        if (!modified.isEmpty()) message.append("\nModificado: ").append(modified);
+        new AlertDialog.Builder(this).setTitle("Detalles del archivo")
+                .setMessage(message.toString()).setPositiveButton("Cerrar", null).show();
+    }
+
+    String formatDetailedSize(long bytes) {
+        if (bytes <= 0) return "—";
+        if (bytes >= 1024L * 1024 * 1024)
+            return String.format(java.util.Locale.US, "%.2f GB", bytes / (1024.0 * 1024 * 1024));
+        if (bytes >= 1024L * 1024)
+            return String.format(java.util.Locale.US, "%.1f MB", bytes / (1024.0 * 1024));
+        return String.format(java.util.Locale.US, "%.0f KB", bytes / 1024.0);
     }
 
     void addEpisodeList(JSONArray files, String fallbackPoster, JSONObject owner) {

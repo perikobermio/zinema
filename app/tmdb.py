@@ -136,8 +136,10 @@ def _cast_payload(details: dict) -> list[dict[str, str]]:
         if not isinstance(name, str) or not name.strip():
             continue
         character = member.get("character")
+        profile_path = member.get("profile_path")
         cast.append({"name": name.strip(),
-                     "character": character.strip() if isinstance(character, str) else ""})
+                     "character": character.strip() if isinstance(character, str) else "",
+                     "profile_path": profile_path if isinstance(profile_path, str) else ""})
     return cast
 
 
@@ -163,7 +165,8 @@ def _write_match(connection: sqlite3.Connection, node: sqlite3.Row, details: dic
     cast = _cast_payload(details)
     connection.execute(
         """UPDATE catalog_nodes SET tmdb_id=?, imdb_id=?, metadata_title=?, original_title=?,
-           overview=?, year=?, genres=?, cast_json=?, poster_file=COALESCE(?, poster_file),
+           overview=?, year=?, genres=?, cast_json=?, cast_version=1,
+           poster_file=COALESCE(?, poster_file),
            backdrop_file=COALESCE(?, backdrop_file), metadata_status='matched',
            metadata_source='tmdb', metadata_checked_at=?, metadata_candidates=NULL,
            metadata_error=NULL WHERE id=?""",
@@ -409,12 +412,12 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
         """SELECT * FROM catalog_nodes
            WHERE available=1 AND kind IN ('movie', 'series')
              AND (COALESCE(metadata_source, '')!='manual'
-                  OR (tmdb_id IS NOT NULL AND cast_json IS NULL))
+                  OR (tmdb_id IS NOT NULL AND cast_version<1))
              AND (? IS NULL OR id=?)
              AND (metadata_checked_at IS NULL
                   OR (metadata_status='error' AND metadata_checked_at < ?)
                   OR (metadata_status!='error' AND metadata_checked_at < ?)
-                  OR (tmdb_id IS NOT NULL AND cast_json IS NULL)
+                  OR (tmdb_id IS NOT NULL AND cast_version<1)
                   OR (kind='series' AND tmdb_id IS NOT NULL
                       AND episode_metadata_checked_at IS NULL))
            ORDER BY CASE WHEN tmdb_id IS NOT NULL THEN 1 ELSE 0 END, scanned_at
@@ -437,7 +440,7 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
                 if node["metadata_source"] == "manual" and node["tmdb_id"]:
                     details = _fetch_details(client, kind, int(node["tmdb_id"]), language, api_key)
                     connection.execute(
-                        "UPDATE catalog_nodes SET cast_json=? WHERE id=?",
+                        "UPDATE catalog_nodes SET cast_json=?, cast_version=1 WHERE id=?",
                         (json.dumps(_cast_payload(details), ensure_ascii=False), node["id"]),
                     )
                     connection.commit()
