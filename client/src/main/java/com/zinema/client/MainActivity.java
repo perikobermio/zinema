@@ -138,8 +138,11 @@ public class MainActivity extends Activity {
     String adminReturnDetailId = "";
     String editingProfileId = "";
     String selectedProfileAvatar = "";
-    boolean metadataEditorFromDetail;
     boolean metadataEditorMode;
+    String metadataEditorReturnScreen = "";
+    String metadataEditorReturnDetailId = "";
+    int metadataEditorReturnScrollY;
+    boolean metadataEditorReturnPrepared;
     boolean metadataEditorPreviousBackVisible;
     List<JSONObject> movies = new ArrayList<>();
     List<JSONObject> series = new ArrayList<>();
@@ -2518,6 +2521,7 @@ public class MainActivity extends Activity {
     void retryMetadata(JSONObject node) {
         String nodeId = node.optString("id");
         if (nodeId.isEmpty()) return;
+        captureMetadataEditorReturnState();
         showLoading("Buscando coincidencias en TMDb…");
         io.execute(() -> {
             try {
@@ -2556,7 +2560,7 @@ public class MainActivity extends Activity {
     }
 
     void showMetadataEditor(JSONObject node, JSONArray candidates) {
-        metadataEditorFromDetail = showingDetail;
+        if (!metadataEditorReturnPrepared) captureMetadataEditorReturnState();
         showingDetail = false;
         setMetadataEditorChrome(true);
         content.removeAllViews();
@@ -2904,7 +2908,7 @@ public class MainActivity extends Activity {
             try {
                 postJson("/api/v1/catalog/" + enc(nodeId) + "/metadata/manual", payload);
                 imageCache.evictAll();
-                runOnUiThread(() -> finishMetadataRetry(nodeId, "Metadata guardada y cliente actualizado."));
+                runOnUiThread(() -> finishMetadataRetry("Metadata guardada y cliente actualizado."));
             } catch (Exception e) {
                 runOnUiThread(() -> {
                     saveButton.setEnabled(true);
@@ -2916,37 +2920,61 @@ public class MainActivity extends Activity {
         });
     }
 
-    void finishMetadataRetry(String requestedNodeId, String summary) {
+    void finishMetadataRetry(String summary) {
         Toast.makeText(this, summary, Toast.LENGTH_LONG).show();
         clearCatalogCache();
         catalogVersion = "";
         lastCatalogVersionCheckMs = 0L;
-        boolean returnToDetail = metadataEditorFromDetail && requestedNodeId.equals(detailNodeId);
+        returnFromMetadataEditor();
+    }
+
+    void captureMetadataEditorReturnState() {
+        if (metadataEditorReturnPrepared) return;
+        metadataEditorReturnScrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
+        metadataEditorReturnDetailId = showingDetail ? detailNodeId : "";
+        if (showingDetail) metadataEditorReturnScreen = "detail";
+        else if (!breadcrumbs.isEmpty()) metadataEditorReturnScreen = "collection";
+        else if (lastSearchQuery != null) metadataEditorReturnScreen = "search";
+        else if (libraryMode) metadataEditorReturnScreen = "library";
+        else metadataEditorReturnScreen = "home";
+        metadataEditorReturnPrepared = true;
+    }
+
+    void returnFromMetadataEditor() {
         setMetadataEditorChrome(false);
-        if (returnToDetail) {
-            metadataEditorFromDetail = false;
+        showingDetail = false;
+        String returnScreen = metadataEditorReturnScreen;
+        String returnDetailId = metadataEditorReturnDetailId;
+        int returnScrollY = metadataEditorReturnScrollY;
+        metadataEditorReturnPrepared = false;
+        metadataEditorReturnScreen = "";
+        metadataEditorReturnDetailId = "";
+
+        if ("detail".equals(returnScreen) && !returnDetailId.isEmpty()) {
             io.execute(() -> {
                 try {
-                    JSONObject updated = getJson("/api/v1/catalog/" + enc(detailNodeId));
-                    runOnUiThread(() -> renderDetail(updated));
-                } catch (Exception e) { runOnUiThread(() -> {
-                    setMetadataEditorChrome(true);
-                    metadataEditorFromDetail = true;
-                    Toast.makeText(this, "Metadata guardada; no se pudo recargar la ficha.",
-                            Toast.LENGTH_LONG).show();
-                }); }
+                    JSONObject node = getJson("/api/v1/catalog/" + enc(returnDetailId));
+                    runOnUiThread(() -> {
+                        renderDetail(node);
+                        if (contentScroller != null) contentScroller.post(
+                                () -> contentScroller.scrollTo(0, returnScrollY));
+                    });
+                } catch (Exception e) {
+                    runOnUiThread(() -> renderError("No se pudo volver a la ficha: " + e.getMessage()));
+                }
             });
+            return;
+        }
+
+        pendingListingRestoreY = returnScrollY;
+        if ("collection".equals(returnScreen) && !breadcrumbs.isEmpty()) {
+            showCollectionContents(breadcrumbs.get(breadcrumbs.size() - 1));
+        } else if ("search".equals(returnScreen) && lastSearchQuery != null) {
+            performSearch(lastSearchQuery);
+        } else if ("library".equals(returnScreen)) {
+            openLibrary(currentLibrary);
         } else {
-            metadataEditorFromDetail = false;
-            if (!breadcrumbs.isEmpty()) {
-                showCollectionContents(breadcrumbs.get(breadcrumbs.size() - 1));
-            } else if (lastSearchQuery != null) {
-                performSearch(lastSearchQuery);
-            } else if (libraryMode) {
-                openLibrary(currentLibrary);
-            } else {
-                loadHome();
-            }
+            loadHome();
         }
     }
 
@@ -4127,16 +4155,7 @@ public class MainActivity extends Activity {
             return;
         }
         if (metadataEditorMode) {
-            setMetadataEditorChrome(false);
-        }
-        if (metadataEditorFromDetail) {
-            metadataEditorFromDetail = false;
-            io.execute(() -> {
-                try {
-                    JSONObject node = getJson("/api/v1/catalog/" + enc(detailNodeId));
-                    runOnUiThread(() -> renderDetail(node));
-                } catch (Exception e) { runOnUiThread(this::loadHome); }
-            });
+            returnFromMetadataEditor();
             return;
         }
         if (showingDetail) {
