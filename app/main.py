@@ -395,28 +395,64 @@ def _collection_artwork(connection: sqlite3.Connection, collection_id: str) -> d
            WHERE kind IN ('movie', 'series') ORDER BY kind, title COLLATE NOCASE""",
         (collection_id,),
     ).fetchall()
-    mosaic = [
-        _artwork_url(item["id"], "poster", item["poster_file"])
-        for item in items if item["poster_file"]
-    ][:4]
+    mosaic: list[str] = []
+    for item in items:
+        if item["poster_file"]:
+            mosaic.append(_artwork_url(item["id"], "poster", item["poster_file"]))
+        elif item["kind"] == "series":
+            # A series may only have artwork attached to its season nodes.
+            # Use the first season's poster (or its numbered fallback tile) so
+            # collections of series fill the mosaic just like movie collections.
+            season = connection.execute(
+                """SELECT id, season_number, poster_file FROM catalog_nodes
+                   WHERE parent_id=? AND kind='season' AND available=1
+                   ORDER BY season_number LIMIT 1""",
+                (item["id"],),
+            ).fetchone()
+            if season:
+                mosaic.append(_artwork_url(
+                    season["id"], "poster", season["poster_file"],
+                    fallback_version=f"season-{season['season_number']}",
+                ))
+        if len(mosaic) == 4:
+            break
     # Keep the four-tile layout complete when one of the titles has no
     # individual artwork. A collection's own poster is a useful last resort.
     collection = connection.execute(
         "SELECT poster_file FROM catalog_nodes WHERE id=?", (collection_id,),
     ).fetchone()
-    if len(mosaic) == 3 and collection and collection["poster_file"]:
+    if len(items) <= 4 and len(mosaic) < 4 and collection and collection["poster_file"]:
         mosaic.append(_artwork_url(collection_id, "poster", collection["poster_file"]))
     single_poster_url = None
     if len(items) == 1:
         item = items[0]
         poster_node_id = item["id"] if item["poster_file"] else None
+        poster_filename = item["poster_file"]
+        fallback_version = ""
+        inherited = None
+        if poster_node_id is None and item["kind"] == "series":
+            season = connection.execute(
+                """SELECT id, season_number, poster_file FROM catalog_nodes
+                   WHERE parent_id=? AND kind='season' AND available=1
+                   ORDER BY season_number LIMIT 1""",
+                (item["id"],),
+            ).fetchone()
+            if season:
+                poster_node_id = season["id"]
+                poster_filename = season["poster_file"]
+                fallback_version = f"season-{season['season_number']}"
         if poster_node_id is None:
             inherited = _inherited_collection_value(connection, item["parent_id"], "poster_file")
             if inherited:
                 poster_node_id = inherited[0]
+                poster_filename = inherited[1]
         if poster_node_id:
-            poster_filename = item["poster_file"] if item["poster_file"] else inherited[1]
-            single_poster_url = _artwork_url(poster_node_id, "poster", poster_filename)
+            if poster_node_id == item["id"]:
+                poster_filename = item["poster_file"]
+            single_poster_url = _artwork_url(
+                poster_node_id, "poster", poster_filename,
+                fallback_version=fallback_version,
+            )
     return {"item_count": len(items), "mosaic_images": mosaic,
             "single_item_poster_url": single_poster_url}
 
