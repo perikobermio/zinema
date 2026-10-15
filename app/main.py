@@ -49,7 +49,7 @@ METADATA_RETRY_GLOBAL_LAST_REQUEST = 0.0
 METADATA_RETRY_GLOBAL_COOLDOWN_SECONDS = 10
 SCHEDULER_STARTED = False
 PLAYBACK_TICKET_TTL_SECONDS = 8 * 60 * 60
-PLAYBACK_TICKETS: dict[str, tuple[str, float]] = {}
+PLAYBACK_TICKETS: dict[str, tuple[str, float, str]] = {}
 PLAYBACK_TICKET_LOCK = threading.Lock()
 
 app = FastAPI(title="Zinema Server", version="0.1.0",
@@ -258,7 +258,7 @@ def require_client_pairing(authorization: Annotated[str | None, Header()] = None
         raise HTTPException(status_code=401, detail="Invalid device pairing key")
 
 
-def require_client(authorization: Annotated[str | None, Header()] = None) -> None:
+def require_client(authorization: Annotated[str | None, Header()] = None) -> str:
     scheme, _, token = (authorization or "").partition(" ")
     if scheme.lower() != "bearer" or not token:
         raise HTTPException(status_code=401, detail="Invalid device token")
@@ -272,6 +272,7 @@ def require_client(authorization: Annotated[str | None, Header()] = None) -> Non
         connection.execute("UPDATE client_devices SET last_seen_at=? WHERE id=?",
                            (datetime.now(timezone.utc).isoformat(), row["id"]))
         connection.commit()
+        return row["id"]
 
 
 def display_title(path: Path) -> str:
@@ -809,6 +810,10 @@ def pair_client_device(request: DevicePairRequest) -> dict[str, str]:
             (device_id, request.name.strip(), token_hash, now, now),
         )
         connection.commit()
+    with PLAYBACK_TICKET_LOCK:
+        for ticket, grant in list(PLAYBACK_TICKETS.items()):
+            if grant[2] == device_id:
+                PLAYBACK_TICKETS.pop(ticket, None)
     return {"device_id": device_id, "token": device_token}
 
 
@@ -826,6 +831,10 @@ def revoke_client_device(device_id: str) -> dict[str, bool]:
     with closing(database()) as connection:
         cursor = connection.execute("UPDATE client_devices SET revoked=1 WHERE id=?", (device_id,))
         connection.commit()
+    with PLAYBACK_TICKET_LOCK:
+        for ticket, grant in list(PLAYBACK_TICKETS.items()):
+            if grant[2] == device_id:
+                PLAYBACK_TICKETS.pop(ticket, None)
     return {"revoked": cursor.rowcount > 0}
 
 
@@ -1257,16 +1266,16 @@ def metadata_review_queue() -> list[dict[str, object]]:
     ]
 
 
-@app.post("/api/v1/items/{item_id}/playback-ticket", dependencies=[Depends(require_client)])
-def create_playback_ticket(item_id: str) -> dict[str, object]:
+@app.post("/api/v1/items/{item_id}/playback-ticket")
+def create_playback_ticket(item_id: str, device_id: str = Depends(require_client)) -> dict[str, object]:
     get_media_file(item_id)
     now = time.time()
     ticket = secrets.token_urlsafe(32)
     with PLAYBACK_TICKET_LOCK:
-        expired = [key for key, (_, expiry) in PLAYBACK_TICKETS.items() if expiry <= now]
+        expired = [key for key, (_, expiry, _) in PLAYBACK_TICKETS.items() if expiry <= now]
         for key in expired:
             PLAYBACK_TICKETS.pop(key, None)
-        PLAYBACK_TICKETS[ticket] = (item_id, now + PLAYBACK_TICKET_TTL_SECONDS)
+        PLAYBACK_TICKETS[ticket] = (item_id, now + PLAYBACK_TICKET_TTL_SECONDS, device_id)
     return {
         "url": f"/api/v1/playback/{ticket}",
         "expires_in": PLAYBACK_TICKET_TTL_SECONDS,
