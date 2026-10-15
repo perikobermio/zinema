@@ -355,16 +355,12 @@ def item_from_row(row: sqlite3.Row, connection: sqlite3.Connection) -> LibraryIt
             data["genres"] = normalize_genres(json.loads(inherited_genres[1] or "[]"))
     if metadata_node_id and poster_file:
         data["poster_url"] = _artwork_url(metadata_node_id, "poster", poster_file)
-    elif metadata_node_id:
-        inherited_poster = _inherited_collection_value(connection, metadata_parent_id, "poster_file")
-        if inherited_poster:
-            data["poster_url"] = _artwork_url(inherited_poster[0], "poster", inherited_poster[1])
     return LibraryItem(**data)
 
 
 def _inherited_collection_value(connection: sqlite3.Connection, parent_id: str | None,
                                 column: str) -> tuple[str, str] | None:
-    if column not in {"poster_file", "genres"}:
+    if column != "genres":
         return None
     while parent_id:
         parent = connection.execute(
@@ -378,6 +374,18 @@ def _inherited_collection_value(connection: sqlite3.Connection, parent_id: str |
                 return parent["id"], parent["value"]
         parent_id = parent["parent_id"]
     return None
+
+
+def _series_fallback_poster(connection: sqlite3.Connection, series_id: str) -> tuple[str, str | None, str] | None:
+    season = connection.execute(
+        """SELECT id, season_number, poster_file FROM catalog_nodes
+           WHERE parent_id=? AND kind='season' AND available=1
+           ORDER BY season_number LIMIT 1""",
+        (series_id,),
+    ).fetchone()
+    if season is None:
+        return None
+    return (season["id"], season["poster_file"], f"season-{season['season_number']}")
 
 
 def _collection_artwork(connection: sqlite3.Connection, collection_id: str) -> dict:
@@ -403,49 +411,23 @@ def _collection_artwork(connection: sqlite3.Connection, collection_id: str) -> d
             # A series may only have artwork attached to its season nodes.
             # Use the first season's poster (or its numbered fallback tile) so
             # collections of series fill the mosaic just like movie collections.
-            season = connection.execute(
-                """SELECT id, season_number, poster_file FROM catalog_nodes
-                   WHERE parent_id=? AND kind='season' AND available=1
-                   ORDER BY season_number LIMIT 1""",
-                (item["id"],),
-            ).fetchone()
+            season = _series_fallback_poster(connection, item["id"])
             if season:
                 mosaic.append(_artwork_url(
-                    season["id"], "poster", season["poster_file"],
-                    fallback_version=f"season-{season['season_number']}",
+                    season[0], "poster", season[1], fallback_version=season[2],
                 ))
         if len(mosaic) == 4:
             break
-    # Keep the four-tile layout complete when one of the titles has no
-    # individual artwork. A collection's own poster is a useful last resort.
-    collection = connection.execute(
-        "SELECT poster_file FROM catalog_nodes WHERE id=?", (collection_id,),
-    ).fetchone()
-    if len(items) <= 4 and len(mosaic) < 4 and collection and collection["poster_file"]:
-        mosaic.append(_artwork_url(collection_id, "poster", collection["poster_file"]))
     single_poster_url = None
     if len(items) == 1:
         item = items[0]
         poster_node_id = item["id"] if item["poster_file"] else None
         poster_filename = item["poster_file"]
         fallback_version = ""
-        inherited = None
         if poster_node_id is None and item["kind"] == "series":
-            season = connection.execute(
-                """SELECT id, season_number, poster_file FROM catalog_nodes
-                   WHERE parent_id=? AND kind='season' AND available=1
-                   ORDER BY season_number LIMIT 1""",
-                (item["id"],),
-            ).fetchone()
+            season = _series_fallback_poster(connection, item["id"])
             if season:
-                poster_node_id = season["id"]
-                poster_filename = season["poster_file"]
-                fallback_version = f"season-{season['season_number']}"
-        if poster_node_id is None:
-            inherited = _inherited_collection_value(connection, item["parent_id"], "poster_file")
-            if inherited:
-                poster_node_id = inherited[0]
-                poster_filename = inherited[1]
+                poster_node_id, poster_filename, fallback_version = season
         if poster_node_id:
             if poster_node_id == item["id"]:
                 poster_filename = item["poster_file"]
@@ -470,18 +452,19 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     node["genres"] = genres
     poster_file = node.get("poster_file")
     collection_artwork = _collection_artwork(connection, node["id"]) if node["kind"] == "collection" else None
-    inherited_poster = None
-    if not poster_file and node["kind"] != "season":
-        inherited_poster = _inherited_collection_value(connection, node.get("parent_id"), "poster_file")
     single_item_poster = collection_artwork["single_item_poster_url"] if collection_artwork else None
-    node["poster_available"] = bool(poster_file or single_item_poster or inherited_poster) or node["kind"] == "season"
+    series_poster = _series_fallback_poster(connection, node["id"]) \
+        if not poster_file and node["kind"] == "series" else None
+    node["poster_available"] = bool(poster_file or single_item_poster or series_poster) or node["kind"] == "season"
     node["poster_is_assigned"] = bool(poster_file)
     if poster_file:
         node["poster_url"] = _artwork_url(node["id"], "poster", poster_file)
     elif single_item_poster:
         node["poster_url"] = single_item_poster
-    elif inherited_poster:
-        node["poster_url"] = _artwork_url(inherited_poster[0], "poster", inherited_poster[1])
+    elif series_poster:
+        node["poster_url"] = _artwork_url(
+            series_poster[0], "poster", series_poster[1], fallback_version=series_poster[2],
+        )
     else:
         node["poster_url"] = None
     node["backdrop_url"] = (
@@ -521,17 +504,20 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     ).fetchall()
     node["children"] = []
     for child in child_rows:
-        inherited = None
-        if not child["poster_file"] and child["kind"] != "season":
-            inherited = _inherited_collection_value(connection, child["parent_id"], "poster_file")
-        available = bool(child["poster_file"] or inherited) or child["kind"] == "season"
-        poster_node_id = child["id"] if child["poster_file"] else (inherited[0] if inherited else child["id"])
+        child_series_poster = _series_fallback_poster(connection, child["id"]) \
+            if not child["poster_file"] and child["kind"] == "series" else None
+        available = bool(child["poster_file"] or child_series_poster) or child["kind"] == "season"
+        poster_node_id = child["id"] if child["poster_file"] else (
+            child_series_poster[0] if child_series_poster else child["id"])
+        poster_filename = child["poster_file"] or (
+            child_series_poster[1] if child_series_poster else None)
         child_payload = {"id": child["id"], "kind": child["kind"],
              "title": child["metadata_title"] or child["title"],
              "season_number": child["season_number"],
              "poster_url": (_artwork_url(poster_node_id, "poster",
-                                          child["poster_file"] or (inherited[1] if inherited else None),
-                                          fallback_version=f"season-{child['season_number']}")
+                                          poster_filename,
+                                          fallback_version=(child_series_poster[2]
+                                              if child_series_poster else f"season-{child['season_number']}"))
                             if available else None),
              "poster_available": available,
              "poster_is_assigned": bool(child["poster_file"])}
