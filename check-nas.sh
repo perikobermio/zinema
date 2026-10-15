@@ -20,9 +20,6 @@ set -a
 . "$ENV_FILE"
 set +a
 
-[ -n "${ADMIN_TOKEN:-}" ] || fail "ADMIN_TOKEN está vacío en .env."
-[ "$ADMIN_TOKEN" != "replace-this-with-a-long-random-secret" ] || \
-    fail "Cambia ADMIN_TOKEN en .env por un secreto propio."
 [ -n "${MOVIES_PATH:-}" ] || fail "Falta MOVIES_PATH en .env."
 [ -n "${SERIES_PATH:-}" ] || fail "Falta SERIES_PATH en .env."
 [ -d "$MOVIES_PATH" ] || fail "No existe la carpeta de películas: $MOVIES_PATH"
@@ -37,5 +34,5 @@ cd "$PROJECT_DIR"
 docker compose config -q || fail "La configuración de Docker Compose no es válida."
 
 printf 'OK: Docker está activo y Compose v2 está disponible.\n'
-printf 'OK: .env contiene token y las dos rutas existen y se pueden leer.\n'
+printf 'OK: .env contiene las rutas y las dos bibliotecas existen y se pueden leer.\n'
 printf 'OK: la configuración de Docker Compose es válida.\n'

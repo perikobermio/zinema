@@ -12,7 +12,7 @@ fail() {
 
 [ "$#" -le 1 ] || fail "Uso: $0 [ID_DEL_TRABAJO]"
 command -v curl >/dev/null 2>&1 || fail "Falta curl."
-[ -f "$PROJECT_DIR/.env" ] || fail "No existe $PROJECT_DIR/.env."
+[ -n "${DEVICE_TOKEN:-}" ] || fail "Define DEVICE_TOKEN con un token de una sesión administradora."
 
 job_id=${1:-}
 if [ -n "$job_id" ]; then
@@ -25,17 +25,12 @@ else
     endpoint="$API_BASE_URL/api/v1/admin/sync"
 fi
 
-set -a
-. "$PROJECT_DIR/.env"
-set +a
-[ -n "${ADMIN_TOKEN:-}" ] || fail "ADMIN_TOKEN está vacío en .env."
-
-if response=$(printf 'Authorization: Bearer %s\n' "$ADMIN_TOKEN" | \
+if response=$(printf 'Authorization: Bearer %s\n' "$DEVICE_TOKEN" | \
     curl --silent --show-error --fail-with-body --max-time 30 \
     --header @- "$endpoint"); then
-    unset ADMIN_TOKEN
+    unset DEVICE_TOKEN
 else
-    unset ADMIN_TOKEN
+    unset DEVICE_TOKEN
     [ -n "$response" ] && printf '%s\n' "$response" >&2
     fail "No se pudo consultar el estado. Comprueba la URL, el token y que el servidor esté activo."
 fi

@@ -18,6 +18,7 @@ from uuid import uuid4
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 import httpx
 from pydantic import BaseModel, Field
+from pwdlib import PasswordHash
 from starlette.responses import FileResponse, Response, StreamingResponse
 
 from app.catalog import scan_catalog
@@ -30,8 +31,6 @@ MEDIA_ROOTS = {
     "series": Path(os.getenv("SERIES_ROOT", "/library/series")).resolve(),
 }
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/zinema.sqlite3"))
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
-CLIENT_API_TOKEN = os.getenv("CLIENT_API_TOKEN", "")
 TMDB_ACCESS_TOKEN = os.getenv("TMDB_ACCESS_TOKEN", "")
 TMDB_KEY = os.getenv("TMDB_KEY", "") if not TMDB_ACCESS_TOKEN else ""
 TMDB_CONFIGURED = bool(TMDB_ACCESS_TOKEN or TMDB_KEY)
@@ -110,9 +109,18 @@ class UserProfileRequest(BaseModel):
     avatar: str = Field(default="generic:0", max_length=1500)
 
 
-class DevicePairRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
+class AccountCredentials(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=256)
+    device_name: str = Field(default="Zinema client", min_length=1, max_length=120)
     device_id: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+class AccountCreateRequest(AccountCredentials):
+    is_admin: bool = False
+
+
+password_hash = PasswordHash.recommended()
 
 
 def database() -> sqlite3.Connection:
@@ -211,6 +219,7 @@ def database() -> sqlite3.Connection:
     connection.execute(
         """CREATE TABLE IF NOT EXISTS user_profiles (
                id TEXT PRIMARY KEY,
+               user_id TEXT,
                name TEXT NOT NULL,
                avatar TEXT NOT NULL DEFAULT 'generic:0',
                created_at TEXT NOT NULL,
@@ -219,8 +228,11 @@ def database() -> sqlite3.Connection:
            )"""
     )
     profile_columns = {row["name"] for row in connection.execute("PRAGMA table_info(user_profiles)")}
+    if "user_id" not in profile_columns:
+        connection.execute("ALTER TABLE user_profiles ADD COLUMN user_id TEXT")
     if "deleted" not in profile_columns:
         connection.execute("ALTER TABLE user_profiles ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_profiles_user ON user_profiles(user_id, deleted)")
     connection.execute(
         """CREATE TABLE IF NOT EXISTS profile_state (
                profile_id TEXT PRIMARY KEY,
@@ -230,8 +242,19 @@ def database() -> sqlite3.Connection:
            )"""
     )
     connection.execute(
+        """CREATE TABLE IF NOT EXISTS accounts (
+               id TEXT PRIMARY KEY,
+               email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+               password_hash TEXT NOT NULL,
+               is_admin INTEGER NOT NULL DEFAULT 0,
+               created_at TEXT NOT NULL,
+               disabled INTEGER NOT NULL DEFAULT 0
+           )"""
+    )
+    connection.execute(
         """CREATE TABLE IF NOT EXISTS client_devices (
                id TEXT PRIMARY KEY,
+               user_id TEXT,
                name TEXT NOT NULL,
                token_hash TEXT NOT NULL UNIQUE,
                created_at TEXT NOT NULL,
@@ -239,23 +262,10 @@ def database() -> sqlite3.Connection:
                revoked INTEGER NOT NULL DEFAULT 0
            )"""
     )
+    device_columns = {row["name"] for row in connection.execute("PRAGMA table_info(client_devices)")}
+    if "user_id" not in device_columns:
+        connection.execute("ALTER TABLE client_devices ADD COLUMN user_id TEXT")
     return connection
-
-
-def require_admin(authorization: Annotated[str | None, Header()] = None) -> None:
-    if not ADMIN_TOKEN:
-        raise HTTPException(status_code=503, detail="Admin token is not configured")
-    scheme, _, token = (authorization or "").partition(" ")
-    if scheme.lower() != "bearer" or not secrets.compare_digest(token, ADMIN_TOKEN):
-        raise HTTPException(status_code=401, detail="Invalid bearer token")
-
-
-def require_client_pairing(authorization: Annotated[str | None, Header()] = None) -> None:
-    if not CLIENT_API_TOKEN:
-        raise HTTPException(status_code=503, detail="Client API token is not configured")
-    scheme, _, token = (authorization or "").partition(" ")
-    if scheme.lower() != "bearer" or not secrets.compare_digest(token, CLIENT_API_TOKEN):
-        raise HTTPException(status_code=401, detail="Invalid device pairing key")
 
 
 def require_client(authorization: Annotated[str | None, Header()] = None) -> str:
@@ -265,7 +275,9 @@ def require_client(authorization: Annotated[str | None, Header()] = None) -> str
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     with closing(database()) as connection:
         row = connection.execute(
-            "SELECT id FROM client_devices WHERE token_hash=? AND revoked=0", (token_hash,),
+            """SELECT d.id FROM client_devices d JOIN accounts a ON a.id=d.user_id
+               WHERE d.token_hash=? AND d.revoked=0 AND a.disabled=0""",
+            (token_hash,),
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=401, detail="Invalid or revoked device token")
@@ -273,6 +285,45 @@ def require_client(authorization: Annotated[str | None, Header()] = None) -> str
                            (datetime.now(timezone.utc).isoformat(), row["id"]))
         connection.commit()
         return row["id"]
+
+
+def require_admin(device_id: Annotated[str, Depends(require_client)]) -> str:
+    with closing(database()) as connection:
+        row = connection.execute(
+            """SELECT a.id FROM client_devices d JOIN accounts a ON a.id=d.user_id
+               WHERE d.id=? AND d.revoked=0 AND a.disabled=0 AND a.is_admin=1""",
+            (device_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=403, detail="Administrator account required")
+    return device_id
+
+
+def account_for_device(device_id: str) -> str:
+    with closing(database()) as connection:
+        row = connection.execute(
+            "SELECT user_id FROM client_devices WHERE id=? AND revoked=0", (device_id,),
+        ).fetchone()
+    if row is None or not row["user_id"]:
+        raise HTTPException(status_code=401, detail="Device is not linked to an account")
+    return row["user_id"]
+
+
+def issue_device_token(connection: sqlite3.Connection, user_id: str,
+                       name: str, device_id: str | None) -> dict[str, str]:
+    device_id = device_id or uuid4().hex
+    token = secrets.token_urlsafe(48)
+    now = datetime.now(timezone.utc).isoformat()
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    connection.execute(
+        """INSERT INTO client_devices(id, user_id, name, token_hash, created_at, last_seen_at, revoked)
+           VALUES (?, ?, ?, ?, ?, ?, 0)
+           ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id, name=excluded.name,
+               token_hash=excluded.token_hash, created_at=excluded.created_at,
+               last_seen_at=excluded.last_seen_at, revoked=0""",
+        (device_id, user_id, name.strip(), token_hash, now, now),
+    )
+    return {"device_id": device_id, "token": token}
 
 
 def display_title(path: Path) -> str:
@@ -795,33 +846,92 @@ def get_catalog_version() -> dict[str, str]:
     return {"version": hashlib.sha256(state.encode("utf-8")).hexdigest()}
 
 
-@app.post("/api/v1/auth/devices", dependencies=[Depends(require_client_pairing)])
-def pair_client_device(request: DevicePairRequest) -> dict[str, str]:
-    device_id = request.device_id or uuid4().hex
-    device_token = secrets.token_urlsafe(40)
+def _account_login(credentials: AccountCredentials, register: bool) -> dict[str, str]:
+    email = credentials.email.strip().lower()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        raise HTTPException(status_code=422, detail="A valid email is required")
     now = datetime.now(timezone.utc).isoformat()
-    token_hash = hashlib.sha256(device_token.encode("utf-8")).hexdigest()
     with closing(database()) as connection:
-        connection.execute(
-            """INSERT INTO client_devices(id, name, token_hash, created_at, last_seen_at, revoked)
-               VALUES (?, ?, ?, ?, ?, 0)
-               ON CONFLICT(id) DO UPDATE SET name=excluded.name, token_hash=excluded.token_hash,
-                   created_at=excluded.created_at, last_seen_at=excluded.last_seen_at, revoked=0""",
-            (device_id, request.name.strip(), token_hash, now, now),
-        )
+        row = connection.execute(
+            "SELECT id, password_hash, disabled FROM accounts WHERE email=? COLLATE NOCASE", (email,),
+        ).fetchone()
+        if register:
+            if row is not None:
+                raise HTTPException(status_code=409, detail="An account with this email already exists")
+            user_id = uuid4().hex
+            connection.execute(
+                "INSERT INTO accounts(id, email, password_hash, is_admin, created_at) VALUES (?, ?, ?, 0, ?)",
+                (user_id, email, password_hash.hash(credentials.password), now),
+            )
+        else:
+            if row is None or row["disabled"] or not password_hash.verify(
+                    credentials.password, row["password_hash"]):
+                raise HTTPException(status_code=401, detail="Invalid email or password")
+            user_id = row["id"]
+        result = issue_device_token(connection, user_id, credentials.device_name,
+                                    credentials.device_id)
         connection.commit()
     with PLAYBACK_TICKET_LOCK:
         for ticket, grant in list(PLAYBACK_TICKETS.items()):
-            if grant[2] == device_id:
+            if grant[2] == result["device_id"]:
                 PLAYBACK_TICKETS.pop(ticket, None)
-    return {"device_id": device_id, "token": device_token}
+    return result
+
+
+@app.post("/api/v1/auth/register")
+def register_account(credentials: AccountCredentials) -> dict[str, str]:
+    """Create a standard account and return a device-specific bearer token."""
+    return _account_login(credentials, register=True)
+
+
+@app.post("/api/v1/auth/login")
+def login_account(credentials: AccountCredentials) -> dict[str, str]:
+    """Authenticate an account and issue a revocable token for this installation."""
+    return _account_login(credentials, register=False)
+
+
+@app.get("/api/v1/auth/me")
+def account_info(device_id: Annotated[str, Depends(require_client)]) -> dict[str, object]:
+    with closing(database()) as connection:
+        row = connection.execute(
+            """SELECT a.id, a.email, a.is_admin, a.created_at FROM accounts a
+               JOIN client_devices d ON d.user_id=a.id WHERE d.id=?""", (device_id,),
+        ).fetchone()
+        count = connection.execute(
+            "SELECT COUNT(*) AS n FROM user_profiles WHERE user_id=? AND deleted=0",
+            (row["id"],),
+        ).fetchone()["n"] if row else 0
+    if row is None:
+        raise HTTPException(status_code=401, detail="Account not found")
+    return {"id": row["id"], "email": row["email"], "is_admin": bool(row["is_admin"]),
+            "profile_count": count, "created_at": row["created_at"]}
+
+
+@app.post("/api/v1/admin/accounts", dependencies=[Depends(require_admin)])
+def create_account(request: AccountCreateRequest) -> dict[str, object]:
+    email = request.email.strip().lower()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        raise HTTPException(status_code=422, detail="A valid email is required")
+    now = datetime.now(timezone.utc).isoformat()
+    user_id = uuid4().hex
+    with closing(database()) as connection:
+        try:
+            connection.execute(
+                "INSERT INTO accounts(id, email, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, email, password_hash.hash(request.password), int(request.is_admin), now),
+            )
+            connection.commit()
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="An account with this email already exists") from exc
+    return {"id": user_id, "email": email, "is_admin": request.is_admin, "created_at": now}
 
 
 @app.get("/api/v1/admin/devices", dependencies=[Depends(require_admin)])
 def list_client_devices() -> list[dict[str, object]]:
     with closing(database()) as connection:
         rows = connection.execute(
-            "SELECT id, name, created_at, last_seen_at, revoked FROM client_devices ORDER BY created_at"
+            """SELECT d.id, d.name, d.created_at, d.last_seen_at, d.revoked, a.email
+               FROM client_devices d LEFT JOIN accounts a ON a.id=d.user_id ORDER BY d.created_at"""
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -838,11 +948,13 @@ def revoke_client_device(device_id: str) -> dict[str, bool]:
     return {"revoked": cursor.rowcount > 0}
 
 
-@app.get("/api/v1/profiles", dependencies=[Depends(require_client)])
-def list_profiles() -> list[dict]:
+@app.get("/api/v1/profiles")
+def list_profiles(device_id: Annotated[str, Depends(require_client)]) -> list[dict]:
+    user_id = account_for_device(device_id)
     with closing(database()) as connection:
         rows = connection.execute(
-            "SELECT id, name, avatar, created_at, updated_at, deleted FROM user_profiles ORDER BY created_at, id"
+            """SELECT id, name, avatar, created_at, updated_at, deleted FROM user_profiles
+               WHERE user_id=? ORDER BY created_at, id""", (user_id,),
         ).fetchall()
     result = []
     for row in rows:
@@ -852,42 +964,53 @@ def list_profiles() -> list[dict]:
     return result
 
 
-@app.post("/api/v1/profiles", dependencies=[Depends(require_client)])
-def save_profile(profile: UserProfileRequest) -> dict:
+@app.post("/api/v1/profiles")
+def save_profile(profile: UserProfileRequest,
+                 device_id: Annotated[str, Depends(require_client)]) -> dict:
+    user_id = account_for_device(device_id)
     now = datetime.now(timezone.utc).isoformat()
     with closing(database()) as connection:
         connection.execute(
-            """INSERT INTO user_profiles(id, name, avatar, created_at, updated_at, deleted)
-               VALUES (?, ?, ?, ?, ?, 0)
+            """INSERT INTO user_profiles(id, user_id, name, avatar, created_at, updated_at, deleted)
+               VALUES (?, ?, ?, ?, ?, ?, 0)
                ON CONFLICT(id) DO UPDATE SET name=excluded.name, avatar=excluded.avatar,
-                                              updated_at=excluded.updated_at, deleted=0""",
-            (profile.id, profile.name.strip(), profile.avatar, now, now),
+                   updated_at=excluded.updated_at, deleted=0 WHERE user_profiles.user_id=excluded.user_id""",
+            (profile.id, user_id, profile.name.strip(), profile.avatar, now, now),
         )
         connection.commit()
         row = connection.execute(
-            "SELECT id, name, avatar, created_at, updated_at, deleted FROM user_profiles WHERE id=?",
-            (profile.id,),
+            "SELECT id, name, avatar, created_at, updated_at, deleted FROM user_profiles WHERE id=? AND user_id=?",
+            (profile.id, user_id),
         ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=409, detail="Profile belongs to another account")
     return dict(row)
 
 
-@app.delete("/api/v1/profiles/{profile_id}", dependencies=[Depends(require_client)])
-def delete_profile(profile_id: str) -> dict[str, bool]:
+@app.delete("/api/v1/profiles/{profile_id}")
+def delete_profile(profile_id: str, device_id: Annotated[str, Depends(require_client)]) -> dict[str, bool]:
+    user_id = account_for_device(device_id)
     with closing(database()) as connection:
+        owned = connection.execute(
+            "SELECT 1 FROM user_profiles WHERE id=? AND user_id=?", (profile_id, user_id),
+        ).fetchone()
+        if owned is None:
+            raise HTTPException(status_code=404, detail="Profile not found")
         connection.execute("DELETE FROM profile_state WHERE profile_id=?", (profile_id,))
         cursor = connection.execute(
-            "UPDATE user_profiles SET deleted=1, updated_at=? WHERE id=?",
-            (datetime.now(timezone.utc).isoformat(), profile_id),
+            "UPDATE user_profiles SET deleted=1, updated_at=? WHERE id=? AND user_id=?",
+            (datetime.now(timezone.utc).isoformat(), profile_id, user_id),
         )
         connection.commit()
     return {"deleted": cursor.rowcount > 0}
 
 
-@app.get("/api/v1/profiles/{profile_id}/state", dependencies=[Depends(require_client)])
-def get_profile_state(profile_id: str) -> dict:
+@app.get("/api/v1/profiles/{profile_id}/state")
+def get_profile_state(profile_id: str, device_id: Annotated[str, Depends(require_client)]) -> dict:
+    user_id = account_for_device(device_id)
     with closing(database()) as connection:
         exists = connection.execute(
-            "SELECT 1 FROM user_profiles WHERE id=? AND deleted=0", (profile_id,),
+            "SELECT 1 FROM user_profiles WHERE id=? AND user_id=? AND deleted=0", (profile_id, user_id),
         ).fetchone()
         if exists is None:
             raise HTTPException(status_code=404, detail="Profile not found")
@@ -901,13 +1024,15 @@ def get_profile_state(profile_id: str) -> dict:
             "revision": row["revision"], "updated_at": row["updated_at"]}
 
 
-@app.put("/api/v1/profiles/{profile_id}/state", dependencies=[Depends(require_client)])
-def save_profile_state(profile_id: str, state: dict[str, object]) -> dict:
+@app.put("/api/v1/profiles/{profile_id}/state")
+def save_profile_state(profile_id: str, state: dict[str, object],
+                       device_id: Annotated[str, Depends(require_client)]) -> dict:
+    user_id = account_for_device(device_id)
     now = datetime.now(timezone.utc).isoformat()
     state_json = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
     with closing(database()) as connection:
         exists = connection.execute(
-            "SELECT 1 FROM user_profiles WHERE id=? AND deleted=0", (profile_id,),
+            "SELECT 1 FROM user_profiles WHERE id=? AND user_id=? AND deleted=0", (profile_id, user_id),
         ).fetchone()
         if exists is None:
             raise HTTPException(status_code=404, detail="Profile not found")

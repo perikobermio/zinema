@@ -33,7 +33,7 @@ Requisitos: Docker Engine con Docker Compose v2, `curl` y acceso de lectura del 
    nano .env
    ```
 
-2. Configura `MOVIES_PATH`, `SERIES_PATH`, un `ADMIN_TOKEN` y un `CLIENT_API_TOKEN` aleatorios. `CLIENT_API_TOKEN` solo se usa para vincular un dispositivo desde Administración; el servidor entrega después una credencial revocable exclusiva para ese dispositivo. Para TMDb puedes guardar la **API Key v3** en `TMDB_KEY` o el **API Read Access Token** en `TMDB_ACCESS_TOKEN`; basta con configurar uno. No subas estas credenciales a Git. `TMDB_LANGUAGE` controla el idioma preferido de los resultados; por defecto es `es-ES`.
+2. Configura `MOVIES_PATH` y `SERIES_PATH`. Para TMDb puedes guardar la **API Key v3** en `TMDB_KEY` o el **API Read Access Token** en `TMDB_ACCESS_TOKEN`; basta con configurar uno. No subas estas credenciales a Git. `TMDB_LANGUAGE` controla el idioma preferido de los resultados; por defecto es `es-ES`.
 
 3. Valida las rutas y arranca el servidor:
 
@@ -46,6 +46,16 @@ Requisitos: Docker Engine con Docker Compose v2, `curl` y acceso de lectura del 
 
 El NAS y SQLite se montan de forma persistente en `./data`; las carpetas de medios se montan en solo lectura. La API está en el puerto `8180` del host.
 
+### Crear la cuenta administradora inicial
+
+Tras reconstruir y arrancar el servidor en el NAS, ejecuta:
+
+```sh
+./create-admin.sh
+```
+
+El script solicita email y contraseña sin mostrar esta última. Crea o promueve la cuenta administradora y vincula a ella los perfiles existentes que aún no tenían propietario; conserva sus IDs y el estado sincronizado de cada perfil. No guarda la contraseña en `.env` ni en el repositorio. Ejecuta este paso una vez después de actualizar el servidor para migrar la base de datos persistente.
+
 ## Lanzar la sincronización inicial
 
 La sincronización vuelve a escanear las carpetas y busca metadata de películas y series en TMDb. Se ejecuta como trabajo en segundo plano:
@@ -54,15 +64,12 @@ La sincronización vuelve a escanear las carpetas y busca metadata de películas
 ./start-import.sh
 ```
 
-El script lee `ADMIN_TOKEN` de `.env`, inicia el trabajo y muestra su ID. Para usar una URL distinta, ejecuta `API_BASE_URL=https://zinema.tudominio.com ./start-import.sh`. Consulta el progreso con la URL y el comando que imprime el script, o con:
+El script usa `DEVICE_TOKEN` del entorno (debe pertenecer a una sesión administradora), inicia el trabajo y muestra su ID. Para usar una URL distinta, ejecuta `API_BASE_URL=https://zinema.tudominio.com ./start-import.sh`. Consulta el progreso con la URL y el comando que imprime el script, o con:
 
 ```sh
-set -a
-. ./.env
-set +a
 curl http://localhost:8180/api/v1/admin/sync/ID_DEL_TRABAJO \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-unset ADMIN_TOKEN
+  -H "Authorization: Bearer $DEVICE_TOKEN"
+unset DEVICE_TOKEN
 ```
 
 También puedes consultar el último trabajo o uno concreto con el script de estado:
@@ -78,32 +85,33 @@ El estado pasa por `scan` y `metadata:N`; al terminar devuelve cuántos archivos
 
 ```sh
 curl http://localhost:8180/api/v1/admin/metadata/review \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
+  -H "Authorization: Bearer $DEVICE_TOKEN"
 ```
 
 Para aceptar una coincidencia, envía el `tmdb_id` elegido:
 
 ```sh
 curl -X POST 'http://localhost:8180/api/v1/admin/catalog/ID_DEL_NODO/match?tmdb_id=ID_TMDB' \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
+  -H "Authorization: Bearer $DEVICE_TOKEN"
 ```
 
 Tras una sincronización inicial completada, el servidor vuelve a escanear diariamente. Solo consulta TMDb para entradas nuevas o cuya metadata lleve 30 días sin actualizar. Puedes cambiar el intervalo y el tamaño de lote con `TMDB_SYNC_INTERVAL_HOURS` y `TMDB_SYNC_BATCH_SIZE`.
 
 ## API para el cliente
 
-Las rutas del catálogo requieren el token de un dispositivo vinculado. Las rutas `/api/v1/admin` requieren `ADMIN_TOKEN`; `/health` permanece pública para comprobar conectividad.
+Las cuentas se crean con email y contraseña. La pantalla Administración del cliente permite iniciar sesión o registrar una cuenta. En un registro abierto, la cuenta nueva tiene permisos normales. La cuenta creada con `create-admin.sh` puede acceder además a las rutas de administración y crear otras cuentas.
 
-En Administración del cliente, introduce una vez el `CLIENT_API_TOKEN` del NAS en **Vincular este dispositivo**. El servidor entrega una credencial independiente para esa instalación y no vuelve a guardar la clave de vinculación en el teléfono. Los perfiles, catálogo, imágenes y operaciones de metadata usan esa credencial.
+El login y el registro emiten un token aleatorio revocable para esa instalación. Android lo cifra con Android Keystore; el servidor guarda solamente su hash. Las contraseñas se guardan con Argon2id. Las rutas de datos requieren `Authorization: Bearer <token>`; `/health` queda pública para comprobar conectividad, y registro/login son los únicos endpoints de cuenta sin sesión. VLC recibe un ticket de reproducción temporal después de que la app se autentique.
 
-La vinculación también puede hacerse por API. La respuesta contiene el token individual del dispositivo; guárdalo en un gestor seguro y no lo publiques:
+Ejemplo de login desde terminal (no guardes la contraseña en el historial del shell):
 
 ```sh
-curl -X POST 'http://localhost:8180/api/v1/auth/devices' \
-  -H "Authorization: Bearer $CLIENT_API_TOKEN" \
+curl -X POST 'http://localhost:8180/api/v1/auth/login' \
   -H 'Content-Type: application/json' \
-  -d '{"name":"Cliente Android"}'
+  -d '{"email":"tu@email","password":"...","device_name":"Terminal"}'
 ```
+
+`POST /api/v1/auth/register` acepta el mismo cuerpo para crear una cuenta estándar. `GET /api/v1/auth/me` devuelve la cuenta y su número de perfiles. Los perfiles y su estado de reproducción pertenecen a la cuenta, de modo que cualquier instalación que inicie sesión con ella recibe los mismos perfiles.
 
 El catálogo se navega por nivel, usando `parent_id` para abrir una colección, serie o temporada:
 
@@ -115,7 +123,7 @@ curl 'http://localhost:8180/api/v1/catalog?library=series&parent_id=ID_DEL_NODO'
 curl 'http://localhost:8180/api/v1/catalog/ID_DEL_NODO' -H "Authorization: Bearer $DEVICE_TOKEN"
 ```
 
-`DEVICE_TOKEN` es la credencial emitida al vincular la app; no es `CLIENT_API_TOKEN` ni `ADMIN_TOKEN`.
+`DEVICE_TOKEN` es el token emitido al iniciar sesión en una instalación.
 
 Al reintentar metadata desde el cliente, `POST /api/v1/catalog/ID_DEL_NODO/metadata/candidates` busca coincidencias TMDb para validarlas antes de guardarlas. `GET /api/v1/catalog/ID_DEL_NODO/metadata/candidate/ID_TMDB` carga sus datos completos. La edición manual se guarda con `POST /api/v1/catalog/ID_DEL_NODO/metadata/manual`. Para buscar imágenes se usa `GET /api/v1/catalog/ID_DEL_NODO/metadata/images?q=TITULO`; devuelve hasta diez imágenes TMDb.
 
@@ -133,12 +141,12 @@ Cada nodo incluye `kind`, `display_title`, `overview`, `year`, `genres`, `poster
 
 `/api/v1/items` sigue disponible como lista plana y también requiere `DEVICE_TOKEN`. Evita guardar rutas `/api/v1/playback/...` en logs de acceso del reverse proxy, porque contienen permisos temporales de reproducción.
 
-Para consultar o revocar dispositivos vinculados, usa `ADMIN_TOKEN`:
+Para consultar o revocar dispositivos vinculados, usa el token de un dispositivo conectado con la cuenta administradora:
 
 ```sh
-curl http://localhost:8180/api/v1/admin/devices -H "Authorization: Bearer $ADMIN_TOKEN"
+curl http://localhost:8180/api/v1/admin/devices -H "Authorization: Bearer $DEVICE_TOKEN"
 curl -X DELETE http://localhost:8180/api/v1/admin/devices/ID_DEL_DISPOSITIVO \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
+  -H "Authorization: Bearer $DEVICE_TOKEN"
 ```
 
 ## Cliente Android
@@ -155,7 +163,7 @@ El archivo queda en `client/build/outputs/apk/debug/zinema-client-debug.apk`. El
 
 TMDb proporciona metadata e imágenes para este proyecto. La aplicación debe mostrar la atribución requerida por TMDb: **“This product uses the TMDB API but is not endorsed or certified by TMDB.”** Si el uso pasa a ser comercial, revisa las condiciones y licencia con TMDb. Zinema conserva los IDs de IMDb que TMDb devuelva, pero no consulta ni extrae datos directamente de IMDb.
 
-Todas las rutas `/api/v1` requieren credenciales salvo `/health`: el cliente usa un token individual revocable, la vinculación requiere `CLIENT_API_TOKEN` y las operaciones administrativas requieren `ADMIN_TOKEN`. Las rutas de perfiles también usan la credencial del dispositivo. Mantén HTTPS y, si es posible, limita además el acceso a través de una VPN. Las URLs temporales de reproducción deben excluirse de los logs del proxy.
+Todas las rutas `/api/v1` que consultan datos requieren un token válido salvo `/health`; registro y login son públicos para iniciar sesión. Cada cliente usa un token individual revocable y las operaciones administrativas verifican el rol de la cuenta asociada. Mantén HTTPS y, si es posible, limita además el acceso a través de una VPN. Las URLs temporales de reproducción deben excluirse de los logs del proxy.
 
 ## Comprobaciones
 

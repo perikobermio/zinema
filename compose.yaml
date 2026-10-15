@@ -9,8 +9,6 @@ services:
       MOVIES_ROOT: /library/movies
       SERIES_ROOT: /library/series
       DATABASE_PATH: /data/zinema.sqlite3
-      ADMIN_TOKEN: ${ADMIN_TOKEN:?Set ADMIN_TOKEN in .env}
-      CLIENT_API_TOKEN: ${CLIENT_API_TOKEN:?Set CLIENT_API_TOKEN in .env}
       TMDB_ACCESS_TOKEN: ${TMDB_ACCESS_TOKEN:-}
       TMDB_KEY: ${TMDB_KEY:-}
       TMDB_LANGUAGE: ${TMDB_LANGUAGE:-es-ES}

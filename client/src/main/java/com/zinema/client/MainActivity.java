@@ -3223,6 +3223,20 @@ public class MainActivity extends Activity {
             case "Configuración del servidor": return "Zerbitzariaren ezarpenak";
             case "Nombre del servidor": return "Zerbitzariaren izena";
             case "Dirección del servidor": return "Zerbitzariaren helbidea";
+            case "Cuenta Zinema": return "Zinema kontua";
+            case "Email": return "Posta elektronikoa";
+            case "Contraseña": return "Pasahitza";
+            case "Inicia sesión para vincular esta instalación a tu cuenta. Cada dispositivo recibe su propio token.":
+                return "Hasi saioa instalazio hau zure kontuarekin lotzeko. Gailu bakoitzak bere tokena jasoko du.";
+            case "Crear cuenta": return "Kontua sortu";
+            case "Iniciando sesión…": return "Saioa hasten…";
+            case "Creando cuenta…": return "Kontua sortzen…";
+            case "Introduce email y contraseña para iniciar sesión.":
+                return "Sartu posta elektronikoa eta pasahitza saioa hasteko.";
+            case "Indica un email y una contraseña de al menos 8 caracteres.":
+                return "Sartu posta elektronikoa eta gutxienez 8 karaktereko pasahitza.";
+            case "Revisa la dirección y el nombre del servidor.":
+                return "Egiaztatu zerbitzariaren helbidea eta izena.";
             case "Idioma de la aplicación": return "Aplikazioaren hizkuntza";
             case "Probar conexión": return "Konexioa probatu";
             case "Guardar y conectar": return "Gorde eta konektatu";
@@ -3554,7 +3568,7 @@ public class MainActivity extends Activity {
         showingAdmin = true;
         showingDetail = false;
         buildShell("Administración");
-        renderAdminWindow(serverName, server);
+        renderAdminWindow(serverName, server, prefs.getString("account_email", ""));
     }
 
     EditText settingsField(String value, String hint, boolean uri) {
@@ -3576,7 +3590,7 @@ public class MainActivity extends Activity {
         renderAdminWindow(initialName, initialServer, "");
     }
 
-    void renderAdminWindow(String initialName, String initialServer, String initialPairingKey) {
+    void renderAdminWindow(String initialName, String initialServer, String initialEmail) {
         content.removeAllViews();
         LinearLayout screen = new LinearLayout(this);
         screen.setOrientation(LinearLayout.VERTICAL);
@@ -3599,15 +3613,20 @@ public class MainActivity extends Activity {
         serverCard.addView(urlLabel, urlP);
         EditText urlInput = settingsField(initialServer, "https://servidor", true);
         addSettingInput(serverCard, urlInput);
-        TextView apiTokenLabel = label(t("Vincular este dispositivo"), 13, MUTED, true);
+        TextView apiTokenLabel = label(t("Cuenta Zinema"), 13, MUTED, true);
         LinearLayout.LayoutParams apiTokenLabelParams = new LinearLayout.LayoutParams(-1, -2);
         apiTokenLabelParams.topMargin = d(16);
         serverCard.addView(apiTokenLabel, apiTokenLabelParams);
-        EditText pairingKeyInput = settingsField(initialPairingKey,
-                "CLIENT_API_TOKEN", false);
-        pairingKeyInput.setTransformationMethod(PasswordTransformationMethod.getInstance());
-        addSettingInput(serverCard, pairingKeyInput);
-        TextView apiTokenHint = label(t("Introduce la clave del NAS; se guardará una credencial exclusiva para este dispositivo."),
+        EditText emailInput = settingsField(initialEmail, "Email", false);
+        emailInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS);
+        addSettingInput(serverCard, emailInput);
+        EditText passwordInput = settingsField("", "Contraseña", false);
+        passwordInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        passwordInput.setTransformationMethod(PasswordTransformationMethod.getInstance());
+        addSettingInput(serverCard, passwordInput);
+        TextView apiTokenHint = label(t("Inicia sesión para vincular esta instalación a tu cuenta. Cada dispositivo recibe su propio token."),
                 12, MUTED, false);
         LinearLayout.LayoutParams apiTokenHintParams = new LinearLayout.LayoutParams(-1, -2);
         apiTokenHintParams.topMargin = d(6);
@@ -3623,6 +3642,10 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams saveP = new LinearLayout.LayoutParams(0, d(48), 1);
         saveP.leftMargin = d(9);
         connectButtons.addView(save, saveP);
+        Button register = actionButton("Crear cuenta", false);
+        LinearLayout.LayoutParams registerP = new LinearLayout.LayoutParams(-1, d(44));
+        registerP.topMargin = d(8);
+        serverCard.addView(register, registerP);
         TextView status = label(t("Servidor actual") + ": " + serverName, 12, MUTED, false);
         LinearLayout.LayoutParams statusP = new LinearLayout.LayoutParams(-1, -2);
         statusP.topMargin = d(12);
@@ -3645,8 +3668,8 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams basqueP = new LinearLayout.LayoutParams(0, d(46), 1);
         basqueP.leftMargin = d(9);
         languageButtons.addView(basque, basqueP);
-        spanish.setOnClickListener(v -> changeLanguage("es", nameInput, urlInput, pairingKeyInput));
-        basque.setOnClickListener(v -> changeLanguage("eu", nameInput, urlInput, pairingKeyInput));
+        spanish.setOnClickListener(v -> changeLanguage("es", nameInput, urlInput, emailInput));
+        basque.setOnClickListener(v -> changeLanguage("eu", nameInput, urlInput, emailInput));
 
         TextView attribution = label("This product uses the TMDB API but is not endorsed or certified by TMDB.",
                 11, MUTED, false);
@@ -3686,9 +3709,11 @@ public class MainActivity extends Activity {
             if (value.isEmpty()) { Toast.makeText(this, t("Escribe una URL válida."), Toast.LENGTH_LONG).show(); return; }
             if (name.isEmpty()) { Toast.makeText(this, t("El nombre del servidor no puede estar vacío."), Toast.LENGTH_LONG).show(); return; }
             boolean serverChanged = !server.equals(value);
-            String pairingKey = pairingKeyInput.getText().toString().trim();
-            if (pairingKey.isEmpty() && (clientApiToken().isEmpty() || serverChanged)) {
-                Toast.makeText(this, t("Introduce la clave de vinculación del NAS para este dispositivo."),
+            String email = emailInput.getText().toString().trim();
+            String password = passwordInput.getText().toString();
+            if ((email.isEmpty() || password.isEmpty())
+                    && (clientApiToken().isEmpty() || serverChanged)) {
+                Toast.makeText(this, t("Introduce email y contraseña para iniciar sesión."),
                         Toast.LENGTH_LONG).show();
                 return;
             }
@@ -3704,9 +3729,9 @@ public class MainActivity extends Activity {
             prefs.edit().putString("server", server).putString("server_name", serverName).apply();
             imageCache.evictAll();
             requestedImages.clear();
-            if (!pairingKey.isEmpty()) {
+            if (!email.isEmpty() && !password.isEmpty()) {
                 String currentDeviceId = serverChanged ? "" : prefs.getString("client_device_id", "");
-                pairClientDevice(pairingKey, currentDeviceId);
+                authenticateAccount(email, password, false, currentDeviceId, passwordInput);
             } else {
                 showingAdmin = false;
                 lastProfileSyncMs = 0L;
@@ -3714,27 +3739,50 @@ public class MainActivity extends Activity {
                 synchronizeProfilesFromServer(true);
             }
         });
+        register.setOnClickListener(v -> {
+            String email = emailInput.getText().toString().trim();
+            String password = passwordInput.getText().toString();
+            String value = normalizeServerUrl(urlInput.getText().toString());
+            String name = nameInput.getText().toString().trim();
+            if (email.isEmpty() || password.length() < 8) {
+                Toast.makeText(this, t("Indica un email y una contraseña de al menos 8 caracteres."),
+                        Toast.LENGTH_LONG).show();
+                return;
+            }
+            if (value.isEmpty() || name.isEmpty()) {
+                Toast.makeText(this, t("Revisa la dirección y el nombre del servidor."), Toast.LENGTH_LONG).show();
+                return;
+            }
+            server = value;
+            serverName = name;
+            prefs.edit().putString("server", server).putString("server_name", serverName).apply();
+            authenticateAccount(email, password, true,
+                    prefs.getString("client_device_id", ""), passwordInput);
+        });
     }
 
-    void pairClientDevice(String pairingKey, String currentDeviceId) {
-        Toast.makeText(this, t("Vinculando este dispositivo…"), Toast.LENGTH_SHORT).show();
+    void authenticateAccount(String email, String password, boolean register,
+                             String currentDeviceId, EditText passwordInput) {
+        Toast.makeText(this, register ? t("Creando cuenta…") : t("Iniciando sesión…"), Toast.LENGTH_SHORT).show();
         io.execute(() -> {
             HttpURLConnection connection = null;
             try {
                 JSONObject payload = new JSONObject();
                 String deviceName = (android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL).trim();
-                payload.put("name", deviceName.isEmpty() ? "Android" : deviceName);
+                payload.put("device_name", deviceName.isEmpty() ? "Android" : deviceName);
+                payload.put("email", email);
+                payload.put("password", password);
                 if (currentDeviceId != null && !currentDeviceId.isEmpty()) {
                     payload.put("device_id", currentDeviceId);
                 }
-                connection = (HttpURLConnection) new URL(server + "/api/v1/auth/devices").openConnection();
+                String authPath = register ? "/api/v1/auth/register" : "/api/v1/auth/login";
+                connection = (HttpURLConnection) new URL(server + authPath).openConnection();
                 connection.setRequestMethod("POST");
                 connection.setConnectTimeout(12000);
                 connection.setReadTimeout(20000);
                 connection.setDoOutput(true);
                 connection.setRequestProperty("Accept", "application/json");
                 connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-                connection.setRequestProperty("Authorization", "Bearer " + pairingKey);
                 connection.getOutputStream().write(payload.toString().getBytes(StandardCharsets.UTF_8));
                 int status = connection.getResponseCode();
                 InputStream input = status < 400 ? connection.getInputStream() : connection.getErrorStream();
@@ -3751,9 +3799,15 @@ public class MainActivity extends Activity {
                 if (deviceToken.isEmpty() || deviceId.isEmpty()) {
                     throw new Exception("El servidor no devolvió las credenciales del dispositivo.");
                 }
+                String previousEmail = prefs.getString("account_email", "");
+                if (!previousEmail.isEmpty() && !previousEmail.equalsIgnoreCase(email)) {
+                    clearLocalProfilesForAccountSwitch();
+                }
                 storeClientApiToken(deviceToken);
-                prefs.edit().putString("client_device_id", deviceId).remove("profile_sync_token").apply();
+                prefs.edit().putString("client_device_id", deviceId)
+                        .putString("account_email", email).remove("profile_sync_token").apply();
                 runOnUiThread(() -> {
+                    passwordInput.setText("");
                     showingAdmin = false;
                     lastProfileSyncMs = 0L;
                     loadHome();
@@ -3767,6 +3821,19 @@ public class MainActivity extends Activity {
                 if (connection != null) connection.disconnect();
             }
         });
+    }
+
+    void clearLocalProfilesForAccountSwitch() {
+        SharedPreferences.Editor editor = prefs.edit().remove("profiles_json")
+                .remove("active_profile").remove("profile_deleted_ids");
+        for (String key : prefs.getAll().keySet()) {
+            if (key.startsWith("p:") || key.startsWith("profile_sync_dirty:")
+                    || key.startsWith("profile_metadata_dirty:")
+                    || key.startsWith("profile_sync_revision:")) {
+                editor.remove(key);
+            }
+        }
+        editor.apply();
     }
 
     LinearLayout settingsCard() {
@@ -3790,12 +3857,12 @@ public class MainActivity extends Activity {
     }
 
     void changeLanguage(String language, EditText nameInput, EditText urlInput,
-                        EditText pairingKeyInput) {
+                        EditText emailInput) {
         String name = nameInput.getText().toString();
         String address = urlInput.getText().toString();
-        String pairingKey = pairingKeyInput.getText().toString();
+        String email = emailInput.getText().toString();
         prefs.edit().putString("language", language).apply();
-        renderAdminWindow(name, address, pairingKey);
+        renderAdminWindow(name, address, email);
     }
 
     void renderError(String error) {
