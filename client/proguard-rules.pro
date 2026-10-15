@@ -7,6 +7,9 @@
 -keep public class com.zinema.client.PlayerActivity {
     public <init>();
 }
+-keep public class com.zinema.client.UpdateApkProvider {
+    public <init>();
+}
 
 # WebView calls this JavaScript bridge by its annotated method name.
 -keep public class com.zinema.client.MainActivity$IntroBridge {

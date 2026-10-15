@@ -14,11 +14,19 @@ BUILD_DIR="$CLIENT_DIR/build/release"
 KEYSTORE="$CLIENT_DIR/.release.keystore"
 SIGNING_ENV="$CLIENT_DIR/.release-signing.env"
 OUTPUT="${1:-$REPO_DIR/zinema-prod.apk}"
+VERSION_CODE=${VERSION_CODE:-$(date +%s)}
+VERSION_NAME=${VERSION_NAME:-1.0.$(date -u +%Y%m%d%H%M)}
+UPDATE_MANIFEST="$(dirname -- "$OUTPUT")/zinema-update.json"
 
 fail() {
     printf 'ERROR: %s\n' "$1" >&2
     exit 1
 }
+
+case "$VERSION_CODE" in
+    ''|*[!0-9]*) fail "VERSION_CODE debe ser un entero positivo." ;;
+esac
+[ "$VERSION_CODE" -gt 0 ] && [ "$VERSION_CODE" -le 2100000000 ] || fail "VERSION_CODE debe estar entre 1 y 2100000000."
 
 [ -x "$TOOLS/aapt2" ] || fail "No encuentro aapt2 en $TOOLS."
 [ -x "$TOOLS/zipalign" ] || fail "No encuentro zipalign en $TOOLS."
@@ -47,8 +55,8 @@ python3 "$CLIENT_DIR/generate_server_config.py" "$REPO_DIR/.env" \
     --custom-package com.zinema.client \
     --min-sdk-version 23 \
     --target-sdk-version "$ANDROID_API" \
-    --version-code 32 \
-    --version-name 1.0.0 \
+    --version-code "$VERSION_CODE" \
+    --version-name "$VERSION_NAME" \
     --auto-add-overlay \
     "$BUILD_DIR/resources.zip"
 
@@ -121,6 +129,26 @@ fi
     --out "$OUTPUT" \
     "$BUILD_DIR/aligned.apk"
 "$TOOLS/apksigner" verify --verbose "$OUTPUT"
+python3 - "$OUTPUT" "$UPDATE_MANIFEST" "$VERSION_CODE" "$VERSION_NAME" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+apk = pathlib.Path(sys.argv[1])
+manifest = pathlib.Path(sys.argv[2])
+digest = hashlib.sha256()
+with apk.open("rb") as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+manifest.write_text(json.dumps({
+    "version_code": int(sys.argv[3]),
+    "version_name": sys.argv[4],
+    "sha256": digest.hexdigest(),
+    "size_bytes": apk.stat().st_size,
+}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
 printf 'APK de distribución: %s\n' "$OUTPUT"
+printf 'Manifiesto para publicar: %s\n' "$UPDATE_MANIFEST"
 wc -c "$OUTPUT"
 printf 'Clave de distribución: %s (guarda una copia segura junto con %s)\n' "$KEYSTORE" "$SIGNING_ENV"

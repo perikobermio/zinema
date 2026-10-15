@@ -3,6 +3,12 @@ package com.zinema.client;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.content.ContentProvider;
+import android.content.ContentValues;
+import android.content.pm.PackageManager;
+import android.database.Cursor;
+import android.net.Uri;
+import android.os.ParcelFileDescriptor;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -12,6 +18,8 @@ import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Build;
+import android.provider.Settings;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.text.Editable;
@@ -150,6 +158,9 @@ public class MainActivity extends Activity {
     int metadataEditorReturnScrollY;
     boolean metadataEditorReturnPrepared;
     boolean metadataEditorPreviousBackVisible;
+    boolean updateCheckInProgress;
+    boolean installAfterPermission;
+    int lastPromptedUpdateCode;
     List<JSONObject> movies = new ArrayList<>();
     List<JSONObject> series = new ArrayList<>();
     final Map<String, String> posterByStream = new HashMap<>();
@@ -172,6 +183,7 @@ public class MainActivity extends Activity {
         prefs.edit().remove("profile_sync_token").apply();
         server = trimBase(DEFAULT_SERVER);
         serverName = "Zinema";
+        checkForClientUpdate(true);
         if (!clientApiToken().isEmpty()) {
             verifySavedAccountBeforeStartup();
         } else {
@@ -183,8 +195,9 @@ public class MainActivity extends Activity {
         io.execute(() -> {
             try {
                 JSONObject account = getJson("/api/v1/auth/me");
-                if (!account.optBoolean("is_admin")
-                        && (!account.has("approved") || !account.optBoolean("approved"))) {
+                boolean isAdmin = jsonBoolean(account, "is_admin", false);
+                prefs.edit().putBoolean("account_is_admin", isAdmin).apply();
+                if (!isAdmin && (!account.has("approved") || !jsonBoolean(account, "approved", false))) {
                     runOnUiThread(() -> invalidateSavedAccount("Esta cuenta todavía necesita aprobación de un administrador."));
                     return;
                 }
@@ -207,7 +220,7 @@ public class MainActivity extends Activity {
 
     void invalidateSavedAccount(String message) {
         prefs.edit().remove("client_api_token_enc").remove("client_api_token")
-                .remove("client_device_id").remove("account_email").apply();
+                .remove("client_device_id").remove("account_email").remove("account_is_admin").apply();
         try {
             KeyStore keyStore = KeyStore.getInstance("AndroidKeyStore");
             keyStore.load(null);
@@ -1224,7 +1237,9 @@ public class MainActivity extends Activity {
             PopupMenu menu = new PopupMenu(MainActivity.this, chip);
             menu.getMenu().add(android.view.Menu.NONE, 1, 1, "👤   " + t("Cambiar perfil"));
             menu.getMenu().add(android.view.Menu.NONE, 2, 2, "⚙   " + t("Administración"));
-            menu.getMenu().add(android.view.Menu.NONE, 5, 3, "👥   Gestión de cuentas");
+            if (prefs.getBoolean("account_is_admin", false)) {
+                menu.getMenu().add(android.view.Menu.NONE, 5, 3, "👥   Gestión de cuentas");
+            }
             menu.getMenu().add(android.view.Menu.NONE, 3, 4, "⏻   " + t("Cerrar sesión"));
             menu.getMenu().add(android.view.Menu.NONE, 4, 5, "✕   " + t("Salir"));
             menu.setOnMenuItemClickListener(item -> {
@@ -1258,7 +1273,8 @@ public class MainActivity extends Activity {
             });
         }
         prefs.edit().remove("client_api_token_enc").remove("client_api_token")
-                .remove("client_device_id").remove("account_email").remove("profile_sync_token").apply();
+                .remove("client_device_id").remove("account_email").remove("account_is_admin")
+                .remove("profile_sync_token").apply();
         try {
             KeyStore keyStore = KeyStore.getInstance("AndroidKeyStore");
             keyStore.load(null);
@@ -4377,7 +4393,7 @@ public class MainActivity extends Activity {
         io.execute(() -> {
             try {
                 JSONObject current = getJson("/api/v1/auth/me");
-                if (!current.optBoolean("is_admin")) throw new Exception("Solo los administradores pueden gestionar cuentas.");
+                if (!jsonBoolean(current, "is_admin", false)) throw new Exception("Solo los administradores pueden gestionar cuentas.");
                 String currentAccountId = current.optString("id", "");
                 JSONArray accounts = getArray("/api/v1/admin/accounts");
                 runOnUiThread(() -> {
@@ -4393,10 +4409,11 @@ public class MainActivity extends Activity {
                         String accountId = account.optString("id", "");
                         String username = account.optString("username", "Cuenta");
                         boolean isCurrentAccount = accountId.equals(currentAccountId);
-                        boolean approved = account.optBoolean("approved");
-                        boolean disabled = account.optBoolean("disabled");
-                        boolean isAdmin = account.optBoolean("is_admin");
+                        boolean approved = jsonBoolean(account, "approved", false);
+                        boolean disabled = jsonBoolean(account, "disabled", false);
+                        boolean isAdmin = jsonBoolean(account, "is_admin", false);
                         boolean approvalSatisfied = approved || isAdmin;
+                        boolean canAccess = approvalSatisfied && !disabled;
                         String state = isCurrentAccount ? "Sesión actual"
                                 : (disabled ? "Acceso denegado"
                                 : (!approvalSatisfied ? "Pendiente de aprobación" : "Acceso permitido"));
@@ -4418,43 +4435,31 @@ public class MainActivity extends Activity {
                         actionsParams.topMargin = d(10);
                         card.addView(actions, actionsParams);
                         if (isCurrentAccount) continue;
-                        if (!approvalSatisfied && !disabled) {
-                            Button allow = actionButton("Permitir", true);
-                            actions.addView(allow, new LinearLayout.LayoutParams(0, d(44), 1));
-                            allow.setOnClickListener(v -> confirmAccountChange(username, "Permitir acceso",
+                        Button allow = actionButton("Permitido", canAccess);
+                        actions.addView(allow, new LinearLayout.LayoutParams(0, d(44), 1));
+                        allow.setOnClickListener(v -> {
+                            if (canAccess) return;
+                            confirmAccountChange(username, "Permitir acceso",
                                     "¿Permitir que " + username + " acceda al catálogo?", () -> {
                                         try { postJson("/api/v1/admin/accounts/" + enc(accountId) + "/approve"); }
                                         catch (Exception e) { throw new RuntimeException(e); }
-                                    }));
-                            Button deny = actionButton("Denegar", false);
-                            LinearLayout.LayoutParams denyParams = new LinearLayout.LayoutParams(0, d(44), 1);
-                            denyParams.leftMargin = d(6);
-                            actions.addView(deny, denyParams);
-                            deny.setOnClickListener(v -> confirmAccountChange(username, "Denegar acceso",
+                                    });
+                        });
+                        Button deny = actionButton("Denegado", !canAccess);
+                        LinearLayout.LayoutParams denyParams = new LinearLayout.LayoutParams(0, d(44), 1);
+                        denyParams.leftMargin = d(6);
+                        actions.addView(deny, denyParams);
+                        deny.setOnClickListener(v -> {
+                            if (!canAccess) return;
+                            confirmAccountChange(username, "Denegar acceso",
                                     "¿Denegar temporalmente a " + username + "? Podrás permitirlo después.", () -> {
                                         try { adminAccountRequest("POST", "/api/v1/admin/accounts/" + enc(accountId) + "/disable"); }
                                         catch (Exception e) { throw new RuntimeException(e); }
-                                    }));
-                        } else if (disabled) {
-                            Button allow = actionButton("Permitir", true);
-                            actions.addView(allow, new LinearLayout.LayoutParams(0, d(44), 1));
-                            allow.setOnClickListener(v -> confirmAccountChange(username, "Permitir acceso",
-                                    "¿Permitir que " + username + " acceda al catálogo?", () -> {
-                                        try { postJson("/api/v1/admin/accounts/" + enc(accountId) + "/approve"); }
-                                        catch (Exception e) { throw new RuntimeException(e); }
-                                    }));
-                        } else {
-                            Button deny = actionButton("Denegar", false);
-                            actions.addView(deny, new LinearLayout.LayoutParams(0, d(44), 1));
-                            deny.setOnClickListener(v -> confirmAccountChange(username, "Denegar acceso",
-                                    "¿Bloquear a " + username + "? Podrás volver a permitirlo después.", () -> {
-                                        try { adminAccountRequest("POST", "/api/v1/admin/accounts/" + enc(accountId) + "/disable"); }
-                                        catch (Exception e) { throw new RuntimeException(e); }
-                                    }));
-                        }
+                                    });
+                        });
                         Button delete = actionButton("Borrar", false);
                         LinearLayout.LayoutParams deleteParams = new LinearLayout.LayoutParams(0, d(44), 1);
-                        deleteParams.leftMargin = d(8);
+                        deleteParams.leftMargin = d(6);
                         actions.addView(delete, deleteParams);
                         delete.setOnClickListener(v -> confirmAccountChange(username, "Borrar cuenta",
                                 "¿Borrar definitivamente la cuenta " + username + " y sus perfiles?", () -> {
@@ -4574,8 +4579,9 @@ public class MainActivity extends Activity {
                     throw new Exception("El servidor no devolvió las credenciales del dispositivo.");
                 }
                 JSONObject verifiedAccount = getAccountInfoForToken(deviceToken);
-                if (!verifiedAccount.optBoolean("is_admin")
-                        && (!verifiedAccount.has("approved") || !verifiedAccount.optBoolean("approved"))) {
+                boolean isAdmin = jsonBoolean(verifiedAccount, "is_admin", false);
+                if (!isAdmin
+                        && (!verifiedAccount.has("approved") || !jsonBoolean(verifiedAccount, "approved", false))) {
                     throw new Exception("El servidor no confirma la aprobación de esta cuenta. Actualiza el servidor antes de continuar.");
                 }
                 String previousUsername = prefs.getString("account_email", "");
@@ -4584,7 +4590,8 @@ public class MainActivity extends Activity {
                 }
                 storeClientApiToken(deviceToken);
                 prefs.edit().putString("client_device_id", deviceId)
-                        .putString("account_email", username).remove("profile_sync_token").apply();
+                        .putString("account_email", username).putBoolean("account_is_admin", isAdmin)
+                        .remove("profile_sync_token").apply();
                 runOnUiThread(() -> {
                     passwordInput.setText("");
                     accountStatus.setVisibility(View.GONE);
@@ -4690,6 +4697,132 @@ public class MainActivity extends Activity {
     String enc(String value) {
         try { return URLEncoder.encode(value, "UTF-8"); }
         catch (Exception e) { return value; }
+    }
+
+    boolean jsonBoolean(JSONObject object, String key, boolean fallback) {
+        if (object == null || !object.has(key) || object.isNull(key)) return fallback;
+        Object value = object.opt(key);
+        if (value instanceof Boolean) return (Boolean) value;
+        if (value instanceof Number) return ((Number) value).intValue() != 0;
+        if (value instanceof String) {
+            String normalized = ((String) value).trim();
+            if ("1".equals(normalized) || "true".equalsIgnoreCase(normalized) || "yes".equalsIgnoreCase(normalized)) return true;
+            if ("0".equals(normalized) || "false".equalsIgnoreCase(normalized) || "no".equalsIgnoreCase(normalized)) return false;
+        }
+        return fallback;
+    }
+
+    void checkForClientUpdate(boolean force) {
+        if (prefs == null || updateCheckInProgress) return;
+        long now = System.currentTimeMillis();
+        if (!force && now - prefs.getLong("client_update_checked_at", 0L) < 15L * 60L * 1000L) return;
+        updateCheckInProgress = true;
+        prefs.edit().putLong("client_update_checked_at", now).apply();
+        io.execute(() -> {
+            try {
+                HttpURLConnection connection = (HttpURLConnection) new URL(server + "/api/v1/client/update").openConnection();
+                connection.setConnectTimeout(12000);
+                connection.setReadTimeout(20000);
+                connection.setRequestProperty("Accept", "application/json");
+                int status = connection.getResponseCode();
+                InputStream input = status < 400 ? connection.getInputStream() : connection.getErrorStream();
+                String body = readText(input);
+                connection.disconnect();
+                if (status < 200 || status >= 300) throw new Exception("HTTP " + status);
+                JSONObject update = new JSONObject(body);
+                int version = update.optInt("version_code", 0);
+                if (version > installedClientVersionCode() && version != lastPromptedUpdateCode) {
+                    runOnUiThread(() -> showUpdateAvailable(update));
+                }
+            } catch (Exception ignored) {
+                // Update checks are optional; offline clients continue normally.
+            } finally {
+                updateCheckInProgress = false;
+            }
+        });
+    }
+
+    void showUpdateAvailable(JSONObject update) {
+        int version = update.optInt("version_code", 0);
+        if (version <= installedClientVersionCode() || isFinishing()) return;
+        lastPromptedUpdateCode = version;
+        String versionName = update.optString("version_name", "");
+        String title = versionName.isEmpty() ? "Hay una actualización de Zinema" : "Zinema " + versionName + " está disponible";
+        new AlertDialog.Builder(this).setTitle(title)
+                .setMessage("Descarga la nueva versión para seguir usando el cliente actualizado.")
+                .setPositiveButton("Actualizar", (dialog, which) -> downloadAndInstallUpdate(update))
+                .setNegativeButton("Más tarde", null).show();
+    }
+
+    int installedClientVersionCode() {
+        try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionCode; }
+        catch (PackageManager.NameNotFoundException e) { return 0; }
+    }
+
+    void downloadAndInstallUpdate(JSONObject update) {
+        Toast.makeText(this, "Descargando actualización…", Toast.LENGTH_SHORT).show();
+        io.execute(() -> {
+            File apk = new File(getCacheDir(), "zinema-prod.apk");
+            HttpURLConnection connection = null;
+            try {
+                connection = (HttpURLConnection) new URL(server + "/api/v1/client/update/apk").openConnection();
+                connection.setConnectTimeout(15000);
+                connection.setReadTimeout(120000);
+                connection.setRequestProperty("Accept", "application/vnd.android.package-archive");
+                int status = connection.getResponseCode();
+                if (status < 200 || status >= 300) throw new Exception("HTTP " + status);
+                MessageDigest digest = MessageDigest.getInstance("SHA-256");
+                try (InputStream input = connection.getInputStream(); FileOutputStream output = new FileOutputStream(apk)) {
+                    byte[] buffer = new byte[32768];
+                    int count;
+                    while ((count = input.read(buffer)) != -1) {
+                        digest.update(buffer, 0, count);
+                        output.write(buffer, 0, count);
+                    }
+                }
+                String expectedHash = update.optString("sha256", "");
+                String actualHash = hex(digest.digest());
+                if (expectedHash.isEmpty() || !expectedHash.equalsIgnoreCase(actualHash)) {
+                    apk.delete();
+                    throw new Exception("La descarga no coincide con la versión publicada.");
+                }
+                runOnUiThread(() -> startApkInstall(apk));
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(this,
+                        "No se pudo descargar la actualización: " + e.getMessage(), Toast.LENGTH_LONG).show());
+            } finally {
+                if (connection != null) connection.disconnect();
+            }
+        });
+    }
+
+    String hex(byte[] bytes) {
+        StringBuilder result = new StringBuilder(bytes.length * 2);
+        for (byte value : bytes) result.append(String.format(java.util.Locale.ROOT, "%02x", value & 0xff));
+        return result.toString();
+    }
+
+    void startApkInstall(File apk) {
+        if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+            installAfterPermission = true;
+            new AlertDialog.Builder(this).setTitle("Permitir actualizaciones")
+                    .setMessage("Android necesita permiso para instalar actualizaciones descargadas desde Zinema.")
+                    .setPositiveButton("Abrir ajustes", (dialog, which) -> {
+                        Intent settings = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                Uri.parse("package:" + getPackageName()));
+                        startActivity(settings);
+                    }).setNegativeButton("Cancelar", null).show();
+            return;
+        }
+        try {
+            Uri apkUri = Uri.parse("content://com.zinema.client.updates/zinema-prod.apk");
+            Intent install = new Intent(Intent.ACTION_VIEW);
+            install.setDataAndType(apkUri, "application/vnd.android.package-archive");
+            install.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(install);
+        } catch (Exception e) {
+            Toast.makeText(this, "No se pudo abrir el instalador de Android: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
     }
 
     boolean isFavorite(JSONObject node) {
@@ -4868,6 +5001,12 @@ public class MainActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        checkForClientUpdate(false);
+        if (installAfterPermission && Build.VERSION.SDK_INT >= 26 && getPackageManager().canRequestPackageInstalls()) {
+            installAfterPermission = false;
+            File apk = new File(getCacheDir(), "zinema-prod.apk");
+            if (apk.isFile()) startApkInstall(apk);
+        }
         if (hasResumedOnce) {
             String activeId = activeProfileId();
             if (!activeId.isEmpty() && prefs.getBoolean(profileStateDirtyKey(activeId), false)) {

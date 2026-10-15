@@ -36,4 +36,24 @@ Define `ZINEMA_SERVER_URL` en el `.env` antes de compilar. El valor queda integr
 
 El APK firmado para depuración queda en `build/outputs/apk/debug/zinema-client-debug.apk`. El script compila y firma el paquete, pero no instala nada. La clave local de depuración se conserva en `.debug.keystore` (ignorada por Git) para que las compilaciones siguientes puedan instalarse como actualización. Puedes indicar otra ubicación del SDK con `ANDROID_SDK_ROOT`.
 
+## Publicar una actualización de producción
+
+Cada compilación de producción aumenta automáticamente el `versionCode` y genera `zinema-update.json` junto al APK. Incluye ambos artefactos en el commit que subas a GitHub (el APK está ignorado por Git, por eso hay que forzar su inclusión):
+
+```sh
+git add client app publish-client-update.sh
+git add -f zinema-prod.apk zinema-update.json
+git commit -m "Publish Zinema client update"
+git push
+```
+
+Después, desde la carpeta del proyecto en el servidor, ejecuta:
+
+```sh
+git pull
+./publish-client-update.sh
+```
+
+El script reconstruye y reinicia `zinema`, publica los dos artefactos en `data/client-update/` y verifica la versión que anuncia la API. Por defecto consulta `http://127.0.0.1:8180`; si el puerto local es distinto, define `API_BASE_URL` al ejecutarlo. Los clientes comparan la versión al abrir o volver a la app, descargan el APK al pulsar «Actualizar» y muestran el instalador de Android. Android pide confirmación para instalar y puede pedir permiso a Zinema para instalar paquetes; la app no puede instalarse silenciosamente. La actualización conserva datos si el APK usa la misma clave de firma que la instalación existente.
+
 La primera apertura muestra el inicio de sesión; después de autenticar una cuenta aprobada, el cliente recupera sus perfiles y el catálogo. La compatibilidad de reproducción depende de los formatos y códecs que soporte el dispositivo Android.

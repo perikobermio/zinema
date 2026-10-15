@@ -39,6 +39,7 @@ TMDB_SYNC_INTERVAL_HOURS = max(1, int(os.getenv("TMDB_SYNC_INTERVAL_HOURS", "24"
 TMDB_SYNC_BATCH_SIZE = max(1, int(os.getenv("TMDB_SYNC_BATCH_SIZE", "100")))
 TMDB_REQUEST_DELAY_SECONDS = max(0.0, float(os.getenv("TMDB_REQUEST_DELAY_SECONDS", "0.25")))
 ARTWORK_DIR = DATABASE_PATH.parent / "artwork"
+CLIENT_UPDATE_DIR = DATABASE_PATH.parent / "client-update"
 CHUNK_SIZE = 1024 * 1024
 SYNC_LOCK = threading.Lock()
 METADATA_RETRY_LOCK = threading.Lock()
@@ -983,6 +984,41 @@ def account_info(device_id: Annotated[str, Depends(require_client)]) -> dict[str
             "profile_count": count, "created_at": row["created_at"]}
 
 
+@app.get("/api/v1/client/update")
+def client_update_info() -> dict[str, object]:
+    """Return public metadata for the latest production Android client, if published."""
+    manifest_path = CLIENT_UPDATE_DIR / "manifest.json"
+    if not manifest_path.is_file():
+        return {"version_code": 0, "version_name": "", "sha256": "", "size_bytes": 0}
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        version_code = int(manifest["version_code"])
+        version_name = str(manifest.get("version_name", ""))[:80]
+        sha256 = str(manifest["sha256"]).lower()
+        size_bytes = int(manifest["size_bytes"])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        raise HTTPException(status_code=503, detail="Client update is not available")
+    if version_code < 1 or not re.fullmatch(r"[0-9a-f]{64}", sha256) or size_bytes < 1:
+        raise HTTPException(status_code=503, detail="Client update is not available")
+    apk_path = CLIENT_UPDATE_DIR / "zinema-prod.apk"
+    if not apk_path.is_file() or apk_path.stat().st_size != size_bytes:
+        raise HTTPException(status_code=503, detail="Client update is not available")
+    return {"version_code": version_code, "version_name": version_name,
+            "sha256": sha256, "size_bytes": size_bytes}
+
+
+@app.get("/api/v1/client/update/apk")
+def download_client_update() -> FileResponse:
+    """Serve the published production Android package."""
+    manifest = client_update_info()
+    if int(manifest["version_code"]) < 1:
+        raise HTTPException(status_code=404, detail="No client update is published")
+    return FileResponse(CLIENT_UPDATE_DIR / "zinema-prod.apk",
+                        media_type="application/vnd.android.package-archive",
+                        filename="zinema-prod.apk",
+                        headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/v1/admin/accounts", dependencies=[Depends(require_admin)])
 def create_account(request: AccountCreateRequest) -> dict[str, object]:
     email = request.email.strip().lower()
@@ -1025,7 +1061,11 @@ def list_accounts() -> list[dict[str, object]]:
                       (SELECT COUNT(*) FROM client_devices d WHERE d.user_id=a.id AND d.revoked=0) AS devices
                FROM accounts a ORDER BY a.created_at DESC, a.id"""
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [
+        {**dict(row), "is_admin": bool(row["is_admin"]),
+         "approved": bool(row["approved"]), "disabled": bool(row["disabled"])}
+        for row in rows
+    ]
 
 
 @app.post("/api/v1/admin/accounts/{account_id}/approve",
