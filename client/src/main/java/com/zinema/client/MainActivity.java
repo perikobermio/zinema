@@ -1200,7 +1200,8 @@ public class MainActivity extends Activity {
         fallback.setGravity(Gravity.CENTER);
         holder.addView(fallback, new FrameLayout.LayoutParams(-1, -1));
         String imagePath = profileAvatarImagePath(avatar);
-        if (!imagePath.isEmpty()) {
+        boolean catalogAvatar = avatar != null && avatar.startsWith("catalog:");
+        if (!imagePath.isEmpty() || catalogAvatar) {
             ImageView image = new ImageView(this);
             image.setScaleType(ImageView.ScaleType.CENTER_CROP);
             GradientDrawable clear = new GradientDrawable();
@@ -1209,13 +1210,37 @@ public class MainActivity extends Activity {
             image.setBackground(clear);
             image.setClipToOutline(true);
             holder.addView(image, new FrameLayout.LayoutParams(-1, -1));
-            loadImage(imagePath, image, false);
+            if (!imagePath.isEmpty()) loadImage(imagePath, image, false);
+            else loadCatalogProfileAvatar(avatar, image);
         }
         if (clickable) {
             applyTvFocusStyle(holder, false);
             holder.setOnClickListener(v -> openProfileManager());
         }
         return holder;
+    }
+
+    void loadCatalogProfileAvatar(String avatar, ImageView target) {
+        if (avatar == null || !avatar.startsWith("catalog:") || clientApiToken().isEmpty()) return;
+        String nodeId = avatar.substring("catalog:".length());
+        target.setTag("profile-catalog:" + nodeId);
+        io.execute(() -> {
+            try {
+                JSONObject node = getJson("/api/v1/catalog/" + enc(nodeId));
+                String imagePath = node.optString("poster_url", "");
+                if (imagePath.isEmpty()) {
+                    JSONArray mosaic = node.optJSONArray("mosaic_images");
+                    if (mosaic != null && mosaic.length() > 0) imagePath = mosaic.optString(0, "");
+                }
+                if (imagePath.isEmpty()) return;
+                String resolvedImagePath = imagePath;
+                runOnUiThread(() -> {
+                    if (target.getParent() != null && ("profile-catalog:" + nodeId).equals(target.getTag())) {
+                        loadImage(resolvedImagePath, target, false);
+                    }
+                });
+            } catch (Exception ignored) { }
+        });
     }
 
     View buildProfileChip() {

@@ -1060,7 +1060,8 @@ def list_accounts() -> list[dict[str, object]]:
                       a.created_at, a.is_admin, a.approved, a.disabled,
                       (SELECT COUNT(*) FROM client_devices d WHERE d.user_id=a.id AND d.revoked=0) AS devices,
                       (SELECT p.avatar FROM user_profiles p WHERE p.user_id=a.id AND p.deleted=0
-                       ORDER BY p.created_at, p.id LIMIT 1) AS avatar
+                       ORDER BY CASE WHEN p.avatar IS NULL OR p.avatar='' OR p.avatar LIKE 'generic:%'
+                                     THEN 1 ELSE 0 END, p.created_at, p.id LIMIT 1) AS avatar
                FROM accounts a ORDER BY a.created_at DESC, a.id"""
         ).fetchall()
     return [
