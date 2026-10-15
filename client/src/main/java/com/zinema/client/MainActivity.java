@@ -12,9 +12,14 @@ import android.os.ParcelFileDescriptor;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.PixelFormat;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.Drawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -23,7 +28,10 @@ import android.provider.Settings;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.text.Editable;
+import android.text.Spannable;
+import android.text.SpannableString;
 import android.text.TextWatcher;
+import android.text.style.ImageSpan;
 import android.text.method.PasswordTransformationMethod;
 import android.util.LruCache;
 import android.util.Base64;
@@ -1235,13 +1243,13 @@ public class MainActivity extends Activity {
         applyTvFocusStyle(chip, false);
         chip.setOnClickListener(v -> {
             PopupMenu menu = new PopupMenu(MainActivity.this, chip);
-            menu.getMenu().add(android.view.Menu.NONE, 1, 1, "👤   " + t("Cambiar perfil"));
-            menu.getMenu().add(android.view.Menu.NONE, 2, 2, "⚙   " + t("Administración"));
+            addAvatarMenuItem(menu, 1, 1, t("Cambiar perfil"), MenuIconDrawable.PROFILE);
+            addAvatarMenuItem(menu, 2, 2, t("Administración"), MenuIconDrawable.SETTINGS);
             if (prefs.getBoolean("account_is_admin", false)) {
-                menu.getMenu().add(android.view.Menu.NONE, 5, 3, "👥   Gestión de cuentas");
+                addAvatarMenuItem(menu, 5, 3, "Gestión de cuentas", MenuIconDrawable.ACCOUNTS);
             }
-            menu.getMenu().add(android.view.Menu.NONE, 3, 4, "⏻   " + t("Cerrar sesión"));
-            menu.getMenu().add(android.view.Menu.NONE, 4, 5, "✕   " + t("Salir"));
+            addAvatarMenuItem(menu, 3, 4, t("Cerrar sesión"), MenuIconDrawable.LOGOUT);
+            addAvatarMenuItem(menu, 4, 5, t("Salir"), MenuIconDrawable.EXIT);
             menu.setOnMenuItemClickListener(item -> {
                 if (item.getItemId() == 1) openProfileManager();
                 else if (item.getItemId() == 2) showSettings();
@@ -1253,6 +1261,95 @@ public class MainActivity extends Activity {
             menu.show();
         });
         return chip;
+    }
+
+    void addAvatarMenuItem(PopupMenu menu, int id, int order, String title, int iconKind) {
+        int iconSize = d(20);
+        MenuIconDrawable icon = new MenuIconDrawable(iconSize, iconKind);
+        icon.setBounds(0, 0, iconSize, iconSize);
+        SpannableString itemTitle = new SpannableString("\uFFFC  " + title);
+        itemTitle.setSpan(new ImageSpan(icon, ImageSpan.ALIGN_BOTTOM), 0, 1,
+                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+        menu.getMenu().add(android.view.Menu.NONE, id, order, itemTitle);
+    }
+
+    static class MenuIconDrawable extends Drawable {
+        static final int PROFILE = 1;
+        static final int SETTINGS = 2;
+        static final int ACCOUNTS = 3;
+        static final int LOGOUT = 4;
+        static final int EXIT = 5;
+        final int kind;
+        final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+        MenuIconDrawable(int size, int kind) {
+            this.kind = kind;
+            paint.setColor(Color.WHITE);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(Math.max(1.5f, size * 0.085f));
+            paint.setStrokeCap(Paint.Cap.ROUND);
+            paint.setStrokeJoin(Paint.Join.ROUND);
+        }
+
+        @Override public void draw(Canvas canvas) {
+            android.graphics.Rect bounds = getBounds();
+            float left = bounds.left;
+            float top = bounds.top;
+            float size = Math.min(bounds.width(), bounds.height());
+            float cx = left + size / 2f;
+            float cy = top + size / 2f;
+            float unit = size / 100f;
+            canvas.save();
+            canvas.translate(left, top);
+            canvas.scale(unit, unit);
+            if (kind == PROFILE) {
+                canvas.drawCircle(50, 31, 14, paint);
+                Path shoulders = new Path();
+                shoulders.moveTo(19, 88);
+                shoulders.cubicTo(22, 65, 37, 59, 50, 59);
+                shoulders.cubicTo(64, 59, 78, 66, 81, 88);
+                canvas.drawPath(shoulders, paint);
+            } else if (kind == SETTINGS) {
+                canvas.drawCircle(50, 50, 27, paint);
+                canvas.drawCircle(50, 50, 10, paint);
+                for (int i = 0; i < 8; i++) {
+                    double angle = Math.PI * i / 4d;
+                    float x1 = 50 + (float) Math.cos(angle) * 31;
+                    float y1 = 50 + (float) Math.sin(angle) * 31;
+                    float x2 = 50 + (float) Math.cos(angle) * 40;
+                    float y2 = 50 + (float) Math.sin(angle) * 40;
+                    canvas.drawLine(x1, y1, x2, y2, paint);
+                }
+            } else if (kind == ACCOUNTS) {
+                canvas.drawCircle(36, 32, 11, paint);
+                canvas.drawCircle(67, 35, 9, paint);
+                Path group = new Path();
+                group.moveTo(12, 84);
+                group.cubicTo(15, 64, 26, 57, 38, 57);
+                group.cubicTo(52, 57, 60, 67, 61, 84);
+                group.moveTo(58, 62);
+                group.cubicTo(75, 57, 88, 67, 89, 82);
+                canvas.drawPath(group, paint);
+            } else if (kind == LOGOUT) {
+                canvas.drawLine(57, 13, 30, 13, paint);
+                canvas.drawLine(30, 13, 30, 87, paint);
+                canvas.drawLine(30, 87, 57, 87, paint);
+                canvas.drawLine(44, 50, 91, 50, paint);
+                canvas.drawLine(91, 50, 74, 33, paint);
+                canvas.drawLine(91, 50, 74, 67, paint);
+            } else {
+                canvas.drawLine(23, 23, 77, 77, paint);
+                canvas.drawLine(77, 23, 23, 77, paint);
+            }
+            canvas.restore();
+        }
+
+        @Override public void setAlpha(int alpha) { paint.setAlpha(alpha); invalidateSelf(); }
+        @Override public void setColorFilter(android.graphics.ColorFilter colorFilter) {
+            paint.setColorFilter(colorFilter);
+            invalidateSelf();
+        }
+        @Override public int getOpacity() { return PixelFormat.TRANSLUCENT; }
     }
 
     void logoutAccount() {
