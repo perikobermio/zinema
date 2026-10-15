@@ -29,15 +29,15 @@ def main() -> None:
         if row:
             user_id = row["id"]
             connection.execute(
-                "UPDATE accounts SET password_hash=?, is_admin=1, disabled=0 WHERE id=?",
+                "UPDATE accounts SET password_hash=?, username=email, is_admin=1, disabled=0, approved=1 WHERE id=?",
                 (password_hash.hash(password), user_id),
             )
         else:
             user_id = uuid.uuid4().hex
             connection.execute(
-                """INSERT INTO accounts(id, email, password_hash, is_admin, created_at)
-                   VALUES (?, ?, ?, 1, ?)""",
-                (user_id, email, password_hash.hash(password), now),
+                """INSERT INTO accounts(id, email, username, password_hash, is_admin, created_at, approved)
+                   VALUES (?, ?, ?, ?, 1, ?, 1)""",
+                (user_id, email, email, password_hash.hash(password), now),
             )
         # Existing profiles belong to the first admin account. Their profile IDs
         # and profile_state rows stay intact, preserving each profile's data.

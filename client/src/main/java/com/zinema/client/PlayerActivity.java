@@ -4,9 +4,16 @@ import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
+import android.view.Gravity;
+import android.view.KeyEvent;
+import android.widget.FrameLayout;
+import android.widget.MediaController;
+import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.VideoView;
 
 import org.json.JSONObject;
 
@@ -20,6 +27,10 @@ public class PlayerActivity extends Activity {
     private String ownerKind;
     private String progressKey;
     private String profileId;
+    private VideoView videoView;
+    private boolean internalPlayer;
+    private boolean prepared;
+    private MediaController mediaController;
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -39,6 +50,13 @@ public class PlayerActivity extends Activity {
             return;
         }
 
+        boolean preferVlc = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE)
+                .getString("player", "vlc").equals("vlc");
+        if (!preferVlc) {
+            startInternalPlayer(url, resumeAt);
+            return;
+        }
+
         Intent vlc = new Intent(Intent.ACTION_VIEW);
         vlc.setComponent(new ComponentName("org.videolan.vlc", "org.videolan.vlc.StartActivity"));
         vlc.setDataAndType(Uri.parse(url), "video/*");
@@ -49,9 +67,53 @@ public class PlayerActivity extends Activity {
         try {
             startActivityForResult(vlc, VLC_REQUEST);
         } catch (ActivityNotFoundException e) {
-            Toast.makeText(this, "Instala VLC para reproducir vídeos.", Toast.LENGTH_LONG).show();
-            finish();
+            Toast.makeText(this, "VLC no está instalado. Se abrirá el reproductor de Zinema.",
+                    Toast.LENGTH_LONG).show();
+            startInternalPlayer(url, resumeAt);
         }
+    }
+
+    private void startInternalPlayer(String url, long resumeAt) {
+        internalPlayer = true;
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(Color.BLACK);
+        videoView = new VideoView(this);
+        videoView.setFocusable(true);
+        videoView.setFocusableInTouchMode(true);
+        root.addView(videoView, new FrameLayout.LayoutParams(-1, -1));
+        TextView heading = new TextView(this);
+        heading.setText(title == null || title.isEmpty() ? "Zinema" : title);
+        heading.setTextColor(Color.WHITE);
+        heading.setTextSize(18);
+        heading.setSingleLine(true);
+        heading.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        heading.setPadding(24, 16, 24, 16);
+        heading.setBackgroundColor(0x99000000);
+        FrameLayout.LayoutParams headingParams = new FrameLayout.LayoutParams(-1, -2,
+                Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        root.addView(heading, headingParams);
+        setContentView(root);
+        mediaController = new MediaController(this);
+        mediaController.setAnchorView(videoView);
+        mediaController.setContentDescription("Controles de reproducción");
+        videoView.setMediaController(mediaController);
+        videoView.setOnPreparedListener(player -> {
+            prepared = true;
+            long duration = player.getDuration();
+            if (resumeAt > 0L && duration > 0L && resumeAt < duration - 5000L) {
+                videoView.seekTo((int) Math.min(Integer.MAX_VALUE, resumeAt));
+            }
+            videoView.start();
+            videoView.requestFocus();
+        });
+        videoView.setOnCompletionListener(player -> finishWithProgress(true));
+        videoView.setOnErrorListener((player, what, extra) -> {
+            Toast.makeText(this, "No se pudo reproducir este formato en el dispositivo.",
+                    Toast.LENGTH_LONG).show();
+            finishWithProgress(false);
+            return true;
+        });
+        videoView.setVideoURI(Uri.parse(url));
     }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
@@ -70,6 +132,75 @@ public class PlayerActivity extends Activity {
             }
         }
         finish();
+    }
+
+    @Override public void onBackPressed() {
+        if (internalPlayer) finishWithProgress(false);
+        else super.onBackPressed();
+    }
+
+    @Override public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (internalPlayer && prepared && videoView != null) {
+            if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER
+                    || keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) {
+                if (videoView.isPlaying()) videoView.pause(); else videoView.start();
+                if (mediaController != null) mediaController.show();
+                return true;
+            }
+            if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_MEDIA_REWIND) {
+                videoView.seekTo(Math.max(0, videoView.getCurrentPosition() - 10000));
+                if (mediaController != null) mediaController.show();
+                return true;
+            }
+            if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT || keyCode == KeyEvent.KEYCODE_MEDIA_FAST_FORWARD) {
+                int duration = Math.max(0, videoView.getDuration());
+                videoView.seekTo(Math.min(duration, videoView.getCurrentPosition() + 10000));
+                if (mediaController != null) mediaController.show();
+                return true;
+            }
+        }
+        return super.onKeyDown(keyCode, event);
+    }
+
+    @Override protected void onPause() {
+        if (internalPlayer && prepared) saveCurrentProgress(false);
+        super.onPause();
+    }
+
+    private void finishWithProgress(boolean completed) {
+        if (videoView == null) {
+            finish();
+            return;
+        }
+        long position = Math.max(0, videoView.getCurrentPosition());
+        long duration = Math.max(0, videoView.getDuration());
+        if (completed || (duration > 0 && position >= duration - 5000L)) {
+            getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
+                    .remove(progressKey).apply();
+            markProfileStateDirty();
+        } else if (position > 10000L) {
+            saveProgress(position);
+            markProfileStateDirty();
+        }
+        Intent result = new Intent();
+        result.putExtra("extra_position", position);
+        result.putExtra("extra_duration", duration);
+        setResult(RESULT_OK, result);
+        if (videoView.isPlaying()) videoView.pause();
+        finish();
+    }
+
+    private void saveCurrentProgress(boolean completed) {
+        if (videoView == null || !prepared) return;
+        long position = Math.max(0, videoView.getCurrentPosition());
+        long duration = Math.max(0, videoView.getDuration());
+        if (completed || (duration > 0 && position >= duration - 5000L)) {
+            getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
+                    .remove(progressKey).apply();
+        } else if (position > 10000L) {
+            saveProgress(position);
+        }
+        markProfileStateDirty();
     }
 
     private void saveProgress(long position) {

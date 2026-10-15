@@ -110,13 +110,15 @@ class UserProfileRequest(BaseModel):
 
 
 class AccountCredentials(BaseModel):
-    email: str = Field(min_length=3, max_length=254)
+    username: str | None = Field(default=None, min_length=3, max_length=254)
+    email: str | None = Field(default=None, min_length=3, max_length=254)
     password: str = Field(min_length=8, max_length=256)
     device_name: str = Field(default="Zinema client", min_length=1, max_length=120)
     device_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class AccountCreateRequest(AccountCredentials):
+    email: str = Field(min_length=3, max_length=254)
     is_admin: bool = False
 
 
@@ -245,12 +247,33 @@ def database() -> sqlite3.Connection:
         """CREATE TABLE IF NOT EXISTS accounts (
                id TEXT PRIMARY KEY,
                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+               username TEXT,
                password_hash TEXT NOT NULL,
                is_admin INTEGER NOT NULL DEFAULT 0,
                created_at TEXT NOT NULL,
-               disabled INTEGER NOT NULL DEFAULT 0
+               disabled INTEGER NOT NULL DEFAULT 0,
+               approved INTEGER NOT NULL DEFAULT 0
            )"""
     )
+    account_columns = {row["name"] for row in connection.execute("PRAGMA table_info(accounts)")}
+    if "approved" not in account_columns:
+        connection.execute("ALTER TABLE accounts ADD COLUMN approved INTEGER NOT NULL DEFAULT 0")
+    if "username" not in account_columns:
+        connection.execute("ALTER TABLE accounts ADD COLUMN username TEXT")
+    connection.execute("UPDATE accounts SET username=email WHERE username IS NULL OR username='' ")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_username ON accounts(username COLLATE NOCASE)")
+    connection.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    approval_migration = connection.execute(
+        "SELECT value FROM app_settings WHERE key='account_approval_enforced_v1'"
+    ).fetchone()
+    if approval_migration is None:
+        # Old server versions treated every account as approved. Require the
+        # administrator to review standard accounts once when enforcing approvals.
+        connection.execute("UPDATE accounts SET approved=0 WHERE is_admin=0")
+        connection.execute("UPDATE accounts SET approved=1 WHERE is_admin=1")
+        connection.execute(
+            "INSERT INTO app_settings(key, value) VALUES ('account_approval_enforced_v1', '1')"
+        )
     connection.execute(
         """CREATE TABLE IF NOT EXISTS client_devices (
                id TEXT PRIMARY KEY,
@@ -265,6 +288,7 @@ def database() -> sqlite3.Connection:
     device_columns = {row["name"] for row in connection.execute("PRAGMA table_info(client_devices)")}
     if "user_id" not in device_columns:
         connection.execute("ALTER TABLE client_devices ADD COLUMN user_id TEXT")
+    connection.commit()
     return connection
 
 
@@ -276,7 +300,8 @@ def require_client(authorization: Annotated[str | None, Header()] = None) -> str
     with closing(database()) as connection:
         row = connection.execute(
             """SELECT d.id FROM client_devices d JOIN accounts a ON a.id=d.user_id
-               WHERE d.token_hash=? AND d.revoked=0 AND a.disabled=0""",
+               WHERE d.token_hash=? AND d.revoked=0 AND a.disabled=0
+                 AND (a.approved=1 OR a.is_admin=1)""",
             (token_hash,),
         ).fetchone()
         if row is None:
@@ -874,27 +899,36 @@ def get_catalog_version() -> dict[str, str]:
     return {"version": hashlib.sha256(state.encode("utf-8")).hexdigest()}
 
 
-def _account_login(credentials: AccountCredentials, register: bool) -> dict[str, str]:
-    email = credentials.email.strip().lower()
-    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
-        raise HTTPException(status_code=422, detail="A valid email is required")
+def _account_login(credentials: AccountCredentials, register: bool) -> dict[str, object]:
+    username = (credentials.username or credentials.email or "").strip()
+    if len(username) < 3 or len(username) > 254 or re.search(r"\s", username):
+        raise HTTPException(status_code=422, detail="A valid username is required")
+    username = username.lower()
     now = datetime.now(timezone.utc).isoformat()
     with closing(database()) as connection:
         row = connection.execute(
-            "SELECT id, password_hash, disabled FROM accounts WHERE email=? COLLATE NOCASE", (email,),
+            """SELECT id, password_hash, disabled, approved, is_admin FROM accounts
+               WHERE username=? COLLATE NOCASE OR email=? COLLATE NOCASE""",
+            (username, username),
         ).fetchone()
         if register:
             if row is not None:
-                raise HTTPException(status_code=409, detail="An account with this email already exists")
+                raise HTTPException(status_code=409, detail="An account with this username already exists")
             user_id = uuid4().hex
             connection.execute(
-                "INSERT INTO accounts(id, email, password_hash, is_admin, created_at) VALUES (?, ?, ?, 0, ?)",
-                (user_id, email, password_hash.hash(credentials.password), now),
+                """INSERT INTO accounts(id, email, username, password_hash, is_admin, created_at, approved)
+                   VALUES (?, ?, ?, ?, 0, ?, 0)""",
+                (user_id, username, username, password_hash.hash(credentials.password), now),
             )
+            connection.commit()
+            return {"status": "pending_approval", "username": username, "email": username}
         else:
             if row is None or row["disabled"] or not password_hash.verify(
                     credentials.password, row["password_hash"]):
                 raise HTTPException(status_code=401, detail="Invalid email or password")
+            if not row["approved"] and not row["is_admin"]:
+                raise HTTPException(status_code=403,
+                                    detail="La cuenta está pendiente de aprobación por un administrador.")
             user_id = row["id"]
         result = issue_device_token(connection, user_id, credentials.device_name,
                                     credentials.device_id)
@@ -906,23 +940,35 @@ def _account_login(credentials: AccountCredentials, register: bool) -> dict[str,
     return result
 
 
-@app.post("/api/v1/auth/register")
-def register_account(credentials: AccountCredentials) -> dict[str, str]:
-    """Create a standard account and return a device-specific bearer token."""
+@app.post("/api/v1/auth/register", status_code=202)
+def register_account(credentials: AccountCredentials) -> dict[str, object]:
+    """Create a standard account that must be approved before it can sign in."""
     return _account_login(credentials, register=True)
 
 
 @app.post("/api/v1/auth/login")
-def login_account(credentials: AccountCredentials) -> dict[str, str]:
+def login_account(credentials: AccountCredentials) -> dict[str, object]:
     """Authenticate an account and issue a revocable token for this installation."""
     return _account_login(credentials, register=False)
+
+
+@app.post("/api/v1/auth/logout")
+def logout_account(device_id: Annotated[str, Depends(require_client)]) -> dict[str, bool]:
+    with closing(database()) as connection:
+        cursor = connection.execute("UPDATE client_devices SET revoked=1 WHERE id=?", (device_id,))
+        connection.commit()
+    with PLAYBACK_TICKET_LOCK:
+        for ticket, grant in list(PLAYBACK_TICKETS.items()):
+            if grant[2] == device_id:
+                PLAYBACK_TICKETS.pop(ticket, None)
+    return {"revoked": cursor.rowcount > 0}
 
 
 @app.get("/api/v1/auth/me")
 def account_info(device_id: Annotated[str, Depends(require_client)]) -> dict[str, object]:
     with closing(database()) as connection:
         row = connection.execute(
-            """SELECT a.id, a.email, a.is_admin, a.created_at FROM accounts a
+            """SELECT a.id, a.email, a.username, a.is_admin, a.approved, a.created_at FROM accounts a
                JOIN client_devices d ON d.user_id=a.id WHERE d.id=?""", (device_id,),
         ).fetchone()
         count = connection.execute(
@@ -931,7 +977,9 @@ def account_info(device_id: Annotated[str, Depends(require_client)]) -> dict[str
         ).fetchone()["n"] if row else 0
     if row is None:
         raise HTTPException(status_code=401, detail="Account not found")
-    return {"id": row["id"], "email": row["email"], "is_admin": bool(row["is_admin"]),
+    return {"id": row["id"], "email": row["email"],
+            "username": row["username"] or row["email"], "is_admin": bool(row["is_admin"]),
+            "approved": bool(row["approved"]),
             "profile_count": count, "created_at": row["created_at"]}
 
 
@@ -945,13 +993,123 @@ def create_account(request: AccountCreateRequest) -> dict[str, object]:
     with closing(database()) as connection:
         try:
             connection.execute(
-                "INSERT INTO accounts(id, email, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, email, password_hash.hash(request.password), int(request.is_admin), now),
+                """INSERT INTO accounts(id, email, username, password_hash, is_admin, created_at, approved)
+                   VALUES (?, ?, ?, ?, ?, ?, 1)""",
+                (user_id, email, email, password_hash.hash(request.password), int(request.is_admin), now),
             )
             connection.commit()
         except sqlite3.IntegrityError as exc:
             raise HTTPException(status_code=409, detail="An account with this email already exists") from exc
-    return {"id": user_id, "email": email, "is_admin": request.is_admin, "created_at": now}
+    return {"id": user_id, "email": email, "username": email,
+            "is_admin": request.is_admin, "created_at": now}
+
+
+@app.get("/api/v1/admin/accounts/pending", dependencies=[Depends(require_admin)])
+def list_pending_accounts() -> list[dict[str, str]]:
+    with closing(database()) as connection:
+        rows = connection.execute(
+            """SELECT id, COALESCE(NULLIF(username, ''), email) AS username,
+                      COALESCE(NULLIF(username, ''), email) AS email, created_at FROM accounts
+               WHERE approved=0 AND disabled=0 ORDER BY created_at, id"""
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/api/v1/admin/accounts", dependencies=[Depends(require_admin)])
+def list_accounts() -> list[dict[str, object]]:
+    """List account status for the administrator account management screen."""
+    with closing(database()) as connection:
+        rows = connection.execute(
+            """SELECT a.id, COALESCE(NULLIF(a.username, ''), a.email) AS username,
+                      a.created_at, a.is_admin, a.approved, a.disabled,
+                      (SELECT COUNT(*) FROM client_devices d WHERE d.user_id=a.id AND d.revoked=0) AS devices
+               FROM accounts a ORDER BY a.created_at DESC, a.id"""
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/api/v1/admin/accounts/{account_id}/approve",
+          dependencies=[Depends(require_admin)])
+def approve_account(account_id: str) -> dict[str, bool]:
+    with closing(database()) as connection:
+        cursor = connection.execute(
+            "UPDATE accounts SET approved=1, disabled=0 WHERE id=? AND (approved=0 OR disabled=1)",
+            (account_id,),
+        )
+        connection.commit()
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Pending account not found")
+    return {"approved": True}
+
+
+@app.post("/api/v1/admin/accounts/{account_id}/disable",
+          dependencies=[Depends(require_admin)])
+def disable_account(account_id: str, admin_device_id: Annotated[str, Depends(require_admin)]) -> dict[str, bool]:
+    admin_id = account_for_device(admin_device_id)
+    if account_id == admin_id:
+        raise HTTPException(status_code=400, detail="You cannot disable your own administrator account")
+    with closing(database()) as connection:
+        device_ids = [row["id"] for row in connection.execute(
+            "SELECT id FROM client_devices WHERE user_id=?", (account_id,),
+        ).fetchall()]
+        cursor = connection.execute("UPDATE accounts SET disabled=1 WHERE id=? AND disabled=0", (account_id,))
+        connection.commit()
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Account not found")
+    device_id_set = set(device_ids)
+    with PLAYBACK_TICKET_LOCK:
+        for ticket, grant in list(PLAYBACK_TICKETS.items()):
+            if grant[2] in device_id_set:
+                PLAYBACK_TICKETS.pop(ticket, None)
+    return {"disabled": True}
+
+
+def _delete_account_data(account_id: str) -> bool:
+    with closing(database()) as connection:
+        row = connection.execute("SELECT id FROM accounts WHERE id=?", (account_id,)).fetchone()
+        if row is None:
+            return False
+        profile_ids = [item["id"] for item in connection.execute(
+            "SELECT id FROM user_profiles WHERE user_id=?", (account_id,),
+        ).fetchall()]
+        device_ids = [item["id"] for item in connection.execute(
+            "SELECT id FROM client_devices WHERE user_id=?", (account_id,),
+        ).fetchall()]
+        if profile_ids:
+            connection.executemany("DELETE FROM profile_state WHERE profile_id=?",
+                                   [(profile_id,) for profile_id in profile_ids])
+        connection.execute("DELETE FROM user_profiles WHERE user_id=?", (account_id,))
+        connection.execute("DELETE FROM client_devices WHERE user_id=?", (account_id,))
+        connection.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+        connection.commit()
+    device_id_set = set(device_ids)
+    with PLAYBACK_TICKET_LOCK:
+        for ticket, grant in list(PLAYBACK_TICKETS.items()):
+            if grant[2] in device_id_set:
+                PLAYBACK_TICKETS.pop(ticket, None)
+    return True
+
+
+@app.delete("/api/v1/admin/accounts/{account_id}")
+def delete_account(account_id: str, admin_device_id: Annotated[str, Depends(require_admin)]) -> dict[str, bool]:
+    admin_id = account_for_device(admin_device_id)
+    if account_id == admin_id:
+        raise HTTPException(status_code=400, detail="You cannot delete your own administrator account")
+    if not _delete_account_data(account_id):
+        raise HTTPException(status_code=404, detail="Account not found")
+    return {"deleted": True}
+
+
+@app.post("/api/v1/admin/accounts/{account_id}/reject",
+          dependencies=[Depends(require_admin)])
+def reject_account(account_id: str) -> dict[str, bool]:
+    with closing(database()) as connection:
+        row = connection.execute(
+            "SELECT id FROM accounts WHERE id=? AND approved=0 AND disabled=0", (account_id,),
+        ).fetchone()
+    if row is None or not _delete_account_data(account_id):
+        raise HTTPException(status_code=404, detail="Pending account not found")
+    return {"deleted": True}
 
 
 @app.get("/api/v1/admin/devices", dependencies=[Depends(require_admin)])

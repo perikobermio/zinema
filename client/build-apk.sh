@@ -2,6 +2,7 @@
 set -eu
 
 CLIENT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_DIR=$(CDPATH= cd -- "$CLIENT_DIR/.." && pwd)
 CLIENT_HOME=${HOME:-}
 SDK_ROOT=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$CLIENT_HOME/Android/Sdk}}
 BUILD_TOOLS_VERSION=${BUILD_TOOLS_VERSION:-36.0.0}
@@ -32,6 +33,8 @@ fi
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR/generated" "$BUILD_DIR/classes" "$BUILD_DIR/dex"
 mkdir -p "$BUILD_DIR/outputs/apk/debug"
+python3 "$CLIENT_DIR/generate_server_config.py" "$REPO_DIR/.env" \
+    "$BUILD_DIR/generated/com/zinema/client/ServerConfig.java"
 
 "$TOOLS/aapt2" compile --dir "$CLIENT_DIR/src/main/res" -o "$BUILD_DIR/resources.zip"
 "$TOOLS/aapt2" link \
@@ -43,7 +46,7 @@ mkdir -p "$BUILD_DIR/outputs/apk/debug"
     --custom-package com.zinema.client \
     --min-sdk-version 23 \
     --target-sdk-version "$ANDROID_API" \
-    --version-code 30 \
+    --version-code 31 \
     --version-name 1.0.0 \
     --auto-add-overlay \
     "$BUILD_DIR/resources.zip"

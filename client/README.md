@@ -17,7 +17,10 @@ Cliente Android nativo conectado a la API pública de Zinema. La interfaz usa un
 - Guardar títulos en «Mi lista» y conservar el progreso local para continuar viendo.
 - Reintentar la metadata desde el menú de tres puntos de cada tarjeta o ficha.
 - Reproducir el contenido del NAS con los controles nativos de Android.
-- Configurar el dominio público o una dirección local del servidor desde el icono de ajustes.
+- Mostrar una pantalla propia de inicio de sesión y registro como primera vista cuando no hay sesión.
+- Leer el servidor desde `ZINEMA_SERVER_URL` en el `.env` del proyecto durante la compilación; el usuario no tiene que introducir su dirección ni el nombre del servidor.
+- Registrar cuentas que requieren aprobación administrativa antes de acceder a la biblioteca.
+- Aprobar o rechazar solicitudes de cuenta desde Administración y cerrar sesión desde el menú de perfil.
 
 El cliente no contiene credenciales de TMDb ni del administrador. El servidor sirve las imágenes y los vídeos.
 
@@ -29,6 +32,8 @@ Necesitas un JDK, Android SDK Platform 35 y Android Build Tools 36.0.0. Ejecuta:
 ./build-apk.sh
 ```
 
+Define `ZINEMA_SERVER_URL` en el `.env` antes de compilar. El valor queda integrado en el APK; después de cambiarlo, vuelve a compilar.
+
 El APK firmado para depuración queda en `build/outputs/apk/debug/zinema-client-debug.apk`. El script compila y firma el paquete, pero no instala nada. La clave local de depuración se conserva en `.debug.keystore` (ignorada por Git) para que las compilaciones siguientes puedan instalarse como actualización. Puedes indicar otra ubicación del SDK con `ANDROID_SDK_ROOT`.
 
-La primera apertura conecta al dominio configurado en `MainActivity`; puedes cambiarlo desde «Servidor». La compatibilidad de reproducción depende de los formatos y códecs que soporte el dispositivo Android.
+La primera apertura muestra el inicio de sesión; después de autenticar una cuenta aprobada, el cliente recupera sus perfiles y el catálogo. La compatibilidad de reproducción depende de los formatos y códecs que soporte el dispositivo Android.

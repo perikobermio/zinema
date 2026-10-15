@@ -6,3 +6,7 @@ __pycache__/
 .venv/
 client/build/
 client/.debug.keystore
+client/.release.keystore
+client/.release-signing.env
+*.apk.idsig
+/zinema-prod.apk

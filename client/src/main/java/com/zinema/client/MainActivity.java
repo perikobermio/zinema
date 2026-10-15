@@ -34,6 +34,8 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.PopupMenu;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -79,7 +81,7 @@ public class MainActivity extends Activity {
     static final int MUTED = Color.rgb(168, 172, 182);
     static final int RED = Color.rgb(229, 9, 20);
     static final String PREFS = "zinema_client";
-    static final String DEFAULT_SERVER = "https://zinema.ebu.freemyip.com";
+    static final String DEFAULT_SERVER = ServerConfig.DEFAULT_SERVER;
     static final String CLIENT_TOKEN_ALIAS = "zinema_client_device_token";
     static final long CATALOG_CACHE_TTL_MS = 30000L;
     static final long IMAGE_DISK_CACHE_MAX_BYTES = 160L * 1024L * 1024L;
@@ -168,10 +170,58 @@ public class MainActivity extends Activity {
         hideSystemBars();
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         prefs.edit().remove("profile_sync_token").apply();
-        server = trimBase(prefs.getString("server", DEFAULT_SERVER));
-        serverName = prefs.getString("server_name", "Zinema NAS");
-        startStartupPrefetch();
-        showIntro();
+        server = trimBase(DEFAULT_SERVER);
+        serverName = "Zinema";
+        if (!clientApiToken().isEmpty()) {
+            verifySavedAccountBeforeStartup();
+        } else {
+            showLoginScreen();
+        }
+    }
+
+    void verifySavedAccountBeforeStartup() {
+        io.execute(() -> {
+            try {
+                JSONObject account = getJson("/api/v1/auth/me");
+                if (!account.optBoolean("is_admin")
+                        && (!account.has("approved") || !account.optBoolean("approved"))) {
+                    runOnUiThread(() -> invalidateSavedAccount("Esta cuenta todavía necesita aprobación de un administrador."));
+                    return;
+                }
+                runOnUiThread(() -> {
+                    if (isFinishing()) return;
+                    startStartupPrefetch();
+                    showIntro();
+                });
+            } catch (Exception e) {
+                String message = e.getMessage() == null ? "" : e.getMessage();
+                if (message.contains("HTTP 401") || message.contains("HTTP 403")) {
+                    runOnUiThread(() -> invalidateSavedAccount("La sesión no está aprobada o ya no es válida. Inicia sesión con una cuenta aprobada."));
+                } else {
+                    runOnUiThread(() -> invalidateSavedAccount(
+                            "No se pudo verificar la cuenta. Inicia sesión cuando haya conexión."));
+                }
+            }
+        });
+    }
+
+    void invalidateSavedAccount(String message) {
+        prefs.edit().remove("client_api_token_enc").remove("client_api_token")
+                .remove("client_device_id").remove("account_email").apply();
+        try {
+            KeyStore keyStore = KeyStore.getInstance("AndroidKeyStore");
+            keyStore.load(null);
+            if (keyStore.containsAlias(CLIENT_TOKEN_ALIAS)) keyStore.deleteEntry(CLIENT_TOKEN_ALIAS);
+        } catch (Exception ignored) { }
+        clearLocalProfilesForAccountSwitch();
+        clearCatalogCache();
+        movies.clear();
+        series.clear();
+        startupPrefetchStarted = false;
+        startupPrefetchPending = false;
+        startupPrefetchReady = false;
+        showLoginScreen();
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
     }
 
     void hideSystemBars() {
@@ -221,11 +271,15 @@ public class MainActivity extends Activity {
             introWebView.destroy();
             introWebView = null;
         }
-        buildShell("Inicio");
-        loadHome();
+        if (clientApiToken().isEmpty()) showLoginScreen();
+        else {
+            buildShell("Inicio");
+            loadHome();
+        }
     }
 
     void startStartupPrefetch() {
+        if (clientApiToken().isEmpty()) return;
         synchronized (this) {
             if (startupPrefetchStarted) return;
             startupPrefetchStarted = true;
@@ -435,6 +489,36 @@ public class MainActivity extends Activity {
                 loadVisibleLazyRows());
         page.addView(contentScroller, new LinearLayout.LayoutParams(-1, 0, 1));
         setContentView(frame);
+        frame.post(() -> {
+            if (showingAdmin) {
+                backButton.requestFocus();
+                return;
+            }
+            if (showingProfiles) {
+                View first = firstFocusable(content);
+                if (first != null) first.requestFocus();
+                return;
+            }
+            int tabIndex = "movies".equals(selectedSection) ? 1
+                    : "series".equals(selectedSection) ? 2 : 0;
+            View navView = navScroll.getChildAt(0);
+            if (navView instanceof ViewGroup && ((ViewGroup) navView).getChildAt(tabIndex) != null) {
+                ((ViewGroup) navView).getChildAt(tabIndex).requestFocus();
+            }
+        });
+    }
+
+    View firstFocusable(View view) {
+        if (view == null || view.getVisibility() != View.VISIBLE) return null;
+        if (view.isFocusable()) return view;
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                View found = firstFocusable(group.getChildAt(i));
+                if (found != null) return found;
+            }
+        }
+        return null;
     }
 
     TextView label(String text, int size, int color, boolean bold) {
@@ -535,6 +619,26 @@ public class MainActivity extends Activity {
         String body = readText(input);
         connection.disconnect();
         if (status < 200 || status >= 300) throw new Exception("HTTP " + status + (body.isEmpty() ? "" : ": " + body));
+        return new JSONObject(body);
+    }
+
+    JSONObject getAccountInfoForToken(String token) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(server + "/api/v1/auth/me").openConnection();
+        connection.setRequestMethod("GET");
+        connection.setConnectTimeout(12000);
+        connection.setReadTimeout(20000);
+        connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("Authorization", "Bearer " + token);
+        int status = connection.getResponseCode();
+        InputStream input = status < 400 ? connection.getInputStream() : connection.getErrorStream();
+        String body = readText(input);
+        connection.disconnect();
+        if (status < 200 || status >= 300) {
+            String detail = body;
+            try { detail = new JSONObject(body).optString("detail", body); }
+            catch (JSONException ignored) { }
+            throw new Exception("HTTP " + status + (detail.isEmpty() ? "" : ": " + detail));
+        }
         return new JSONObject(body);
     }
 
@@ -651,6 +755,12 @@ public class MainActivity extends Activity {
     }
 
     void loadHome() {
+        if (clientApiToken().isEmpty()) {
+            showingProfiles = false;
+            profileEditorVisible = false;
+            showSettings();
+            return;
+        }
         List<JSONObject> savedProfiles = readProfiles();
         if (savedProfiles.isEmpty()) {
             startupHomeAwaiting = true;
@@ -1114,16 +1224,63 @@ public class MainActivity extends Activity {
             PopupMenu menu = new PopupMenu(MainActivity.this, chip);
             menu.getMenu().add(android.view.Menu.NONE, 1, 1, "👤   " + t("Cambiar perfil"));
             menu.getMenu().add(android.view.Menu.NONE, 2, 2, "⚙   " + t("Administración"));
-            menu.getMenu().add(android.view.Menu.NONE, 3, 3, "⏻   " + t("Salir"));
+            menu.getMenu().add(android.view.Menu.NONE, 5, 3, "👥   Gestión de cuentas");
+            menu.getMenu().add(android.view.Menu.NONE, 3, 4, "⏻   " + t("Cerrar sesión"));
+            menu.getMenu().add(android.view.Menu.NONE, 4, 5, "✕   " + t("Salir"));
             menu.setOnMenuItemClickListener(item -> {
                 if (item.getItemId() == 1) openProfileManager();
                 else if (item.getItemId() == 2) showSettings();
-                else if (item.getItemId() == 3) finishAffinity();
+                else if (item.getItemId() == 5) showAccountManagement();
+                else if (item.getItemId() == 3) logoutAccount();
+                else if (item.getItemId() == 4) finishAndRemoveTask();
                 return true;
             });
             menu.show();
         });
         return chip;
+    }
+
+    void logoutAccount() {
+        String token = clientApiToken();
+        String base = server;
+        if (!token.isEmpty()) {
+            io.execute(() -> {
+                HttpURLConnection connection = null;
+                try {
+                    connection = (HttpURLConnection) new URL(base + "/api/v1/auth/logout").openConnection();
+                    connection.setRequestMethod("POST");
+                    connection.setConnectTimeout(7000);
+                    connection.setReadTimeout(7000);
+                    connection.setRequestProperty("Authorization", "Bearer " + token);
+                    connection.getResponseCode();
+                } catch (Exception ignored) { }
+                finally { if (connection != null) connection.disconnect(); }
+            });
+        }
+        prefs.edit().remove("client_api_token_enc").remove("client_api_token")
+                .remove("client_device_id").remove("account_email").remove("profile_sync_token").apply();
+        try {
+            KeyStore keyStore = KeyStore.getInstance("AndroidKeyStore");
+            keyStore.load(null);
+            if (keyStore.containsAlias(CLIENT_TOKEN_ALIAS)) keyStore.deleteEntry(CLIENT_TOKEN_ALIAS);
+        } catch (Exception ignored) { }
+        clearLocalProfilesForAccountSwitch();
+        clearCatalogCache();
+        movies.clear();
+        series.clear();
+        catalogVersion = "";
+        showingDetail = false;
+        showingProfiles = false;
+        profileEditorVisible = false;
+        metadataEditorMode = false;
+        libraryMode = false;
+        startupPrefetchPending = false;
+        startupPrefetchReady = false;
+        startupPrefetchStarted = false;
+        startupHomeAwaiting = false;
+        showingAdmin = false;
+        showLoginScreen();
+        Toast.makeText(this, t("Has cerrado sesión."), Toast.LENGTH_LONG).show();
     }
 
     void refreshProfileChip() {
@@ -1137,6 +1294,11 @@ public class MainActivity extends Activity {
     }
 
     void openProfileManager() {
+        if (clientApiToken().isEmpty()) {
+            Toast.makeText(this, t("Inicia sesión con una cuenta aprobada para crear un perfil."), Toast.LENGTH_LONG).show();
+            showSettings();
+            return;
+        }
         showingProfiles = true;
         profileEditorVisible = false;
         buildShell("Perfiles");
@@ -1291,6 +1453,11 @@ public class MainActivity extends Activity {
     }
 
     void saveProfile(JSONObject existing, String rawName) {
+        if (clientApiToken().isEmpty()) {
+            Toast.makeText(this, t("Inicia sesión con una cuenta aprobada para crear un perfil."), Toast.LENGTH_LONG).show();
+            showSettings();
+            return;
+        }
         String name = rawName == null ? "" : rawName.trim();
         if (name.isEmpty()) {
             Toast.makeText(this, t("Escribe un nombre para el perfil."), Toast.LENGTH_SHORT).show();
@@ -3137,6 +3304,7 @@ public class MainActivity extends Activity {
             case "Perfil": return "Profila";
             case "Cambiar perfil": return "Profila aldatu";
             case "Salir": return "Irten";
+            case "Cerrar sesión": return "Saioa itxi";
             case "¿Quién está viendo?": return "Nor ari da ikusten?";
             case "Cada perfil conserva su lista y su progreso de reproducción.":
                 return "Profil bakoitzak bere zerrenda eta erreprodukzio-aurrerapena gordetzen ditu.";
@@ -3252,21 +3420,35 @@ public class MainActivity extends Activity {
             case "Reintentar": return "Berriro saiatu";
             case "Configurar servidor": return "Zerbitzaria konfiguratu";
             case "Administración": return "Administrazioa";
+            case "Iniciar sesión o crear cuenta": return "Hasi saioa edo sortu kontua";
+            case "Iniciar sesión": return "Hasi saioa";
+            case "Películas y series, para toda la familia": return "Filmak eta telesailak, familia osoarentzat";
+            case "Entra para acceder a tus perfiles y a todo el catálogo.":
+                return "Sartu zure profilak eta katalogo osoa ikusteko.";
+            case "Las cuentas nuevas necesitan la aprobación de un administrador.":
+                return "Kontu berriek administratzaile baten onespena behar dute.";
+            case "Introduce tu usuario y contraseña.": return "Sartu erabiltzailea eta pasahitza.";
+            case "El usuario debe tener al menos 3 caracteres y la contraseña 8.":
+                return "Erabiltzaileak gutxienez 3 karaktere eta pasahitzak 8 izan behar dituzte.";
+            case "Ajustes de Zinema": return "Zinemaren ezarpenak";
             case "Configuración del servidor": return "Zerbitzariaren ezarpenak";
             case "Nombre del servidor": return "Zerbitzariaren izena";
             case "Dirección del servidor": return "Zerbitzariaren helbidea";
             case "Cuenta Zinema": return "Zinema kontua";
+            case "Usuario": return "Erabiltzailea";
             case "Email": return "Posta elektronikoa";
             case "Contraseña": return "Pasahitza";
             case "Inicia sesión para vincular esta instalación a tu cuenta. Cada dispositivo recibe su propio token.":
                 return "Hasi saioa instalazio hau zure kontuarekin lotzeko. Gailu bakoitzak bere tokena jasoko du.";
             case "Crear cuenta": return "Kontua sortu";
+            case "Solicitud enviada. Espera a que un administrador apruebe tu cuenta; después inicia sesión para recuperar tus perfiles y el catálogo.":
+                return "Eskaera bidalita. Itxaron administratzaileak kontua onartu arte; ondoren hasi saioa profilak eta katalogoa berreskuratzeko.";
             case "Iniciando sesión…": return "Saioa hasten…";
             case "Creando cuenta…": return "Kontua sortzen…";
-            case "Introduce email y contraseña para iniciar sesión.":
-                return "Sartu posta elektronikoa eta pasahitza saioa hasteko.";
-            case "Indica un email y una contraseña de al menos 8 caracteres.":
-                return "Sartu posta elektronikoa eta gutxienez 8 karaktereko pasahitza.";
+            case "Introduce usuario y contraseña para iniciar sesión.":
+                return "Sartu erabiltzailea eta pasahitza saioa hasteko.";
+            case "Indica un usuario (3 caracteres o más) y una contraseña de al menos 8 caracteres.":
+                return "Sartu erabiltzaile bat (gutxienez 3 karaktere) eta gutxienez 8 karaktereko pasahitza.";
             case "Revisa la dirección y el nombre del servidor.":
                 return "Egiaztatu zerbitzariaren helbidea eta izena.";
             case "Idioma de la aplicación": return "Aplikazioaren hizkuntza";
@@ -3688,6 +3870,109 @@ public class MainActivity extends Activity {
         return genreText.isEmpty() ? "" : genreText;
     }
 
+    void loadPendingAccountControls(LinearLayout slot) {
+        if (clientApiToken().isEmpty()) return;
+        io.execute(() -> {
+            try {
+                JSONObject account = getJson("/api/v1/auth/me");
+                if (!account.optBoolean("is_admin")) return;
+                JSONArray pending = getArray("/api/v1/admin/accounts/pending");
+                runOnUiThread(() -> {
+                    if (!showingAdmin || slot.getParent() == null) return;
+                    slot.removeAllViews();
+                    if (pending.length() == 0) {
+                        slot.setVisibility(View.GONE);
+                        return;
+                    }
+                    slot.setVisibility(View.VISIBLE);
+                    LinearLayout card = settingsCard();
+                    slot.addView(card);
+                    card.addView(label("Cuentas pendientes de aprobación (" + pending.length() + ")",
+                            16, Color.WHITE, true));
+                    TextView hint = label("Estas cuentas todavía no pueden acceder a la biblioteca.",
+                            12, MUTED, false);
+                    LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(-1, -2);
+                    hintParams.topMargin = d(5);
+                    card.addView(hint, hintParams);
+                    for (int i = 0; i < pending.length(); i++) {
+                        JSONObject request = pending.optJSONObject(i);
+                        if (request == null) continue;
+                        String accountId = request.optString("id", "");
+                        String username = request.optString("username", request.optString("email", ""));
+                        LinearLayout row = new LinearLayout(this);
+                        row.setGravity(Gravity.CENTER_VERTICAL);
+                        LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, -2);
+                        rowParams.topMargin = d(10);
+                        card.addView(row, rowParams);
+                        TextView usernameLabel = label(username, 14, Color.WHITE, false);
+                        usernameLabel.setSingleLine(true);
+                        usernameLabel.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                        row.addView(usernameLabel, new LinearLayout.LayoutParams(0, d(46), 1));
+                        LinearLayout actions = new LinearLayout(this);
+                        actions.setGravity(Gravity.CENTER_VERTICAL);
+                        row.addView(actions, new LinearLayout.LayoutParams(-2, -2));
+                        Button approve = actionButton("Aprobar", true);
+                        actions.addView(approve, new LinearLayout.LayoutParams(-2, d(44)));
+                        approve.setOnClickListener(v -> new AlertDialog.Builder(this)
+                                .setTitle("Aprobar cuenta")
+                                .setMessage("¿Permitir que " + username + " acceda a Zinema y cree sus perfiles?")
+                                .setNegativeButton("Cancelar", null)
+                                .setPositiveButton("Aprobar", (dialog, which) -> {
+                                    approve.setEnabled(false);
+                                    io.execute(() -> {
+                                        try {
+                                            postJson("/api/v1/admin/accounts/" + enc(accountId) + "/approve");
+                                            runOnUiThread(() -> {
+                                                Toast.makeText(this, "Cuenta aprobada: " + username,
+                                                        Toast.LENGTH_LONG).show();
+                                                loadPendingAccountControls(slot);
+                                            });
+                                        } catch (Exception e) {
+                                            runOnUiThread(() -> {
+                                                approve.setEnabled(true);
+                                                Toast.makeText(this, "No se pudo aprobar la cuenta: " + e.getMessage(),
+                                                        Toast.LENGTH_LONG).show();
+                                            });
+                                        }
+                                    });
+                                }).show());
+                        Button reject = actionButton("Rechazar", false);
+                        LinearLayout.LayoutParams rejectParams = new LinearLayout.LayoutParams(-2, d(44));
+                        rejectParams.leftMargin = d(7);
+                        actions.addView(reject, rejectParams);
+                        reject.setOnClickListener(v -> new AlertDialog.Builder(this)
+                                .setTitle("Rechazar cuenta")
+                                .setMessage("¿Rechazar y eliminar la cuenta de " + username + "?")
+                                .setNegativeButton("Cancelar", null)
+                                .setPositiveButton("Rechazar", (dialog, which) -> {
+                                    reject.setEnabled(false);
+                                    approve.setEnabled(false);
+                                    io.execute(() -> {
+                                        try {
+                                            postJson("/api/v1/admin/accounts/" + enc(accountId) + "/reject");
+                                            runOnUiThread(() -> {
+                                                Toast.makeText(this, "Cuenta rechazada y eliminada: " + username,
+                                                        Toast.LENGTH_LONG).show();
+                                                loadPendingAccountControls(slot);
+                                            });
+                                        } catch (Exception e) {
+                                            runOnUiThread(() -> {
+                                                reject.setEnabled(true);
+                                                approve.setEnabled(true);
+                                                Toast.makeText(this, "No se pudo rechazar la cuenta: " + e.getMessage(),
+                                                        Toast.LENGTH_LONG).show();
+                                            });
+                                        }
+                                    });
+                                }).show());
+                    }
+                });
+            } catch (Exception ignored) {
+                // Hide account approval controls when the device is not an administrator.
+            }
+        });
+    }
+
     void loadAdminSyncControls(LinearLayout slot) {
         io.execute(() -> {
             try {
@@ -3835,12 +4120,140 @@ public class MainActivity extends Activity {
     }
 
     void showSettings() {
+        if (clientApiToken().isEmpty()) {
+            showLoginScreen();
+            return;
+        }
         leaveStartupHomeWait();
         if (!showingAdmin) adminReturnDetailId = showingDetail ? detailNodeId : "";
         showingAdmin = true;
         showingDetail = false;
         buildShell("Administración");
-        renderAdminWindow(serverName, server, prefs.getString("account_email", ""));
+        renderAdminWindow();
+    }
+
+    void showLoginScreen() {
+        leaveStartupHomeWait();
+        showingAdmin = false;
+        showingProfiles = false;
+        profileEditorVisible = false;
+        FrameLayout root = new FrameLayout(this);
+        GradientDrawable background = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                new int[]{0xFF27090D, 0xFF111014, BG, 0xFF060709});
+        root.setBackground(background);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.setVerticalScrollBarEnabled(false);
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setGravity(Gravity.CENTER_HORIZONTAL);
+        screen.setPadding(d(24), d(34), d(24), d(34));
+        scroll.addView(screen);
+        root.addView(scroll, new FrameLayout.LayoutParams(-1, -1));
+
+        View topSpacer = new View(this);
+        screen.addView(topSpacer, new LinearLayout.LayoutParams(1, 0, 1));
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.drawable.zinema_wordmark);
+        logo.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        logo.setContentDescription("Zinema");
+        screen.addView(logo, new LinearLayout.LayoutParams(d(220), d(74)));
+        TextView tagline = label(t("Películas y series, para toda la familia"), 15, 0xFFD7D7DB, false);
+        LinearLayout.LayoutParams taglineParams = new LinearLayout.LayoutParams(-2, -2);
+        taglineParams.topMargin = d(8);
+        taglineParams.bottomMargin = d(28);
+        screen.addView(tagline, taglineParams);
+
+        int width = Math.max(d(250), Math.min(d(430),
+                getResources().getDisplayMetrics().widthPixels - d(48)));
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(d(26), d(26), d(26), d(24));
+        card.setBackground(round(0xF01A1B20, d(18)));
+        card.setElevation(d(12));
+        screen.addView(card, new LinearLayout.LayoutParams(width, -2));
+
+        TextView heading = label(t("Iniciar sesión"), 27, Color.WHITE, true);
+        card.addView(heading);
+        TextView intro = label(t("Entra para acceder a tus perfiles y a todo el catálogo."),
+                14, MUTED, false);
+        LinearLayout.LayoutParams introParams = new LinearLayout.LayoutParams(-1, -2);
+        introParams.topMargin = d(6);
+        introParams.bottomMargin = d(22);
+        card.addView(intro, introParams);
+
+        EditText usernameInput = settingsField("", t("Usuario"), false);
+        usernameInput.setSingleLine(true);
+        usernameInput.setTextSize(16);
+        usernameInput.setPadding(d(15), 0, d(15), 0);
+        usernameInput.setBackground(round(0xFF303139, d(9)));
+        usernameInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+        card.addView(usernameInput, new LinearLayout.LayoutParams(-1, d(52)));
+
+        EditText passwordInput = settingsField("", t("Contraseña"), false);
+        passwordInput.setSingleLine(true);
+        passwordInput.setTextSize(16);
+        passwordInput.setPadding(d(15), 0, d(15), 0);
+        passwordInput.setBackground(round(0xFF303139, d(9)));
+        passwordInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        passwordInput.setTransformationMethod(PasswordTransformationMethod.getInstance());
+        LinearLayout.LayoutParams passwordParams = new LinearLayout.LayoutParams(-1, d(52));
+        passwordParams.topMargin = d(12);
+        card.addView(passwordInput, passwordParams);
+
+        TextView accountStatus = label("", 13, 0xFFFFB1B5, false);
+        accountStatus.setVisibility(View.GONE);
+        LinearLayout.LayoutParams accountStatusParams = new LinearLayout.LayoutParams(-1, -2);
+        accountStatusParams.topMargin = d(14);
+        card.addView(accountStatus, accountStatusParams);
+
+        Button login = actionButton(t("Iniciar sesión"), true);
+        LinearLayout.LayoutParams loginParams = new LinearLayout.LayoutParams(-1, d(50));
+        loginParams.topMargin = d(20);
+        card.addView(login, loginParams);
+        Button register = actionButton(t("Crear cuenta"), false);
+        LinearLayout.LayoutParams registerParams = new LinearLayout.LayoutParams(-1, d(48));
+        registerParams.topMargin = d(10);
+        card.addView(register, registerParams);
+        TextView approvalHint = label(t("Las cuentas nuevas necesitan la aprobación de un administrador."),
+                12, MUTED, false);
+        approvalHint.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams approvalParams = new LinearLayout.LayoutParams(-1, -2);
+        approvalParams.topMargin = d(16);
+        card.addView(approvalHint, approvalParams);
+
+        TextView brand = label("ZINEMA", 12, 0xFF85858D, true);
+        LinearLayout.LayoutParams brandParams = new LinearLayout.LayoutParams(-2, -2);
+        brandParams.topMargin = d(24);
+        screen.addView(brand, brandParams);
+        View bottomSpacer = new View(this);
+        screen.addView(bottomSpacer, new LinearLayout.LayoutParams(1, 0, 1));
+
+        login.setOnClickListener(v -> {
+            String username = usernameInput.getText().toString().trim();
+            String password = passwordInput.getText().toString();
+            if (username.length() < 3 || password.isEmpty()) {
+                accountStatus.setText(t("Introduce tu usuario y contraseña."));
+                accountStatus.setVisibility(View.VISIBLE);
+                return;
+            }
+            authenticateAccount(username, password, false, "", passwordInput, accountStatus);
+        });
+        register.setOnClickListener(v -> {
+            String username = usernameInput.getText().toString().trim();
+            String password = passwordInput.getText().toString();
+            if (username.length() < 3 || password.length() < 8) {
+                accountStatus.setText(t("El usuario debe tener al menos 3 caracteres y la contraseña 8."));
+                accountStatus.setVisibility(View.VISIBLE);
+                return;
+            }
+            authenticateAccount(username, password, true, "", passwordInput, accountStatus);
+        });
+        setContentView(root);
+        login.requestFocus();
     }
 
     EditText settingsField(String value, String hint, boolean uri) {
@@ -3858,71 +4271,47 @@ public class MainActivity extends Activity {
         return input;
     }
 
-    void renderAdminWindow(String initialName, String initialServer) {
-        renderAdminWindow(initialName, initialServer, "");
-    }
-
-    void renderAdminWindow(String initialName, String initialServer, String initialEmail) {
+    void renderAdminWindow() {
         content.removeAllViews();
         LinearLayout screen = new LinearLayout(this);
         screen.setOrientation(LinearLayout.VERTICAL);
         screen.setPadding(d(20), d(14), d(20), d(24));
         TextView heading = label("Administración", 27, Color.WHITE, true);
         screen.addView(heading);
-        TextView intro = label("Configuración del servidor", 14, MUTED, false);
+        TextView intro = label(t("Ajustes de Zinema"), 14, MUTED, false);
         LinearLayout.LayoutParams introP = new LinearLayout.LayoutParams(-1, -2);
         introP.topMargin = d(5);
         introP.bottomMargin = d(20);
         screen.addView(intro, introP);
 
-        LinearLayout serverCard = settingsCard();
-        serverCard.addView(label("Nombre del servidor", 13, MUTED, true));
-        EditText nameInput = settingsField(initialName, "Zinema NAS", false);
-        addSettingInput(serverCard, nameInput);
-        TextView urlLabel = label("Dirección del servidor", 13, MUTED, true);
-        LinearLayout.LayoutParams urlP = new LinearLayout.LayoutParams(-1, -2);
-        urlP.topMargin = d(16);
-        serverCard.addView(urlLabel, urlP);
-        EditText urlInput = settingsField(initialServer, "https://servidor", true);
-        addSettingInput(serverCard, urlInput);
-        TextView apiTokenLabel = label(t("Cuenta Zinema"), 13, MUTED, true);
-        LinearLayout.LayoutParams apiTokenLabelParams = new LinearLayout.LayoutParams(-1, -2);
-        apiTokenLabelParams.topMargin = d(16);
-        serverCard.addView(apiTokenLabel, apiTokenLabelParams);
-        EditText emailInput = settingsField(initialEmail, "Email", false);
-        emailInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT
-                | android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS);
-        addSettingInput(serverCard, emailInput);
-        EditText passwordInput = settingsField("", "Contraseña", false);
-        passwordInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT
-                | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        passwordInput.setTransformationMethod(PasswordTransformationMethod.getInstance());
-        addSettingInput(serverCard, passwordInput);
-        TextView apiTokenHint = label(t("Inicia sesión para vincular esta instalación a tu cuenta. Cada dispositivo recibe su propio token."),
+        LinearLayout playerCard = settingsCard();
+        LinearLayout.LayoutParams playerCardParams = new LinearLayout.LayoutParams(-1, -2);
+        playerCardParams.bottomMargin = d(14);
+        screen.addView(playerCard, playerCardParams);
+        playerCard.addView(label("Reproductor", 14, Color.WHITE, true));
+        TextView playerHint = label("VLC devuelve posición y duración al terminar. El reproductor de Zinema incluye controles y guarda el progreso mientras ves el vídeo.",
                 12, MUTED, false);
-        LinearLayout.LayoutParams apiTokenHintParams = new LinearLayout.LayoutParams(-1, -2);
-        apiTokenHintParams.topMargin = d(6);
-        serverCard.addView(apiTokenHint, apiTokenHintParams);
-        LinearLayout connectButtons = new LinearLayout(this);
-        connectButtons.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams buttonsP = new LinearLayout.LayoutParams(-1, -2);
-        buttonsP.topMargin = d(16);
-        serverCard.addView(connectButtons, buttonsP);
-        Button check = actionButton("Probar conexión", false);
-        connectButtons.addView(check, new LinearLayout.LayoutParams(0, d(48), 1));
-        Button save = actionButton("Guardar y conectar", true);
-        LinearLayout.LayoutParams saveP = new LinearLayout.LayoutParams(0, d(48), 1);
-        saveP.leftMargin = d(9);
-        connectButtons.addView(save, saveP);
-        Button register = actionButton("Crear cuenta", false);
-        LinearLayout.LayoutParams registerP = new LinearLayout.LayoutParams(-1, d(44));
-        registerP.topMargin = d(8);
-        serverCard.addView(register, registerP);
-        TextView status = label(t("Servidor actual") + ": " + serverName, 12, MUTED, false);
-        LinearLayout.LayoutParams statusP = new LinearLayout.LayoutParams(-1, -2);
-        statusP.topMargin = d(12);
-        serverCard.addView(status, statusP);
-        screen.addView(serverCard);
+        LinearLayout.LayoutParams playerHintParams = new LinearLayout.LayoutParams(-1, -2);
+        playerHintParams.topMargin = d(5);
+        playerCard.addView(playerHint, playerHintParams);
+        RadioGroup playerGroup = new RadioGroup(this);
+        playerGroup.setOrientation(RadioGroup.VERTICAL);
+        LinearLayout.LayoutParams playerGroupParams = new LinearLayout.LayoutParams(-1, -2);
+        playerGroupParams.topMargin = d(8);
+        playerCard.addView(playerGroup, playerGroupParams);
+        RadioButton zinemaPlayer = settingsRadio("Reproductor de Zinema", "builtin".equals(prefs.getString("player", "vlc")));
+        zinemaPlayer.setId(View.generateViewId());
+        playerGroup.addView(zinemaPlayer);
+        RadioButton vlcPlayer = settingsRadio("VLC", "vlc".equals(prefs.getString("player", "vlc")));
+        vlcPlayer.setId(View.generateViewId());
+        playerGroup.addView(vlcPlayer);
+        playerGroup.setOnCheckedChangeListener((group, checkedId) -> {
+            String choice = checkedId == vlcPlayer.getId() ? "vlc" : "builtin";
+            prefs.edit().putString("player", choice).apply();
+            Toast.makeText(this, choice.equals("vlc")
+                    ? "Se usará VLC. Si no está instalado, se abrirá el reproductor de Zinema."
+                    : "Se usará el reproductor de Zinema.", Toast.LENGTH_SHORT).show();
+        });
 
         LinearLayout syncSlot = new LinearLayout(this);
         syncSlot.setOrientation(LinearLayout.VERTICAL);
@@ -3947,8 +4336,8 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams basqueP = new LinearLayout.LayoutParams(0, d(46), 1);
         basqueP.leftMargin = d(9);
         languageButtons.addView(basque, basqueP);
-        spanish.setOnClickListener(v -> changeLanguage("es", nameInput, urlInput, emailInput));
-        basque.setOnClickListener(v -> changeLanguage("eu", nameInput, urlInput, emailInput));
+        spanish.setOnClickListener(v -> changeLanguage("es"));
+        basque.setOnClickListener(v -> changeLanguage("eu"));
 
         TextView attribution = label("This product uses the TMDB API but is not endorsed or certified by TMDB.",
                 11, MUTED, false);
@@ -3956,93 +4345,189 @@ public class MainActivity extends Activity {
         screen.addView(attribution);
         content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
         loadAdminSyncControls(syncSlot);
+    }
 
-        check.setOnClickListener(v -> {
-            String candidate = normalizeServerUrl(urlInput.getText().toString());
-            if (candidate.isEmpty()) {
-                Toast.makeText(this, t("Escribe una URL válida."), Toast.LENGTH_LONG).show();
-                return;
-            }
-            status.setText(t("Conectando…"));
-            io.execute(() -> {
-                boolean ok = false;
-                HttpURLConnection connection = null;
-                try {
-                    connection = (HttpURLConnection) new URL(candidate + "/health").openConnection();
-                    connection.setRequestMethod("GET");
-                    connection.setConnectTimeout(7000);
-                    connection.setReadTimeout(7000);
-                    ok = connection.getResponseCode() >= 200 && connection.getResponseCode() < 300;
-                } catch (Exception ignored) { }
-                finally { if (connection != null) connection.disconnect(); }
-                final boolean connected = ok;
+    void showAccountManagement() {
+        if (clientApiToken().isEmpty()) {
+            showLoginScreen();
+            return;
+        }
+        leaveStartupHomeWait();
+        showingAdmin = true;
+        showingDetail = false;
+        buildShell("Gestión de cuentas");
+        renderAccountManagement();
+    }
+
+    void renderAccountManagement() {
+        content.removeAllViews();
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setPadding(d(20), d(14), d(20), d(24));
+        screen.addView(label("Gestión de cuentas", 27, Color.WHITE, true));
+        TextView description = label("Permite, deniega o elimina el acceso a Zinema.", 14, MUTED, false);
+        LinearLayout.LayoutParams descriptionParams = new LinearLayout.LayoutParams(-1, -2);
+        descriptionParams.topMargin = d(5);
+        descriptionParams.bottomMargin = d(16);
+        screen.addView(description, descriptionParams);
+        ProgressBar progress = new ProgressBar(this);
+        progress.setIndeterminate(true);
+        screen.addView(progress, new LinearLayout.LayoutParams(-2, d(44)));
+        content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
+        io.execute(() -> {
+            try {
+                JSONObject current = getJson("/api/v1/auth/me");
+                if (!current.optBoolean("is_admin")) throw new Exception("Solo los administradores pueden gestionar cuentas.");
+                String currentAccountId = current.optString("id", "");
+                JSONArray accounts = getArray("/api/v1/admin/accounts");
                 runOnUiThread(() -> {
-                    status.setText(connected ? t("Conexión correcta") : t("No se pudo conectar con esa dirección."));
-                    Toast.makeText(this, connected ? t("Conexión correcta") : t("No se pudo conectar con esa dirección."),
-                            Toast.LENGTH_LONG).show();
+                    if (!showingAdmin || screen.getParent() == null) return;
+                    screen.removeView(progress);
+                    if (accounts.length() == 0) {
+                        screen.addView(label("Todavía no hay cuentas registradas.", 14, MUTED, false));
+                        return;
+                    }
+                    for (int i = 0; i < accounts.length(); i++) {
+                        JSONObject account = accounts.optJSONObject(i);
+                        if (account == null) continue;
+                        String accountId = account.optString("id", "");
+                        String username = account.optString("username", "Cuenta");
+                        boolean isCurrentAccount = accountId.equals(currentAccountId);
+                        boolean approved = account.optBoolean("approved");
+                        boolean disabled = account.optBoolean("disabled");
+                        boolean isAdmin = account.optBoolean("is_admin");
+                        boolean approvalSatisfied = approved || isAdmin;
+                        String state = isCurrentAccount ? "Sesión actual"
+                                : (disabled ? "Acceso denegado"
+                                : (!approvalSatisfied ? "Pendiente de aprobación" : "Acceso permitido"));
+                        LinearLayout card = settingsCard();
+                        LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(-1, -2);
+                        cardParams.bottomMargin = d(10);
+                        screen.addView(card, cardParams);
+                        TextView userLabel = label(username + (isAdmin ? "  ·  Admin" : ""), 16, Color.WHITE, true);
+                        card.addView(userLabel);
+                        TextView stateLabel = label(state, 12,
+                                !approvalSatisfied || disabled ? 0xFFFFB1B5 : 0xFF79E3B7, false);
+                        LinearLayout.LayoutParams stateParams = new LinearLayout.LayoutParams(-1, -2);
+                        stateParams.topMargin = d(4);
+                        card.addView(stateLabel, stateParams);
+
+                        LinearLayout actions = new LinearLayout(this);
+                        actions.setGravity(Gravity.CENTER_VERTICAL);
+                        LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(-1, -2);
+                        actionsParams.topMargin = d(10);
+                        card.addView(actions, actionsParams);
+                        if (isCurrentAccount) continue;
+                        if (!approvalSatisfied && !disabled) {
+                            Button allow = actionButton("Permitir", true);
+                            actions.addView(allow, new LinearLayout.LayoutParams(0, d(44), 1));
+                            allow.setOnClickListener(v -> confirmAccountChange(username, "Permitir acceso",
+                                    "¿Permitir que " + username + " acceda al catálogo?", () -> {
+                                        try { postJson("/api/v1/admin/accounts/" + enc(accountId) + "/approve"); }
+                                        catch (Exception e) { throw new RuntimeException(e); }
+                                    }));
+                            Button deny = actionButton("Denegar", false);
+                            LinearLayout.LayoutParams denyParams = new LinearLayout.LayoutParams(0, d(44), 1);
+                            denyParams.leftMargin = d(6);
+                            actions.addView(deny, denyParams);
+                            deny.setOnClickListener(v -> confirmAccountChange(username, "Denegar acceso",
+                                    "¿Denegar temporalmente a " + username + "? Podrás permitirlo después.", () -> {
+                                        try { adminAccountRequest("POST", "/api/v1/admin/accounts/" + enc(accountId) + "/disable"); }
+                                        catch (Exception e) { throw new RuntimeException(e); }
+                                    }));
+                        } else if (disabled) {
+                            Button allow = actionButton("Permitir", true);
+                            actions.addView(allow, new LinearLayout.LayoutParams(0, d(44), 1));
+                            allow.setOnClickListener(v -> confirmAccountChange(username, "Permitir acceso",
+                                    "¿Permitir que " + username + " acceda al catálogo?", () -> {
+                                        try { postJson("/api/v1/admin/accounts/" + enc(accountId) + "/approve"); }
+                                        catch (Exception e) { throw new RuntimeException(e); }
+                                    }));
+                        } else {
+                            Button deny = actionButton("Denegar", false);
+                            actions.addView(deny, new LinearLayout.LayoutParams(0, d(44), 1));
+                            deny.setOnClickListener(v -> confirmAccountChange(username, "Denegar acceso",
+                                    "¿Bloquear a " + username + "? Podrás volver a permitirlo después.", () -> {
+                                        try { adminAccountRequest("POST", "/api/v1/admin/accounts/" + enc(accountId) + "/disable"); }
+                                        catch (Exception e) { throw new RuntimeException(e); }
+                                    }));
+                        }
+                        Button delete = actionButton("Borrar", false);
+                        LinearLayout.LayoutParams deleteParams = new LinearLayout.LayoutParams(0, d(44), 1);
+                        deleteParams.leftMargin = d(8);
+                        actions.addView(delete, deleteParams);
+                        delete.setOnClickListener(v -> confirmAccountChange(username, "Borrar cuenta",
+                                "¿Borrar definitivamente la cuenta " + username + " y sus perfiles?", () -> {
+                                    try { adminAccountRequest("DELETE", "/api/v1/admin/accounts/" + enc(accountId)); }
+                                    catch (Exception e) { throw new RuntimeException(e); }
+                                }));
+                    }
                 });
-            });
-        });
-        save.setOnClickListener(v -> {
-            String value = normalizeServerUrl(urlInput.getText().toString());
-            String name = nameInput.getText().toString().trim();
-            if (value.isEmpty()) { Toast.makeText(this, t("Escribe una URL válida."), Toast.LENGTH_LONG).show(); return; }
-            if (name.isEmpty()) { Toast.makeText(this, t("El nombre del servidor no puede estar vacío."), Toast.LENGTH_LONG).show(); return; }
-            boolean serverChanged = !server.equals(value);
-            String email = emailInput.getText().toString().trim();
-            String password = passwordInput.getText().toString();
-            if ((email.isEmpty() || password.isEmpty())
-                    && (clientApiToken().isEmpty() || serverChanged)) {
-                Toast.makeText(this, t("Introduce email y contraseña para iniciar sesión."),
-                        Toast.LENGTH_LONG).show();
-                return;
+            } catch (Exception e) {
+                String message = e.getMessage() == null ? "No se pudieron cargar las cuentas." : e.getMessage();
+                runOnUiThread(() -> {
+                    if (!showingAdmin || screen.getParent() == null) return;
+                    screen.removeView(progress);
+                    screen.addView(label(message, 14, 0xFFFFB1B5, false));
+                    Button retry = actionButton("Reintentar", true);
+                    LinearLayout.LayoutParams retryParams = new LinearLayout.LayoutParams(-2, d(44));
+                    retryParams.topMargin = d(12);
+                    screen.addView(retry, retryParams);
+                    retry.setOnClickListener(v -> renderAccountManagement());
+                });
             }
-            server = value;
-            serverName = name;
-            if (serverChanged) {
-                startupPrefetchPending = false;
-                startupHomeAwaiting = false;
-                clearCatalogCache();
-                catalogVersion = "";
-                lastCatalogVersionCheckMs = 0L;
-            }
-            prefs.edit().putString("server", server).putString("server_name", serverName).apply();
-            imageCache.evictAll();
-            requestedImages.clear();
-            if (!email.isEmpty() && !password.isEmpty()) {
-                String currentDeviceId = serverChanged ? "" : prefs.getString("client_device_id", "");
-                authenticateAccount(email, password, false, currentDeviceId, passwordInput);
-            } else {
-                showingAdmin = false;
-                lastProfileSyncMs = 0L;
-                loadHome();
-                synchronizeProfilesFromServer(true);
-            }
-        });
-        register.setOnClickListener(v -> {
-            String email = emailInput.getText().toString().trim();
-            String password = passwordInput.getText().toString();
-            String value = normalizeServerUrl(urlInput.getText().toString());
-            String name = nameInput.getText().toString().trim();
-            if (email.isEmpty() || password.length() < 8) {
-                Toast.makeText(this, t("Indica un email y una contraseña de al menos 8 caracteres."),
-                        Toast.LENGTH_LONG).show();
-                return;
-            }
-            if (value.isEmpty() || name.isEmpty()) {
-                Toast.makeText(this, t("Revisa la dirección y el nombre del servidor."), Toast.LENGTH_LONG).show();
-                return;
-            }
-            server = value;
-            serverName = name;
-            prefs.edit().putString("server", server).putString("server_name", serverName).apply();
-            authenticateAccount(email, password, true,
-                    prefs.getString("client_device_id", ""), passwordInput);
         });
     }
 
-    void authenticateAccount(String email, String password, boolean register,
-                             String currentDeviceId, EditText passwordInput) {
+    interface AccountChange { void run() throws Exception; }
+
+    void confirmAccountChange(String username, String title, String message, AccountChange change) {
+        new AlertDialog.Builder(this).setTitle(title).setMessage(message)
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Confirmar", (dialog, which) -> io.execute(() -> {
+                    try {
+                        change.run();
+                        runOnUiThread(() -> {
+                            Toast.makeText(this, "Cuenta actualizada: " + username, Toast.LENGTH_SHORT).show();
+                            renderAccountManagement();
+                        });
+                    } catch (Exception e) {
+                        Throwable cause = e instanceof RuntimeException && e.getCause() != null ? e.getCause() : e;
+                        String messageText = cause.getMessage() == null ? "No se pudo actualizar la cuenta." : cause.getMessage();
+                        runOnUiThread(() -> Toast.makeText(this, messageText, Toast.LENGTH_LONG).show());
+                    }
+                })).show();
+    }
+
+    JSONObject adminAccountRequest(String method, String path) throws Exception {
+        String token = clientApiToken();
+        if (token.isEmpty()) throw new Exception("Inicia sesión con una cuenta administradora.");
+        HttpURLConnection connection = (HttpURLConnection) new URL(server + path).openConnection();
+        connection.setRequestMethod(method);
+        connection.setConnectTimeout(12000);
+        connection.setReadTimeout(20000);
+        connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("Authorization", "Bearer " + token);
+        if ("POST".equals(method)) {
+            connection.setDoOutput(true);
+            connection.getOutputStream().close();
+        }
+        int status = connection.getResponseCode();
+        InputStream input = status < 400 ? connection.getInputStream() : connection.getErrorStream();
+        String body = readText(input);
+        connection.disconnect();
+        if (status < 200 || status >= 300) {
+            String detail = body;
+            try { detail = new JSONObject(body).optString("detail", body); }
+            catch (JSONException ignored) { }
+            throw new Exception(detail.isEmpty() ? "HTTP " + status : detail);
+        }
+        return body.isEmpty() ? new JSONObject() : new JSONObject(body);
+    }
+
+    void authenticateAccount(String username, String password, boolean register,
+                             String currentDeviceId, EditText passwordInput,
+                             TextView accountStatus) {
         Toast.makeText(this, register ? t("Creando cuenta…") : t("Iniciando sesión…"), Toast.LENGTH_SHORT).show();
         io.execute(() -> {
             HttpURLConnection connection = null;
@@ -4050,7 +4535,8 @@ public class MainActivity extends Activity {
                 JSONObject payload = new JSONObject();
                 String deviceName = (android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL).trim();
                 payload.put("device_name", deviceName.isEmpty() ? "Android" : deviceName);
-                payload.put("email", email);
+                payload.put("username", username);
+                payload.put("email", username);
                 payload.put("password", password);
                 if (currentDeviceId != null && !currentDeviceId.isEmpty()) {
                     payload.put("device_id", currentDeviceId);
@@ -4074,29 +4560,57 @@ public class MainActivity extends Activity {
                     throw new Exception("HTTP " + status + (detail.isEmpty() ? "" : ": " + detail));
                 }
                 JSONObject result = new JSONObject(body);
+                if (register && "pending_approval".equals(result.optString("status"))) {
+                    runOnUiThread(() -> {
+                        passwordInput.setText("");
+                        accountStatus.setText(t("Solicitud enviada. Espera a que un administrador apruebe tu cuenta; después inicia sesión para recuperar tus perfiles y el catálogo."));
+                        accountStatus.setVisibility(View.VISIBLE);
+                    });
+                    return;
+                }
                 String deviceToken = result.optString("token", "");
                 String deviceId = result.optString("device_id", "");
                 if (deviceToken.isEmpty() || deviceId.isEmpty()) {
                     throw new Exception("El servidor no devolvió las credenciales del dispositivo.");
                 }
-                String previousEmail = prefs.getString("account_email", "");
-                if (!previousEmail.isEmpty() && !previousEmail.equalsIgnoreCase(email)) {
+                JSONObject verifiedAccount = getAccountInfoForToken(deviceToken);
+                if (!verifiedAccount.optBoolean("is_admin")
+                        && (!verifiedAccount.has("approved") || !verifiedAccount.optBoolean("approved"))) {
+                    throw new Exception("El servidor no confirma la aprobación de esta cuenta. Actualiza el servidor antes de continuar.");
+                }
+                String previousUsername = prefs.getString("account_email", "");
+                if (!previousUsername.equalsIgnoreCase(username)) {
                     clearLocalProfilesForAccountSwitch();
                 }
                 storeClientApiToken(deviceToken);
                 prefs.edit().putString("client_device_id", deviceId)
-                        .putString("account_email", email).remove("profile_sync_token").apply();
+                        .putString("account_email", username).remove("profile_sync_token").apply();
                 runOnUiThread(() -> {
                     passwordInput.setText("");
+                    accountStatus.setVisibility(View.GONE);
                     showingAdmin = false;
                     lastProfileSyncMs = 0L;
+                    synchronized (MainActivity.this) {
+                        startupPrefetchPending = true;
+                        startupPrefetchReady = false;
+                        startupPrefetchStarted = false;
+                        startupHomeAwaiting = false;
+                    }
+                    startupPrefetchError = null;
+                    startStartupPrefetch();
                     loadHome();
-                    synchronizeProfilesFromServer(true);
                 });
             } catch (Exception e) {
                 String message = e.getMessage();
-                runOnUiThread(() -> Toast.makeText(this,
-                        "No se pudo vincular el dispositivo: " + message, Toast.LENGTH_LONG).show());
+                runOnUiThread(() -> {
+                    String detail = message == null ? "No se pudo completar la solicitud." : message;
+                    detail = detail.replaceFirst("^HTTP \\d+: ", "");
+                    if (detail.startsWith("Invalid email or password")) {
+                        detail = "Usuario o contraseña incorrectos.";
+                    }
+                    accountStatus.setText(detail);
+                    accountStatus.setVisibility(View.VISIBLE);
+                });
             } finally {
                 if (connection != null) connection.disconnect();
             }
@@ -4109,7 +4623,9 @@ public class MainActivity extends Activity {
         for (String key : prefs.getAll().keySet()) {
             if (key.startsWith("p:") || key.startsWith("profile_sync_dirty:")
                     || key.startsWith("profile_metadata_dirty:")
-                    || key.startsWith("profile_sync_revision:")) {
+                    || key.startsWith("profile_sync_revision:")
+                    || key.startsWith("watch:") || key.startsWith("seen:")
+                    || key.startsWith("fav:")) {
                 editor.remove(key);
             }
         }
@@ -4124,25 +4640,23 @@ public class MainActivity extends Activity {
         return card;
     }
 
-    void addSettingInput(LinearLayout parent, EditText input) {
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, d(48));
-        p.topMargin = d(7);
-        parent.addView(input, p);
+    RadioButton settingsRadio(String text, boolean checked) {
+        RadioButton button = new RadioButton(this);
+        button.setText(t(text));
+        button.setTextColor(Color.WHITE);
+        button.setTextSize(14);
+        button.setButtonTintList(android.content.res.ColorStateList.valueOf(RED));
+        button.setChecked(checked);
+        button.setMinHeight(d(44));
+        button.setFocusable(true);
+        button.setFocusableInTouchMode(false);
+        applyTvFocusStyle(button, false);
+        return button;
     }
 
-    String normalizeServerUrl(String input) {
-        String value = trimBase(input);
-        if (!value.startsWith("http://") && !value.startsWith("https://")) value = "https://" + value;
-        return value.length() >= 10 ? value : "";
-    }
-
-    void changeLanguage(String language, EditText nameInput, EditText urlInput,
-                        EditText emailInput) {
-        String name = nameInput.getText().toString();
-        String address = urlInput.getText().toString();
-        String email = emailInput.getText().toString();
+    void changeLanguage(String language) {
         prefs.edit().putString("language", language).apply();
-        renderAdminWindow(name, address, email);
+        renderAdminWindow();
     }
 
     void renderError(String error) {
@@ -4377,6 +4891,10 @@ public class MainActivity extends Activity {
 
     @Override public void onBackPressed() {
         if (introShowing) return;
+        if (clientApiToken().isEmpty()) {
+            finishAndRemoveTask();
+            return;
+        }
         if (showingProfiles) {
             if (profileEditorVisible) backFromProfileEditor();
             else if (readProfiles().isEmpty()) showProfileEditor(null);

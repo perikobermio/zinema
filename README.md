@@ -99,9 +99,9 @@ Tras una sincronización inicial completada, el servidor vuelve a escanear diari
 
 ## API para el cliente
 
-Las cuentas se crean con email y contraseña. La pantalla Administración del cliente permite iniciar sesión o registrar una cuenta. En un registro abierto, la cuenta nueva tiene permisos normales. La cuenta creada con `create-admin.sh` puede acceder además a las rutas de administración y crear otras cuentas.
+Las cuentas cliente se crean con usuario y contraseña. Tras el registro quedan pendientes y no pueden iniciar sesión ni consultar la biblioteca hasta que un administrador las apruebe. Las cuentas administradoras no requieren aprobación. Al desplegar esta protección, las cuentas estándar ya existentes también quedan pendientes de una revisión inicial; las cuentas administradoras conservan el acceso. Desde **Gestión de cuentas**, accesible en el menú del avatar del cliente, el administrador puede permitir el acceso, denegarlo temporalmente o borrar la cuenta y sus perfiles. `create-admin.sh` crea o promueve una cuenta administradora a partir de un email.
 
-El login y el registro emiten un token aleatorio revocable para esa instalación. Android lo cifra con Android Keystore; el servidor guarda solamente su hash. Las contraseñas se guardan con Argon2id. Las rutas de datos requieren `Authorization: Bearer <token>`; `/health` queda pública para comprobar conectividad, y registro/login son los únicos endpoints de cuenta sin sesión. VLC recibe un ticket de reproducción temporal después de que la app se autentique.
+El inicio de sesión emite un token aleatorio revocable para esa instalación. El registro responde con estado pendiente y no emite token. Android cifra el token con Android Keystore; el servidor guarda solamente su hash. Las contraseñas se guardan con Argon2id. Las rutas de datos requieren `Authorization: Bearer <token>`; `/health` queda pública para comprobar conectividad, y registro/login son los únicos endpoints de cuenta sin sesión. VLC recibe un ticket de reproducción temporal después de que la app se autentique.
 
 Ejemplo de login desde terminal (no guardes la contraseña en el historial del shell):
 
@@ -111,7 +111,7 @@ curl -X POST 'http://localhost:8180/api/v1/auth/login' \
   -d '{"email":"tu@email","password":"...","device_name":"Terminal"}'
 ```
 
-`POST /api/v1/auth/register` acepta el mismo cuerpo para crear una cuenta estándar. `GET /api/v1/auth/me` devuelve la cuenta y su número de perfiles. Los perfiles y su estado de reproducción pertenecen a la cuenta, de modo que cualquier instalación que inicie sesión con ella recibe los mismos perfiles.
+`POST /api/v1/auth/register` acepta `username` y `password` (también admite `email` por compatibilidad) y responde `202` con `status: pending_approval`, sin emitir token. `GET /api/v1/admin/accounts` lista las cuentas; `POST /api/v1/admin/accounts/{id}/approve` permite el acceso, `/disable` lo deniega y `DELETE /api/v1/admin/accounts/{id}` borra la cuenta y sus perfiles. `POST /api/v1/admin/accounts/{id}/reject` también elimina una solicitud pendiente. `POST /api/v1/auth/logout` revoca el dispositivo actual. `GET /api/v1/auth/me` devuelve la cuenta y su número de perfiles. Los perfiles y su estado de reproducción pertenecen a la cuenta, de modo que cualquier instalación que inicie sesión con ella recibe los mismos perfiles.
 
 El catálogo se navega por nivel, usando `parent_id` para abrir una colección, serie o temporada:
 
