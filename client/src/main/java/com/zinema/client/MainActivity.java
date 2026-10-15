@@ -57,6 +57,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -87,6 +88,7 @@ public class MainActivity extends Activity {
     View brandButton;
     TextView searchButton;
     TextView settingsButton;
+    View profileButton;
     HorizontalScrollView navScroll;
     String server;
     String serverName;
@@ -102,6 +104,8 @@ public class MainActivity extends Activity {
     boolean libraryMode;
     boolean showingDetail;
     boolean showingAdmin;
+    boolean showingProfiles;
+    boolean profileEditorVisible;
     boolean introShowing;
     WebView introWebView;
     boolean startupPrefetchStarted;
@@ -114,6 +118,8 @@ public class MainActivity extends Activity {
     String startupPrefetchError;
     String startupCatalogVersion = "";
     String adminReturnDetailId = "";
+    String editingProfileId = "";
+    String selectedProfileAvatar = "";
     boolean metadataEditorFromDetail;
     boolean metadataEditorMode;
     boolean metadataEditorPreviousBackVisible;
@@ -229,8 +235,15 @@ public class MainActivity extends Activity {
             error = startupPrefetchError;
         }
         if (error != null) {
-            renderError(error);
-            return;
+            if (!readProfiles().isEmpty()) {
+                if (showingProfiles) {
+                    if (!profileEditorVisible) renderProfileManager();
+                    Toast.makeText(this, error, Toast.LENGTH_LONG).show();
+                } else renderError(error);
+                return;
+            }
+            movieList = new ArrayList<>();
+            seriesList = new ArrayList<>();
         }
         movies = movieList == null ? new ArrayList<>() : movieList;
         series = seriesList == null ? new ArrayList<>() : seriesList;
@@ -239,6 +252,10 @@ public class MainActivity extends Activity {
         catalogVersion = version == null ? "" : version;
         lastCatalogVersionCheckMs = System.currentTimeMillis();
         if (items != null) cachePosterByStream(items);
+        if (readProfiles().isEmpty()) {
+            if (!profileEditorVisible) openProfileManager();
+            return;
+        }
         renderHome();
     }
 
@@ -288,6 +305,10 @@ public class MainActivity extends Activity {
                 : new LinearLayout.LayoutParams(d(132), d(42));
         bar.addView(brandButton, brandParams);
         if (!showingAdmin) bar.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+        profileButton = buildProfileChip();
+        LinearLayout.LayoutParams profileParams = new LinearLayout.LayoutParams(-2, d(42));
+        profileParams.rightMargin = d(8);
+        bar.addView(profileButton, profileParams);
         searchButton = navAction("⌕", "Buscar", v -> showSearch());
         searchButton.setBackground(round(PANEL, d(22)));
         searchButton.setElevation(d(4));
@@ -298,9 +319,10 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(d(44), d(44));
         sp.leftMargin = d(10);
         bar.addView(settingsButton, sp);
-        if (showingAdmin) {
+        if (showingAdmin || showingProfiles) {
             searchButton.setVisibility(View.GONE);
             settingsButton.setVisibility(View.GONE);
+            profileButton.setVisibility(View.GONE);
         }
         page.addView(bar, new LinearLayout.LayoutParams(-1, d(68)));
 
@@ -313,7 +335,7 @@ public class MainActivity extends Activity {
         nav.addView(navChip("Series", () -> openLibrary("series"), selectedSection.equals("series")));
         navScroll.addView(nav);
         page.addView(navScroll, new LinearLayout.LayoutParams(-1, d(48)));
-        if (showingAdmin) navScroll.setVisibility(View.GONE);
+        if (showingAdmin || showingProfiles) navScroll.setVisibility(View.GONE);
 
         contentScroller = new ScrollView(this);
         contentScroller.setFillViewport(true);
@@ -458,6 +480,19 @@ public class MainActivity extends Activity {
     }
 
     void loadHome() {
+        List<JSONObject> savedProfiles = readProfiles();
+        if (savedProfiles.isEmpty()) {
+            startupHomeAwaiting = true;
+            openProfileManager();
+            consumeStartupPrefetch();
+            return;
+        }
+        boolean activeFound = false;
+        for (JSONObject profile : savedProfiles) {
+            if (activeProfileId().equals(profile.optString("id"))) activeFound = true;
+        }
+        if (!activeFound) prefs.edit().putString("active_profile", savedProfiles.get(0).optString("id")).apply();
+        showingProfiles = false;
         libraryMode = false;
         showingDetail = false;
         lastSearchQuery = null;
@@ -481,6 +516,393 @@ public class MainActivity extends Activity {
             return;
         }
         fetchHomeFromServer();
+    }
+
+    List<JSONObject> readProfiles() {
+        List<JSONObject> result = new ArrayList<>();
+        String raw = prefs.getString("profiles_json", "[]");
+        try {
+            JSONArray profiles = new JSONArray(raw);
+            for (int i = 0; i < profiles.length(); i++) {
+                JSONObject profile = profiles.optJSONObject(i);
+                if (profile != null && !profile.optString("id", "").isEmpty()) result.add(profile);
+            }
+        } catch (JSONException ignored) { }
+        return result;
+    }
+
+    void saveProfiles(List<JSONObject> profiles) {
+        JSONArray array = new JSONArray();
+        for (JSONObject profile : profiles) array.put(profile);
+        prefs.edit().putString("profiles_json", array.toString()).apply();
+    }
+
+    String activeProfileId() { return prefs.getString("active_profile", ""); }
+
+    JSONObject activeProfile() {
+        String id = activeProfileId();
+        for (JSONObject profile : readProfiles()) {
+            if (id.equals(profile.optString("id"))) return profile;
+        }
+        List<JSONObject> profiles = readProfiles();
+        return profiles.isEmpty() ? null : profiles.get(0);
+    }
+
+    String activeProfileAvatar() {
+        JSONObject profile = activeProfile();
+        return profile == null ? "generic:0" : profile.optString("avatar", "generic:0");
+    }
+
+    String progressPrefix(String type) {
+        String id = activeProfileId();
+        return id.isEmpty() ? type + ":" : "p:" + id + ":" + type + ":";
+    }
+
+    List<JSONObject> profileAvatarOptions() {
+        List<JSONObject> options = new ArrayList<>();
+        Set<String> used = new HashSet<>();
+        ArrayList<JSONObject> catalog = new ArrayList<>();
+        catalog.addAll(movies);
+        catalog.addAll(series);
+        for (JSONObject node : catalog) {
+            String poster = node.optString("poster_url", "");
+            String avatar = "catalog:" + node.optString("id", "");
+            if (poster.isEmpty()) {
+                JSONArray mosaic = node.optJSONArray("mosaic_images");
+                if (mosaic != null && mosaic.length() > 0) {
+                    poster = mosaic.optString(0, "");
+                    avatar = "url:" + poster;
+                }
+            }
+            if (poster.isEmpty() || !used.add(poster)) continue;
+            JSONObject option = new JSONObject();
+            try {
+                option.put("avatar", avatar);
+                option.put("title", displayTitle(node));
+            } catch (JSONException ignored) { }
+            options.add(option);
+            if (options.size() == 20) break;
+        }
+        for (int i = 0; options.size() < 20; i++) {
+            JSONObject option = new JSONObject();
+            try {
+                option.put("avatar", "generic:" + i);
+                option.put("title", t("Avatar") + " " + (options.size() + 1));
+            } catch (JSONException ignored) { }
+            options.add(option);
+        }
+        return options;
+    }
+
+    String genericAvatarGlyph(String avatar) {
+        String[] glyphs = {"🎬", "🧙", "🚀", "🕵️", "🦸", "👽", "🐉", "🤖", "🧛", "🏴‍☠️",
+                "🦊", "🐼", "🐺", "🦉", "🐱", "🦁", "👑", "⚔️", "🌟", "🎭"};
+        int index = 0;
+        try { index = Integer.parseInt(avatar.substring("generic:".length())); }
+        catch (Exception ignored) { }
+        return glyphs[(index % glyphs.length + glyphs.length) % glyphs.length];
+    }
+
+    String profileAvatarImagePath(String avatar) {
+        if (avatar == null) return "";
+        if (avatar.startsWith("url:")) return avatar.substring("url:".length());
+        if (!avatar.startsWith("catalog:")) return "";
+        String id = avatar.substring("catalog:".length());
+        for (JSONObject node : movies) if (id.equals(node.optString("id"))) return node.optString("poster_url", "");
+        for (JSONObject node : series) if (id.equals(node.optString("id"))) return node.optString("poster_url", "");
+        return "";
+    }
+
+    FrameLayout profileAvatarView(String avatar, int size, String description, boolean clickable) {
+        FrameLayout holder = new FrameLayout(this);
+        GradientDrawable base = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                new int[]{Color.rgb(79, 34, 48), Color.rgb(34, 55, 79)});
+        base.setShape(GradientDrawable.OVAL);
+        holder.setBackground(base);
+        holder.setClipToOutline(true);
+        holder.setFocusable(clickable);
+        holder.setClickable(clickable);
+        holder.setContentDescription(description);
+        TextView fallback = label(genericAvatarGlyph(avatar), Math.max(20, size / d(2)), Color.WHITE, false);
+        fallback.setGravity(Gravity.CENTER);
+        holder.addView(fallback, new FrameLayout.LayoutParams(-1, -1));
+        String imagePath = profileAvatarImagePath(avatar);
+        if (!imagePath.isEmpty()) {
+            ImageView image = new ImageView(this);
+            image.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            GradientDrawable clear = new GradientDrawable();
+            clear.setColor(Color.TRANSPARENT);
+            clear.setShape(GradientDrawable.OVAL);
+            image.setBackground(clear);
+            image.setClipToOutline(true);
+            holder.addView(image, new FrameLayout.LayoutParams(-1, -1));
+            loadImage(imagePath, image, false);
+        }
+        if (clickable) {
+            applyTvFocusStyle(holder, false);
+            holder.setOnClickListener(v -> openProfileManager());
+        }
+        return holder;
+    }
+
+    View buildProfileChip() {
+        LinearLayout chip = new LinearLayout(this);
+        chip.setGravity(Gravity.CENTER_VERTICAL);
+        chip.setPadding(d(5), d(3), d(10), d(3));
+        chip.setBackground(round(PANEL, d(24)));
+        JSONObject profile = activeProfile();
+        String name = profile == null ? t("Perfil") : profile.optString("name", t("Perfil"));
+        FrameLayout avatar = profileAvatarView(activeProfileAvatar(), d(34), name, false);
+        chip.addView(avatar, new LinearLayout.LayoutParams(d(34), d(34)));
+        TextView label = label(name, 12, Color.WHITE, true);
+        label.setMaxWidth(d(100));
+        label.setSingleLine(true);
+        LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(-2, -2);
+        textParams.leftMargin = d(7);
+        chip.addView(label, textParams);
+        chip.setFocusable(true);
+        chip.setClickable(true);
+        chip.setContentDescription(t("Cambiar perfil") + ": " + name);
+        applyTvFocusStyle(chip, false);
+        chip.setOnClickListener(v -> openProfileManager());
+        return chip;
+    }
+
+    void openProfileManager() {
+        showingProfiles = true;
+        profileEditorVisible = false;
+        buildShell("Perfiles");
+        renderProfileManager();
+    }
+
+    void renderProfileManager() {
+        if (content == null) return;
+        content.removeAllViews();
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(d(28), d(18), d(28), d(30));
+        scroll.addView(body);
+        content.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
+        body.addView(label(t("¿Quién está viendo?"), 26, Color.WHITE, true));
+        TextView hint = label(t("Cada perfil conserva su lista y su progreso de reproducción."), 14, MUTED, false);
+        hint.setPadding(0, d(6), 0, d(18));
+        body.addView(hint);
+        List<JSONObject> profiles = readProfiles();
+        for (JSONObject profile : profiles) {
+            LinearLayout row = new LinearLayout(this);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(d(12), d(10), d(12), d(10));
+            row.setBackground(round(PANEL, d(12)));
+            LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, -2);
+            rowParams.bottomMargin = d(10);
+            body.addView(row, rowParams);
+            String id = profile.optString("id");
+            String name = profile.optString("name", "Perfil");
+            FrameLayout avatar = profileAvatarView(profile.optString("avatar", "generic:0"), d(58), name, false);
+            row.addView(avatar, new LinearLayout.LayoutParams(d(58), d(58)));
+            LinearLayout info = new LinearLayout(this);
+            info.setOrientation(LinearLayout.VERTICAL);
+            info.setGravity(Gravity.CENTER_VERTICAL);
+            info.setPadding(d(12), 0, d(10), 0);
+            row.addView(info, new LinearLayout.LayoutParams(0, -1, 1));
+            info.addView(label(name, 17, Color.WHITE, true));
+            if (id.equals(activeProfileId())) info.addView(label(t("Perfil actual"), 12, 0xFFFF777D, false));
+            Button use = actionButton(t("Usar"), true);
+            row.addView(use, new LinearLayout.LayoutParams(-2, d(42)));
+            use.setOnClickListener(v -> selectProfile(id));
+            Button edit = actionButton("✎", false);
+            LinearLayout.LayoutParams editParams = new LinearLayout.LayoutParams(d(44), d(42));
+            editParams.leftMargin = d(8);
+            row.addView(edit, editParams);
+            edit.setContentDescription(t("Editar perfil") + " " + name);
+            edit.setOnClickListener(v -> showProfileEditor(profile));
+            row.setFocusable(true);
+            applyTvFocusStyle(row, true);
+            row.setOnClickListener(v -> selectProfile(id));
+        }
+        Button add = actionButton(t("Añadir perfil"), profiles.isEmpty());
+        LinearLayout.LayoutParams addParams = new LinearLayout.LayoutParams(-2, d(48));
+        addParams.topMargin = d(8);
+        body.addView(add, addParams);
+        add.setOnClickListener(v -> showProfileEditor(null));
+    }
+
+    void selectProfile(String id) {
+        prefs.edit().putString("active_profile", id).apply();
+        showingProfiles = false;
+        profileEditorVisible = false;
+        loadHome();
+    }
+
+    void showProfileEditor(JSONObject existing) {
+        profileEditorVisible = true;
+        editingProfileId = existing == null ? "" : existing.optString("id", "");
+        selectedProfileAvatar = existing == null ? "generic:0" : existing.optString("avatar", "generic:0");
+        content.removeAllViews();
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(d(28), d(16), d(28), d(28));
+        scroll.addView(body);
+        content.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
+        body.addView(label(existing == null ? t("Crear perfil") : t("Editar perfil"), 25, Color.WHITE, true));
+        TextView nameLabel = label(t("Nombre"), 14, MUTED, true);
+        nameLabel.setPadding(0, d(18), 0, d(7));
+        body.addView(nameLabel);
+        EditText name = metadataField(existing == null ? "" : existing.optString("name", ""), t("Nombre del perfil"), false);
+        name.setSingleLine(true);
+        body.addView(name, new LinearLayout.LayoutParams(-1, d(50)));
+        TextView avatarLabel = label(t("Elige un avatar"), 14, MUTED, true);
+        avatarLabel.setPadding(0, d(20), 0, d(10));
+        body.addView(avatarLabel);
+        List<JSONObject> options = profileAvatarOptions();
+        int columns = getResources().getDisplayMetrics().widthPixels / getResources().getDisplayMetrics().density > 850 ? 5 : 4;
+        List<View> cells = new ArrayList<>();
+        int rows = (options.size() + columns - 1) / columns;
+        for (int r = 0; r < rows; r++) {
+            LinearLayout line = new LinearLayout(this);
+            line.setGravity(Gravity.CENTER_VERTICAL);
+            body.addView(line, new LinearLayout.LayoutParams(-1, d(112)));
+            for (int c = 0; c < columns; c++) {
+                int index = r * columns + c;
+                if (index >= options.size()) {
+                    line.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+                    continue;
+                }
+                JSONObject option = options.get(index);
+                String avatar = option.optString("avatar", "generic:0");
+                LinearLayout cell = new LinearLayout(this);
+                cell.setOrientation(LinearLayout.VERTICAL);
+                cell.setGravity(Gravity.CENTER);
+                cell.setPadding(d(4), d(4), d(4), d(4));
+                cell.setBackground(round(avatar.equals(selectedProfileAvatar) ? 0x664C2028 : Color.TRANSPARENT, d(10)));
+                cell.setFocusable(true);
+                cell.setClickable(true);
+                cell.setTag(avatar);
+                applyTvFocusStyle(cell, false);
+                FrameLayout picture = profileAvatarView(avatar, d(58), option.optString("title", "Avatar"), false);
+                cell.addView(picture, new LinearLayout.LayoutParams(d(58), d(58)));
+                TextView title = label(option.optString("title", "Avatar"), 10, Color.WHITE, false);
+                title.setGravity(Gravity.CENTER);
+                title.setMaxLines(2);
+                cell.addView(title, new LinearLayout.LayoutParams(-1, d(34)));
+                cells.add(cell);
+                line.addView(cell, new LinearLayout.LayoutParams(0, -1, 1));
+                cell.setOnClickListener(v -> {
+                    selectedProfileAvatar = avatar;
+                    for (View entry : cells) {
+                        String value = String.valueOf(entry.getTag());
+                        entry.setBackground(round(value.equals(selectedProfileAvatar) ? 0x664C2028 : Color.TRANSPARENT, d(10)));
+                    }
+                });
+            }
+        }
+        LinearLayout buttons = new LinearLayout(this);
+        buttons.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams buttonsParams = new LinearLayout.LayoutParams(-1, -2);
+        buttonsParams.topMargin = d(20);
+        body.addView(buttons, buttonsParams);
+        Button save = actionButton(t("Guardar perfil"), true);
+        buttons.addView(save, new LinearLayout.LayoutParams(-2, d(48)));
+        Button cancel = actionButton(t("Cancelar"), false);
+        LinearLayout.LayoutParams cancelParams = new LinearLayout.LayoutParams(-2, d(48));
+        cancelParams.leftMargin = d(10);
+        buttons.addView(cancel, cancelParams);
+        cancel.setOnClickListener(v -> backFromProfileEditor());
+        if (existing != null) {
+            Button delete = actionButton(t("Eliminar"), false);
+            LinearLayout.LayoutParams deleteParams = new LinearLayout.LayoutParams(-2, d(48));
+            deleteParams.leftMargin = d(10);
+            buttons.addView(delete, deleteParams);
+            delete.setOnClickListener(v -> confirmDeleteProfile(existing));
+        }
+        save.setOnClickListener(v -> saveProfile(existing, name.getText().toString()));
+    }
+
+    void saveProfile(JSONObject existing, String rawName) {
+        String name = rawName == null ? "" : rawName.trim();
+        if (name.isEmpty()) {
+            Toast.makeText(this, t("Escribe un nombre para el perfil."), Toast.LENGTH_SHORT).show();
+            return;
+        }
+        boolean first = readProfiles().isEmpty();
+        String id = existing == null ? UUID.randomUUID().toString() : existing.optString("id");
+        JSONObject profile = new JSONObject();
+        try {
+            profile.put("id", id);
+            profile.put("name", name);
+            profile.put("avatar", selectedProfileAvatar);
+        } catch (JSONException ignored) { }
+        List<JSONObject> profiles = readProfiles();
+        boolean replaced = false;
+        for (int i = 0; i < profiles.size(); i++) {
+            if (id.equals(profiles.get(i).optString("id"))) {
+                profiles.set(i, profile);
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) profiles.add(profile);
+        saveProfiles(profiles);
+        if (first) {
+            migrateLegacyProfileData(id);
+            prefs.edit().putString("active_profile", id).apply();
+        }
+        profileEditorVisible = false;
+        if (first) {
+            showingProfiles = false;
+            loadHome();
+        } else renderProfileManager();
+    }
+
+    void migrateLegacyProfileData(String profileId) {
+        SharedPreferences.Editor editor = prefs.edit();
+        Map<String, ?> all = prefs.getAll();
+        for (Map.Entry<String, ?> entry : all.entrySet()) {
+            String key = entry.getKey();
+            String target = null;
+            for (String type : new String[]{"watch", "seen", "fav"}) {
+                String prefix = type + ":";
+                if (key.startsWith(prefix)) target = "p:" + profileId + ":" + key;
+            }
+            if (target != null) {
+                Object value = entry.getValue();
+                if (value instanceof String) editor.putString(target, (String) value);
+                else if (value instanceof Boolean) editor.putBoolean(target, (Boolean) value);
+                else if (value instanceof Integer) editor.putInt(target, (Integer) value);
+                editor.remove(key);
+            }
+        }
+        editor.apply();
+    }
+
+    void backFromProfileEditor() {
+        profileEditorVisible = false;
+        if (readProfiles().isEmpty()) {
+            Toast.makeText(this, t("Crea un perfil para continuar."), Toast.LENGTH_SHORT).show();
+            renderProfileManager();
+        } else renderProfileManager();
+    }
+
+    void confirmDeleteProfile(JSONObject profile) {
+        String id = profile.optString("id");
+        new AlertDialog.Builder(this).setTitle(t("Eliminar perfil"))
+                .setMessage(t("Se eliminará el perfil de este dispositivo."))
+                .setNegativeButton(t("Cancelar"), null)
+                .setPositiveButton(t("Eliminar"), (dialog, which) -> {
+                    List<JSONObject> profiles = readProfiles();
+                    List<JSONObject> kept = new ArrayList<>();
+                    for (JSONObject value : profiles) if (!id.equals(value.optString("id"))) kept.add(value);
+                    saveProfiles(kept);
+                    if (id.equals(activeProfileId())) {
+                        if (kept.isEmpty()) prefs.edit().remove("active_profile").apply();
+                        else prefs.edit().putString("active_profile", kept.get(0).optString("id")).apply();
+                    }
+                    profileEditorVisible = false;
+                    if (kept.isEmpty()) renderProfileManager();
+                    else renderProfileManager();
+                }).show();
     }
 
     void fetchHomeFromServer() {
@@ -1364,11 +1786,13 @@ public class MainActivity extends Activity {
         return null;
     }
 
-    String nodeSeenKey(String nodeId) { return "seen:node:" + nodeId; }
+    String watchKey(String stream) { return progressPrefix("watch") + stream; }
+    String favoriteKey(String nodeId) { return progressPrefix("fav") + nodeId; }
+    String nodeSeenKey(String nodeId) { return progressPrefix("seen") + "node:" + nodeId; }
     String mediaSeenKey(JSONObject media) {
         String id = media.optString("id", "");
         if (id.isEmpty() || id.equals("null")) id = media.optString("stream_url", media.optString("stream", ""));
-        return "seen:file:" + id;
+        return progressPrefix("seen") + "file:" + id;
     }
     boolean isNodeSeen(JSONObject node) {
         String id = node.optString("id", "");
@@ -1415,7 +1839,7 @@ public class MainActivity extends Activity {
     void removeContinueForNode(String nodeId) {
         SharedPreferences.Editor editor = prefs.edit();
         for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
-            if (!entry.getKey().startsWith("watch:")) continue;
+            if (!entry.getKey().startsWith(progressPrefix("watch"))) continue;
             try {
                 JSONObject item = new JSONObject(String.valueOf(entry.getValue()));
                 if (nodeId.equals(item.optString("owner_node_id")) || nodeId.equals(item.optString("node_id"))) {
@@ -1431,7 +1855,7 @@ public class MainActivity extends Activity {
         SharedPreferences.Editor editor = prefs.edit();
         for (int i = 0; i < files.length(); i++) {
             JSONObject file = files.optJSONObject(i);
-            if (file != null) editor.remove("watch:" + file.optString("stream_url", ""));
+            if (file != null) editor.remove(watchKey(file.optString("stream_url", "")));
         }
         editor.apply();
     }
@@ -1462,8 +1886,8 @@ public class MainActivity extends Activity {
     void setMediaWatched(JSONObject media, JSONObject owner, boolean seen) {
         String stream = media.optString("stream_url", media.optString("stream", ""));
         String key = mediaSeenKey(media);
-        if (seen) prefs.edit().putBoolean(key, true).remove("watch:" + stream).apply();
-        else prefs.edit().remove(key).remove("watch:" + stream).apply();
+        if (seen) prefs.edit().putBoolean(key, true).remove(watchKey(stream)).apply();
+        else prefs.edit().remove(key).remove(watchKey(stream)).apply();
         if ("movie".equals(owner.optString("kind"))) setNodeSeen(owner.optString("id"), seen);
         if ("season".equals(owner.optString("kind"))) {
             if (owner.optJSONArray("files") != null) refreshSeasonSeen(owner);
@@ -1535,7 +1959,7 @@ public class MainActivity extends Activity {
                 .setItems(localizedOptions(java.util.Arrays.asList(actions)), (dialog, which) -> {
                     if (which == 0) setResumeSeen(item, true);
                     else if (which == 1) setResumeSeen(item, false);
-                    else prefs.edit().remove("watch:" + item.optString("path", item.optString("stream"))).apply();
+                    else prefs.edit().remove(watchKey(item.optString("path", item.optString("stream")))).apply();
                     removeResumeCard(item);
                 }).show();
     }
@@ -1558,7 +1982,7 @@ public class MainActivity extends Activity {
         String kind = item.optString("owner_kind", "");
         JSONObject media = mediaFromProgress(item);
         String mediaKey = mediaSeenKey(media);
-        SharedPreferences.Editor editor = prefs.edit().remove("watch:" + item.optString("path", item.optString("stream")));
+        SharedPreferences.Editor editor = prefs.edit().remove(watchKey(item.optString("path", item.optString("stream"))));
         if (seen) editor.putBoolean(mediaKey, true); else editor.remove(mediaKey);
         editor.apply();
         if (kind.equals("movie") || kind.equals("series")) {
@@ -2181,6 +2605,28 @@ public class MainActivity extends Activity {
         if (text == null || prefs == null || !"eu".equals(prefs.getString("language", "es"))) return text;
         switch (text) {
             case "Inicio": return "Hasiera";
+            case "Perfiles": return "Profilak";
+            case "Perfil": return "Profila";
+            case "Cambiar perfil": return "Profila aldatu";
+            case "¿Quién está viendo?": return "Nor ari da ikusten?";
+            case "Cada perfil conserva su lista y su progreso de reproducción.":
+                return "Profil bakoitzak bere zerrenda eta erreprodukzio-aurrerapena gordetzen ditu.";
+            case "Perfil actual": return "Uneko profila";
+            case "Usar": return "Erabili";
+            case "Editar perfil": return "Profila editatu";
+            case "Añadir perfil": return "Gehitu profila";
+            case "Crear perfil": return "Sortu profila";
+            case "Nombre": return "Izena";
+            case "Nombre del perfil": return "Profilaren izena";
+            case "Elige un avatar": return "Aukeratu avatar bat";
+            case "Avatar": return "Avatarra";
+            case "Guardar perfil": return "Gorde profila";
+            case "Eliminar": return "Ezabatu";
+            case "Eliminar perfil": return "Profila ezabatu";
+            case "Se eliminará el perfil de este dispositivo.":
+                return "Profila gailu honetatik ezabatuko da.";
+            case "Escribe un nombre para el perfil.": return "Idatzi profilaren izena.";
+            case "Crea un perfil para continuar.": return "Sortu profil bat jarraitzeko.";
             case "Atrás": return "Atzera";
             case "Buscar": return "Bilatu";
             case "Servidor": return "Zerbitzaria";
@@ -2798,11 +3244,11 @@ public class MainActivity extends Activity {
     }
 
     boolean isFavorite(JSONObject node) {
-        return prefs.contains("fav:" + node.optString("id"));
+        return prefs.contains(favoriteKey(node.optString("id")));
     }
 
     void toggleFavorite(JSONObject node) {
-        String key = "fav:" + node.optString("id");
+        String key = favoriteKey(node.optString("id"));
         if (prefs.contains(key)) prefs.edit().remove(key).apply();
         else prefs.edit().putString(key, node.toString()).apply();
         Toast.makeText(this, prefs.contains(key) ? "Añadido a Mi lista" : "Eliminado de Mi lista", Toast.LENGTH_SHORT).show();
@@ -2810,8 +3256,9 @@ public class MainActivity extends Activity {
 
     List<JSONObject> readFavorites() {
         List<JSONObject> list = new ArrayList<>();
+        String prefix = progressPrefix("fav");
         for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
-            if (!entry.getKey().startsWith("fav:")) continue;
+            if (!entry.getKey().startsWith(prefix)) continue;
             try { list.add(new JSONObject(String.valueOf(entry.getValue()))); }
             catch (JSONException ignored) { }
         }
@@ -2820,8 +3267,9 @@ public class MainActivity extends Activity {
 
     List<JSONObject> readContinueWatching() {
         List<JSONObject> list = new ArrayList<>();
+        String prefix = progressPrefix("watch");
         for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
-            if (!entry.getKey().startsWith("watch:")) continue;
+            if (!entry.getKey().startsWith(prefix)) continue;
             try {
                 JSONObject item = new JSONObject(String.valueOf(entry.getValue()));
                 String ownerId = item.optString("owner_node_id", item.optString("node_id", ""));
@@ -2916,7 +3364,7 @@ public class MainActivity extends Activity {
                       String ownerNodeId, String mediaId, String ownerKind) {
         if (path == null || path.isEmpty()) return;
         String url = path.startsWith("http") ? path : server + (path.startsWith("/") ? path : "/" + path);
-        String key = "watch:" + path;
+        String key = watchKey(path);
         long position = 0L;
         try { position = new JSONObject(prefs.getString(key, "{}")).optLong("position"); }
         catch (JSONException ignored) { }
@@ -2929,6 +3377,7 @@ public class MainActivity extends Activity {
         intent.putExtra("owner_node_id", ownerNodeId);
         intent.putExtra("media_id", mediaId);
         intent.putExtra("owner_kind", ownerKind);
+        intent.putExtra("progress_key", key);
         startActivity(intent);
     }
 
@@ -2950,6 +3399,15 @@ public class MainActivity extends Activity {
 
     @Override public void onBackPressed() {
         if (introShowing) return;
+        if (showingProfiles) {
+            if (profileEditorVisible) backFromProfileEditor();
+            else if (readProfiles().isEmpty()) showProfileEditor(null);
+            else {
+                showingProfiles = false;
+                loadHome();
+            }
+            return;
+        }
         if (showingAdmin) {
             showingAdmin = false;
             String returnDetailId = adminReturnDetailId;

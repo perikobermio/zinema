@@ -18,6 +18,7 @@ public class PlayerActivity extends Activity {
     private String ownerNodeId;
     private String mediaId;
     private String ownerKind;
+    private String progressKey;
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -28,6 +29,8 @@ public class PlayerActivity extends Activity {
         ownerNodeId = getIntent().getStringExtra("owner_node_id");
         mediaId = getIntent().getStringExtra("media_id");
         ownerKind = getIntent().getStringExtra("owner_kind");
+        progressKey = getIntent().getStringExtra("progress_key");
+        if (progressKey == null || progressKey.isEmpty()) progressKey = "watch:" + path;
         long resumeAt = getIntent().getLongExtra("position", 0L);
         if (url == null || url.isEmpty()) {
             finish();
@@ -57,7 +60,7 @@ public class PlayerActivity extends Activity {
             long duration = data.getLongExtra("extra_duration", -1L);
             if (position >= 0L && duration > 0L && position >= duration - 5000L) {
                 getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
-                        .remove("watch:" + path).apply();
+                        .remove(progressKey).apply();
             } else if (position > 10000L) {
                 saveProgress(position);
             }
@@ -80,7 +83,8 @@ public class PlayerActivity extends Activity {
             item.put("position", (int) Math.min(Integer.MAX_VALUE, position));
             item.put("updated", System.currentTimeMillis());
             getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
-                    .putString("watch:" + path, item.toString()).apply();
+                    .putString(progressKey == null || progressKey.isEmpty() ? "watch:" + path : progressKey,
+                            item.toString()).apply();
         } catch (Exception ignored) { }
     }
 }
