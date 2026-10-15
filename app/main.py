@@ -31,6 +31,7 @@ MEDIA_ROOTS = {
 }
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/zinema.sqlite3"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+PROFILE_SYNC_TOKEN = os.getenv("PROFILE_SYNC_TOKEN", "")
 TMDB_ACCESS_TOKEN = os.getenv("TMDB_ACCESS_TOKEN", "")
 TMDB_KEY = os.getenv("TMDB_KEY", "") if not TMDB_ACCESS_TOKEN else ""
 TMDB_CONFIGURED = bool(TMDB_ACCESS_TOKEN or TMDB_KEY)
@@ -97,6 +98,12 @@ class ManualMetadataRequest(BaseModel):
     image_path: str | None = Field(default=None, max_length=500)
     image_type: str = Field(default="poster", pattern="^(poster|backdrop)$")
     tmdb_id: int | None = Field(default=None, gt=0)
+
+
+class UserProfileRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=80)
+    avatar: str = Field(default="generic:0", max_length=1500)
 
 
 def database() -> sqlite3.Connection:
@@ -192,6 +199,27 @@ def database() -> sqlite3.Connection:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_library_title ON library_items(title COLLATE NOCASE)"
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS user_profiles (
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               avatar TEXT NOT NULL DEFAULT 'generic:0',
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               deleted INTEGER NOT NULL DEFAULT 0
+           )"""
+    )
+    profile_columns = {row["name"] for row in connection.execute("PRAGMA table_info(user_profiles)")}
+    if "deleted" not in profile_columns:
+        connection.execute("ALTER TABLE user_profiles ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS profile_state (
+               profile_id TEXT PRIMARY KEY,
+               state_json TEXT NOT NULL DEFAULT '{}',
+               revision INTEGER NOT NULL DEFAULT 0,
+               updated_at TEXT NOT NULL
+           )"""
+    )
     return connection
 
 
@@ -201,6 +229,14 @@ def require_admin(authorization: Annotated[str | None, Header()] = None) -> None
     scheme, _, token = (authorization or "").partition(" ")
     if scheme.lower() != "bearer" or not secrets.compare_digest(token, ADMIN_TOKEN):
         raise HTTPException(status_code=401, detail="Invalid bearer token")
+
+
+def require_profile_sync(authorization: Annotated[str | None, Header()] = None) -> None:
+    if not PROFILE_SYNC_TOKEN:
+        raise HTTPException(status_code=503, detail="Profile sync is not configured")
+    scheme, _, token = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(token, PROFILE_SYNC_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid profile sync token")
 
 
 def display_title(path: Path) -> str:
@@ -721,6 +757,93 @@ def get_catalog_version() -> dict[str, str]:
         ensure_ascii=False, separators=(",", ":"),
     )
     return {"version": hashlib.sha256(state.encode("utf-8")).hexdigest()}
+
+
+@app.get("/api/v1/profiles", dependencies=[Depends(require_profile_sync)])
+def list_profiles() -> list[dict]:
+    with closing(database()) as connection:
+        rows = connection.execute(
+            "SELECT id, name, avatar, created_at, updated_at, deleted FROM user_profiles ORDER BY created_at, id"
+        ).fetchall()
+    result = []
+    for row in rows:
+        profile = dict(row)
+        profile["deleted"] = bool(profile["deleted"])
+        result.append(profile)
+    return result
+
+
+@app.post("/api/v1/profiles", dependencies=[Depends(require_profile_sync)])
+def save_profile(profile: UserProfileRequest) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(database()) as connection:
+        connection.execute(
+            """INSERT INTO user_profiles(id, name, avatar, created_at, updated_at, deleted)
+               VALUES (?, ?, ?, ?, ?, 0)
+               ON CONFLICT(id) DO UPDATE SET name=excluded.name, avatar=excluded.avatar,
+                                              updated_at=excluded.updated_at, deleted=0""",
+            (profile.id, profile.name.strip(), profile.avatar, now, now),
+        )
+        connection.commit()
+        row = connection.execute(
+            "SELECT id, name, avatar, created_at, updated_at, deleted FROM user_profiles WHERE id=?",
+            (profile.id,),
+        ).fetchone()
+    return dict(row)
+
+
+@app.delete("/api/v1/profiles/{profile_id}", dependencies=[Depends(require_profile_sync)])
+def delete_profile(profile_id: str) -> dict[str, bool]:
+    with closing(database()) as connection:
+        connection.execute("DELETE FROM profile_state WHERE profile_id=?", (profile_id,))
+        cursor = connection.execute(
+            "UPDATE user_profiles SET deleted=1, updated_at=? WHERE id=?",
+            (datetime.now(timezone.utc).isoformat(), profile_id),
+        )
+        connection.commit()
+    return {"deleted": cursor.rowcount > 0}
+
+
+@app.get("/api/v1/profiles/{profile_id}/state", dependencies=[Depends(require_profile_sync)])
+def get_profile_state(profile_id: str) -> dict:
+    with closing(database()) as connection:
+        exists = connection.execute(
+            "SELECT 1 FROM user_profiles WHERE id=? AND deleted=0", (profile_id,),
+        ).fetchone()
+        if exists is None:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        row = connection.execute(
+            "SELECT state_json, revision, updated_at FROM profile_state WHERE profile_id=?",
+            (profile_id,),
+        ).fetchone()
+    if row is None:
+        return {"state": {}, "revision": 0, "updated_at": None}
+    return {"state": json.loads(row["state_json"] or "{}"),
+            "revision": row["revision"], "updated_at": row["updated_at"]}
+
+
+@app.put("/api/v1/profiles/{profile_id}/state", dependencies=[Depends(require_profile_sync)])
+def save_profile_state(profile_id: str, state: dict[str, object]) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    state_json = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    with closing(database()) as connection:
+        exists = connection.execute(
+            "SELECT 1 FROM user_profiles WHERE id=? AND deleted=0", (profile_id,),
+        ).fetchone()
+        if exists is None:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        connection.execute(
+            """INSERT INTO profile_state(profile_id, state_json, revision, updated_at)
+               VALUES (?, ?, 1, ?)
+               ON CONFLICT(profile_id) DO UPDATE SET state_json=excluded.state_json,
+                   revision=profile_state.revision + 1, updated_at=excluded.updated_at""",
+            (profile_id, state_json, now),
+        )
+        connection.commit()
+        row = connection.execute(
+            "SELECT revision, updated_at FROM profile_state WHERE profile_id=?", (profile_id,),
+        ).fetchone()
+    return {"revision": row["revision"], "updated_at": row["updated_at"]}
 
 
 @app.get("/api/v1/catalog")

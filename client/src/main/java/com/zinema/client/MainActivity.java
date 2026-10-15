@@ -12,6 +12,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.text.Editable;
 import android.text.TextWatcher;
+import android.text.method.PasswordTransformationMethod;
 import android.util.LruCache;
 import android.view.Gravity;
 import android.view.View;
@@ -100,7 +101,12 @@ public class MainActivity extends Activity {
     int detailReturnScrollY;
     int pendingListingRestoreY = -1;
     long lastCatalogVersionCheckMs;
+    long lastProfileSyncMs;
     boolean catalogVersionCheckRunning;
+    boolean profileSyncRunning;
+    boolean profileStateSyncRunning;
+    boolean profileStateSyncPending;
+    boolean hasResumedOnce;
     boolean libraryMode;
     boolean showingDetail;
     boolean showingAdmin;
@@ -115,6 +121,9 @@ public class MainActivity extends Activity {
     List<JSONObject> startupMovies = new ArrayList<>();
     List<JSONObject> startupSeries = new ArrayList<>();
     JSONArray startupItems;
+    JSONArray startupRemoteProfiles;
+    JSONObject startupRemoteProfileState;
+    String startupRemoteStateProfileId = "";
     String startupPrefetchError;
     String startupCatalogVersion = "";
     String adminReturnDetailId = "";
@@ -140,11 +149,28 @@ public class MainActivity extends Activity {
         super.onCreate(state);
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
+        hideSystemBars();
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         server = trimBase(prefs.getString("server", DEFAULT_SERVER));
         serverName = prefs.getString("server_name", "Zinema NAS");
         startStartupPrefetch();
         showIntro();
+    }
+
+    void hideSystemBars() {
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        int flags = View.SYSTEM_UI_FLAG_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
+        getWindow().getDecorView().setSystemUiVisibility(flags);
+    }
+
+    @Override public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) hideSystemBars();
     }
 
     void showIntro() {
@@ -191,6 +217,9 @@ public class MainActivity extends Activity {
             List<JSONObject> movieList = null;
             List<JSONObject> seriesList = null;
             JSONArray items = null;
+            JSONArray remoteProfiles = null;
+            JSONObject remoteState = null;
+            String remoteStateProfileId = "";
             String error = null;
             String version = "";
             try {
@@ -199,6 +228,19 @@ public class MainActivity extends Activity {
                 items = getArray("/api/v1/items?limit=500");
                 try { version = getJson("/api/v1/catalog/version").optString("version", ""); }
                 catch (Exception ignored) { }
+                if (!profileSyncToken().isEmpty()) {
+                    try {
+                        remoteProfiles = getAuthorizedProfileArray("/api/v1/profiles");
+                        remoteStateProfileId = prefs.getString("active_profile", "");
+                        if (remoteStateProfileId.isEmpty() && remoteProfiles.length() > 0) {
+                            remoteStateProfileId = remoteProfiles.optJSONObject(0).optString("id", "");
+                        }
+                        if (!remoteStateProfileId.isEmpty()) {
+                            remoteState = getAuthorizedProfileJson("/api/v1/profiles/" +
+                                    enc(remoteStateProfileId) + "/state");
+                        }
+                    } catch (Exception ignored) { }
+                }
                 movieList = toList(movieRows);
                 seriesList = toList(seriesRows);
                 sortNewestFirst(movieList);
@@ -210,6 +252,9 @@ public class MainActivity extends Activity {
                 startupMovies = movieList;
                 startupSeries = seriesList;
                 startupItems = items;
+                startupRemoteProfiles = remoteProfiles;
+                startupRemoteProfileState = remoteState;
+                startupRemoteStateProfileId = remoteStateProfileId;
                 startupCatalogVersion = version;
                 startupPrefetchError = error;
                 startupPrefetchReady = true;
@@ -222,6 +267,9 @@ public class MainActivity extends Activity {
         List<JSONObject> movieList;
         List<JSONObject> seriesList;
         JSONArray items;
+        JSONArray remoteProfiles;
+        JSONObject remoteState;
+        String remoteStateProfileId;
         String error;
         String version;
         synchronized (this) {
@@ -231,9 +279,20 @@ public class MainActivity extends Activity {
             movieList = startupMovies;
             seriesList = startupSeries;
             items = startupItems;
+            remoteProfiles = startupRemoteProfiles;
+            remoteState = startupRemoteProfileState;
+            remoteStateProfileId = startupRemoteStateProfileId;
             version = startupCatalogVersion;
             error = startupPrefetchError;
         }
+        boolean hasRemoteProfiles = false;
+        if (remoteProfiles != null) {
+            for (int i = 0; i < remoteProfiles.length(); i++) {
+                JSONObject profile = remoteProfiles.optJSONObject(i);
+                if (profile != null && !profile.optBoolean("deleted", false)) hasRemoteProfiles = true;
+            }
+        }
+        boolean needsProfileChoice = hasRemoteProfiles && activeProfileId().isEmpty();
         if (error != null) {
             if (!readProfiles().isEmpty()) {
                 if (showingProfiles) {
@@ -247,13 +306,30 @@ public class MainActivity extends Activity {
         }
         movies = movieList == null ? new ArrayList<>() : movieList;
         series = seriesList == null ? new ArrayList<>() : seriesList;
+        if (remoteProfiles != null) mergeRemoteProfiles(remoteProfiles);
         putCatalogList("movies", null, movies);
         putCatalogList("series", null, series);
         catalogVersion = version == null ? "" : version;
         lastCatalogVersionCheckMs = System.currentTimeMillis();
         if (items != null) cachePosterByStream(items);
+        if (remoteProfiles != null) lastProfileSyncMs = System.currentTimeMillis();
+        if (remoteState != null && remoteStateProfileId.equals(activeProfileId())) {
+            JSONObject state = remoteState.optJSONObject("state");
+            boolean localDirty = prefs.getBoolean(profileStateDirtyKey(remoteStateProfileId), false);
+            boolean localHasState = collectProfileState(remoteStateProfileId).keys().hasNext();
+            if (localDirty || (remoteState.optInt("revision") == 0 && localHasState)) {
+                if (localHasState) scheduleProfileStateSync();
+                else if (state != null) applyProfileState(remoteStateProfileId, state);
+            } else if (state != null) applyProfileState(remoteStateProfileId, state);
+        }
         if (readProfiles().isEmpty()) {
             if (!profileEditorVisible) openProfileManager();
+            return;
+        }
+        if (needsProfileChoice) {
+            showingProfiles = true;
+            buildShell("Perfiles");
+            renderProfileManager();
             return;
         }
         renderHome();
@@ -305,10 +381,6 @@ public class MainActivity extends Activity {
                 : new LinearLayout.LayoutParams(d(132), d(42));
         bar.addView(brandButton, brandParams);
         if (!showingAdmin) bar.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
-        profileButton = buildProfileChip();
-        LinearLayout.LayoutParams profileParams = new LinearLayout.LayoutParams(-2, d(42));
-        profileParams.rightMargin = d(8);
-        bar.addView(profileButton, profileParams);
         searchButton = navAction("⌕", "Buscar", v -> showSearch());
         searchButton.setBackground(round(PANEL, d(22)));
         searchButton.setElevation(d(4));
@@ -319,6 +391,10 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(d(44), d(44));
         sp.leftMargin = d(10);
         bar.addView(settingsButton, sp);
+        profileButton = buildProfileChip();
+        LinearLayout.LayoutParams profileParams = new LinearLayout.LayoutParams(-2, d(42));
+        profileParams.leftMargin = d(10);
+        bar.addView(profileButton, profileParams);
         if (showingAdmin || showingProfiles) {
             searchButton.setVisibility(View.GONE);
             settingsButton.setVisibility(View.GONE);
@@ -469,6 +545,53 @@ public class MainActivity extends Activity {
         return new JSONArray(body);
     }
 
+    String profileSyncToken() {
+        return prefs == null ? "" : prefs.getString("profile_sync_token", "").trim();
+    }
+
+    String authorizedProfileRequest(String method, String path, JSONObject payload) throws Exception {
+        String token = profileSyncToken();
+        if (token.isEmpty()) throw new Exception("Configura la clave de sincronización de perfiles en Administración.");
+        HttpURLConnection connection = (HttpURLConnection) new URL(server + path).openConnection();
+        connection.setRequestMethod(method);
+        connection.setConnectTimeout(12000);
+        connection.setReadTimeout(20000);
+        connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("Authorization", "Bearer " + token);
+        if (payload != null) {
+            connection.setDoOutput(true);
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            connection.getOutputStream().write(payload.toString().getBytes(StandardCharsets.UTF_8));
+        }
+        int status = connection.getResponseCode();
+        InputStream input = status < 400 ? connection.getInputStream() : connection.getErrorStream();
+        String body = readText(input);
+        connection.disconnect();
+        if (status < 200 || status >= 300) {
+            String message = body;
+            try { message = new JSONObject(body).optString("detail", body); }
+            catch (JSONException ignored) { }
+            throw new Exception("HTTP " + status + (message.isEmpty() ? "" : ": " + message));
+        }
+        return body;
+    }
+
+    JSONArray getAuthorizedProfileArray(String path) throws Exception {
+        return new JSONArray(authorizedProfileRequest("GET", path, null));
+    }
+
+    JSONObject getAuthorizedProfileJson(String path) throws Exception {
+        return new JSONObject(authorizedProfileRequest("GET", path, null));
+    }
+
+    JSONObject putAuthorizedProfileJson(String path, JSONObject payload) throws Exception {
+        return new JSONObject(authorizedProfileRequest("PUT", path, payload));
+    }
+
+    JSONObject postAuthorizedProfileJson(String path, JSONObject payload) throws Exception {
+        return new JSONObject(authorizedProfileRequest("POST", path, payload));
+    }
+
     static String readText(InputStream input) throws Exception {
         if (input == null) return "";
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -535,6 +658,277 @@ public class MainActivity extends Activity {
         JSONArray array = new JSONArray();
         for (JSONObject profile : profiles) array.put(profile);
         prefs.edit().putString("profiles_json", array.toString()).apply();
+    }
+
+    String profileStateDirtyKey(String id) { return "profile_sync_dirty:" + id; }
+    String profileMetadataDirtyKey(String id) { return "profile_metadata_dirty:" + id; }
+
+    Set<String> deletedProfileIds() {
+        return new HashSet<>(prefs.getStringSet("profile_deleted_ids", new HashSet<>()));
+    }
+
+    void forgetDeletedProfile(String id) {
+        Set<String> deleted = deletedProfileIds();
+        if (!deleted.remove(id)) return;
+        prefs.edit().putStringSet("profile_deleted_ids", deleted).apply();
+    }
+
+    void cleanupProfileLocalData(String id) {
+        String prefix = "p:" + id + ":";
+        SharedPreferences.Editor editor = prefs.edit();
+        for (String key : prefs.getAll().keySet()) {
+            if (key.startsWith(prefix) || key.equals(profileStateDirtyKey(id))
+                    || key.equals(profileMetadataDirtyKey(id)) || key.equals("profile_sync_revision:" + id)) {
+                editor.remove(key);
+            }
+        }
+        if (activeProfileId().equals(id)) editor.remove("active_profile");
+        editor.apply();
+    }
+
+    boolean isProfileStateKey(String key) {
+        return key.startsWith("watch:") || key.startsWith("seen:") || key.startsWith("fav:");
+    }
+
+    JSONObject collectProfileState(String profileId) {
+        JSONObject state = new JSONObject();
+        String prefix = "p:" + profileId + ":";
+        for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
+            String key = entry.getKey();
+            if (!key.startsWith(prefix)) continue;
+            String shortKey = key.substring(prefix.length());
+            if (!isProfileStateKey(shortKey)) continue;
+            try { state.put(shortKey, entry.getValue()); }
+            catch (JSONException ignored) { }
+        }
+        return state;
+    }
+
+    void applyProfileState(String profileId, JSONObject state) {
+        String prefix = "p:" + profileId + ":";
+        SharedPreferences.Editor editor = prefs.edit();
+        for (String key : prefs.getAll().keySet()) {
+            if (!key.startsWith(prefix)) continue;
+            if (isProfileStateKey(key.substring(prefix.length()))) editor.remove(key);
+        }
+        if (state != null) {
+            java.util.Iterator<String> keys = state.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                if (!isProfileStateKey(key)) continue;
+                Object value = state.opt(key);
+                if (value instanceof Boolean) editor.putBoolean(prefix + key, (Boolean) value);
+                else if (value != null && value != JSONObject.NULL) editor.putString(prefix + key, String.valueOf(value));
+            }
+        }
+        editor.putBoolean(profileStateDirtyKey(profileId), false).apply();
+    }
+
+    JSONObject profilePayload(JSONObject profile) {
+        JSONObject payload = new JSONObject();
+        try {
+            payload.put("id", profile.optString("id"));
+            payload.put("name", profile.optString("name", "Profil"));
+            payload.put("avatar", profile.optString("avatar", "generic:0"));
+        } catch (JSONException ignored) { }
+        return payload;
+    }
+
+    void mergeRemoteProfiles(JSONArray remoteRows) {
+        List<JSONObject> local = readProfiles();
+        Set<String> remoteIds = new HashSet<>();
+        Set<String> deleted = deletedProfileIds();
+        boolean deletionSetChanged = false;
+        for (int i = 0; i < remoteRows.length(); i++) {
+            JSONObject remote = remoteRows.optJSONObject(i);
+            if (remote == null) continue;
+            String id = remote.optString("id", "");
+            if (id.isEmpty()) continue;
+            if (remote.optBoolean("deleted", false)) {
+                for (int j = local.size() - 1; j >= 0; j--) {
+                    if (id.equals(local.get(j).optString("id"))) local.remove(j);
+                }
+                if (deleted.add(id)) deletionSetChanged = true;
+                cleanupProfileLocalData(id);
+                continue;
+            }
+            if (deleted.contains(id)) {
+                deleteProfileFromServer(id);
+                continue;
+            }
+            remoteIds.add(id);
+            boolean replaced = false;
+            for (int j = 0; j < local.size(); j++) {
+                if (id.equals(local.get(j).optString("id"))) {
+                    if (!prefs.getBoolean(profileMetadataDirtyKey(id), false)) local.set(j, remote);
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) local.add(remote);
+        }
+        if (deletionSetChanged) prefs.edit().putStringSet("profile_deleted_ids", deleted).apply();
+        saveProfiles(local);
+        String active = activeProfileId();
+        boolean activeExists = false;
+        for (JSONObject profile : local) if (active.equals(profile.optString("id"))) activeExists = true;
+        if (!activeExists && !local.isEmpty()) {
+            active = local.get(0).optString("id");
+            prefs.edit().putString("active_profile", active).apply();
+        }
+        for (JSONObject profile : local) {
+            String id = profile.optString("id");
+            boolean metadataDirty = prefs.getBoolean(profileMetadataDirtyKey(id), false);
+            boolean stateDirty = prefs.getBoolean(profileStateDirtyKey(id), false);
+            if (!remoteIds.contains(id) || metadataDirty) {
+                if (collectProfileState(id).keys().hasNext()) {
+                    prefs.edit().putBoolean(profileStateDirtyKey(id), true).apply();
+                }
+                uploadProfileToServer(profile);
+            } else if (stateDirty) {
+                uploadProfileState(id);
+            }
+        }
+    }
+
+    void uploadProfileToServer(JSONObject profile) {
+        if (profileSyncToken().isEmpty()) return;
+        JSONObject payload = profilePayload(profile);
+        io.execute(() -> {
+            try {
+                postAuthorizedProfileJson("/api/v1/profiles", payload);
+                String id = profile.optString("id");
+                prefs.edit().putBoolean(profileMetadataDirtyKey(id), false).apply();
+                JSONObject state = collectProfileState(profile.optString("id"));
+                if (prefs.getBoolean(profileStateDirtyKey(id), false) && state.keys().hasNext()) {
+                    JSONObject result = putAuthorizedProfileJson("/api/v1/profiles/" +
+                            enc(id) + "/state", state);
+                    prefs.edit().putInt("profile_sync_revision:" + id, result.optInt("revision"))
+                            .putBoolean(profileStateDirtyKey(id), false).apply();
+                }
+            }
+            catch (Exception ignored) { }
+        });
+    }
+
+    void deleteProfileFromServer(String profileId) {
+        if (profileSyncToken().isEmpty()) return;
+        io.execute(() -> {
+            try {
+                authorizedProfileRequest("DELETE", "/api/v1/profiles/" + enc(profileId), null);
+                forgetDeletedProfile(profileId);
+            }
+            catch (Exception ignored) { }
+        });
+    }
+
+    void uploadProfileState(String profileId) {
+        if (profileSyncToken().isEmpty()) return;
+        JSONObject state = collectProfileState(profileId);
+        JSONObject payload = new JSONObject();
+        try {
+            java.util.Iterator<String> keys = state.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                payload.put(key, state.opt(key));
+            }
+        } catch (JSONException ignored) { }
+        io.execute(() -> {
+            try {
+                JSONObject result = putAuthorizedProfileJson("/api/v1/profiles/" + enc(profileId) + "/state", payload);
+                prefs.edit().putInt("profile_sync_revision:" + profileId, result.optInt("revision"))
+                        .putBoolean(profileStateDirtyKey(profileId), false).apply();
+            } catch (Exception ignored) { }
+        });
+    }
+
+    synchronized void scheduleProfileStateSync() {
+        String id = activeProfileId();
+        if (id.isEmpty()) return;
+        prefs.edit().putBoolean(profileStateDirtyKey(id), true).apply();
+        if (profileSyncToken().isEmpty()) return;
+        if (profileStateSyncRunning) {
+            profileStateSyncPending = true;
+            return;
+        }
+        profileStateSyncRunning = true;
+        io.execute(() -> {
+            while (true) {
+                String profileId = activeProfileId();
+                JSONObject state = collectProfileState(profileId);
+                JSONObject payload = new JSONObject();
+                try {
+                    java.util.Iterator<String> keys = state.keys();
+                    while (keys.hasNext()) {
+                        String key = keys.next();
+                        payload.put(key, state.opt(key));
+                    }
+                    JSONObject result = putAuthorizedProfileJson(
+                            "/api/v1/profiles/" + enc(profileId) + "/state", payload);
+                    prefs.edit().putInt("profile_sync_revision:" + profileId, result.optInt("revision"))
+                            .putBoolean(profileStateDirtyKey(profileId), false).apply();
+                } catch (Exception ignored) { }
+                synchronized (MainActivity.this) {
+                    if (profileStateSyncPending) {
+                        profileStateSyncPending = false;
+                    } else {
+                        profileStateSyncRunning = false;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    void synchronizeProfilesFromServer(boolean notifyError) {
+        String token = profileSyncToken();
+        long now = System.currentTimeMillis();
+        if (token.isEmpty() || profileSyncRunning || now - lastProfileSyncMs < 60000L) return;
+        profileSyncRunning = true;
+        lastProfileSyncMs = now;
+        io.execute(() -> {
+            try {
+                JSONArray remote = getAuthorizedProfileArray("/api/v1/profiles");
+                String currentId = activeProfileId();
+                JSONObject remoteState = null;
+                boolean localStateDirty = !currentId.isEmpty()
+                        && prefs.getBoolean(profileStateDirtyKey(currentId), false);
+                if (!currentId.isEmpty() && !localStateDirty) {
+                    boolean found = false;
+                    for (int i = 0; i < remote.length(); i++) {
+                        JSONObject profile = remote.optJSONObject(i);
+                        if (profile != null && currentId.equals(profile.optString("id"))) found = true;
+                    }
+                    if (found) remoteState = getAuthorizedProfileJson(
+                            "/api/v1/profiles/" + enc(currentId) + "/state");
+                }
+                JSONObject stateResult = remoteState;
+                runOnUiThread(() -> {
+                    profileSyncRunning = false;
+                    mergeRemoteProfiles(remote);
+                    String activeId = activeProfileId();
+                    if (stateResult != null && activeId.equals(currentId)) {
+                        boolean localHasState = collectProfileState(activeId).keys().hasNext();
+                        if (prefs.getBoolean(profileStateDirtyKey(activeId), false)
+                                || (stateResult.optInt("revision") == 0 && localHasState)) {
+                            scheduleProfileStateSync();
+                        }
+                        else applyProfileState(activeId, stateResult.optJSONObject("state"));
+                    }
+                    if (readProfiles().isEmpty()) openProfileManager();
+                    else if (showingProfiles && !profileEditorVisible) renderProfileManager();
+                    else if (!showingDetail && !showingAdmin && !showingProfiles && "home".equals(selectedSection)) {
+                        renderHome();
+                    }
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    profileSyncRunning = false;
+                    if (notifyError) Toast.makeText(MainActivity.this,
+                            "No se pudieron sincronizar los perfiles: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                });
+            }
+        });
     }
 
     String activeProfileId() { return prefs.getString("active_profile", ""); }
@@ -730,9 +1124,11 @@ public class MainActivity extends Activity {
 
     void selectProfile(String id) {
         prefs.edit().putString("active_profile", id).apply();
+        lastProfileSyncMs = 0L;
         showingProfiles = false;
         profileEditorVisible = false;
         loadHome();
+        synchronizeProfilesFromServer(false);
     }
 
     void showProfileEditor(JSONObject existing) {
@@ -845,10 +1241,15 @@ public class MainActivity extends Activity {
         }
         if (!replaced) profiles.add(profile);
         saveProfiles(profiles);
+        prefs.edit().putBoolean(profileMetadataDirtyKey(id), true).apply();
         if (first) {
             migrateLegacyProfileData(id);
             prefs.edit().putString("active_profile", id).apply();
+            if (collectProfileState(id).keys().hasNext()) {
+                prefs.edit().putBoolean(profileStateDirtyKey(id), true).apply();
+            }
         }
+        uploadProfileToServer(profile);
         profileEditorVisible = false;
         if (first) {
             showingProfiles = false;
@@ -895,13 +1296,18 @@ public class MainActivity extends Activity {
                     List<JSONObject> kept = new ArrayList<>();
                     for (JSONObject value : profiles) if (!id.equals(value.optString("id"))) kept.add(value);
                     saveProfiles(kept);
-                    if (id.equals(activeProfileId())) {
+                    boolean wasActive = id.equals(activeProfileId());
+                    Set<String> deleted = deletedProfileIds();
+                    deleted.add(id);
+                    prefs.edit().putStringSet("profile_deleted_ids", deleted).apply();
+                    cleanupProfileLocalData(id);
+                    deleteProfileFromServer(id);
+                    if (wasActive) {
                         if (kept.isEmpty()) prefs.edit().remove("active_profile").apply();
                         else prefs.edit().putString("active_profile", kept.get(0).optString("id")).apply();
                     }
                     profileEditorVisible = false;
-                    if (kept.isEmpty()) renderProfileManager();
-                    else renderProfileManager();
+                    renderProfileManager();
                 }).show();
     }
 
@@ -1834,6 +2240,7 @@ public class MainActivity extends Activity {
         if (seen) editor.putBoolean(nodeSeenKey(id), true);
         else editor.remove(nodeSeenKey(id));
         editor.apply();
+        scheduleProfileStateSync();
     }
 
     void removeContinueForNode(String nodeId) {
@@ -1848,6 +2255,7 @@ public class MainActivity extends Activity {
             } catch (JSONException ignored) { }
         }
         editor.apply();
+        scheduleProfileStateSync();
     }
 
     void removeContinueForFiles(JSONArray files) {
@@ -1858,6 +2266,7 @@ public class MainActivity extends Activity {
             if (file != null) editor.remove(watchKey(file.optString("stream_url", "")));
         }
         editor.apply();
+        scheduleProfileStateSync();
     }
 
     void showMediaActions(JSONObject media, JSONObject owner) {
@@ -1888,6 +2297,7 @@ public class MainActivity extends Activity {
         String key = mediaSeenKey(media);
         if (seen) prefs.edit().putBoolean(key, true).remove(watchKey(stream)).apply();
         else prefs.edit().remove(key).remove(watchKey(stream)).apply();
+        scheduleProfileStateSync();
         if ("movie".equals(owner.optString("kind"))) setNodeSeen(owner.optString("id"), seen);
         if ("season".equals(owner.optString("kind"))) {
             if (owner.optJSONArray("files") != null) refreshSeasonSeen(owner);
@@ -1959,7 +2369,10 @@ public class MainActivity extends Activity {
                 .setItems(localizedOptions(java.util.Arrays.asList(actions)), (dialog, which) -> {
                     if (which == 0) setResumeSeen(item, true);
                     else if (which == 1) setResumeSeen(item, false);
-                    else prefs.edit().remove(watchKey(item.optString("path", item.optString("stream")))).apply();
+                    else {
+                        prefs.edit().remove(watchKey(item.optString("path", item.optString("stream")))).apply();
+                        scheduleProfileStateSync();
+                    }
                     removeResumeCard(item);
                 }).show();
     }
@@ -1985,6 +2398,7 @@ public class MainActivity extends Activity {
         SharedPreferences.Editor editor = prefs.edit().remove(watchKey(item.optString("path", item.optString("stream"))));
         if (seen) editor.putBoolean(mediaKey, true); else editor.remove(mediaKey);
         editor.apply();
+        scheduleProfileStateSync();
         if (kind.equals("movie") || kind.equals("series")) {
             setNodeSeen(nodeId, seen);
             removeContinueForNode(nodeId);
@@ -2612,6 +3026,9 @@ public class MainActivity extends Activity {
             case "Cada perfil conserva su lista y su progreso de reproducción.":
                 return "Profil bakoitzak bere zerrenda eta erreprodukzio-aurrerapena gordetzen ditu.";
             case "Perfil actual": return "Uneko profila";
+            case "Clave de sincronización de perfiles": return "Profilak sinkronizatzeko gakoa";
+            case "Usa el mismo valor configurado como PROFILE_SYNC_TOKEN en el NAS.":
+                return "Erabili NASeko PROFILE_SYNC_TOKEN gisa ezarritako balio bera.";
             case "Usar": return "Erabili";
             case "Editar perfil": return "Profila editatu";
             case "Añadir perfil": return "Gehitu profila";
@@ -3092,6 +3509,18 @@ public class MainActivity extends Activity {
         serverCard.addView(urlLabel, urlP);
         EditText urlInput = settingsField(initialServer, "https://servidor", true);
         addSettingInput(serverCard, urlInput);
+        TextView syncLabel = label(t("Clave de sincronización de perfiles"), 13, MUTED, true);
+        LinearLayout.LayoutParams syncLabelParams = new LinearLayout.LayoutParams(-1, -2);
+        syncLabelParams.topMargin = d(16);
+        serverCard.addView(syncLabel, syncLabelParams);
+        EditText syncTokenInput = settingsField(prefs.getString("profile_sync_token", ""),
+                "PROFILE_SYNC_TOKEN", false);
+        syncTokenInput.setTransformationMethod(PasswordTransformationMethod.getInstance());
+        addSettingInput(serverCard, syncTokenInput);
+        TextView syncHint = label(t("Usa el mismo valor configurado como PROFILE_SYNC_TOKEN en el NAS."), 12, MUTED, false);
+        LinearLayout.LayoutParams syncHintParams = new LinearLayout.LayoutParams(-1, -2);
+        syncHintParams.topMargin = d(6);
+        serverCard.addView(syncHint, syncHintParams);
         LinearLayout connectButtons = new LinearLayout(this);
         connectButtons.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams buttonsP = new LinearLayout.LayoutParams(-1, -2);
@@ -3125,8 +3554,8 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams basqueP = new LinearLayout.LayoutParams(0, d(46), 1);
         basqueP.leftMargin = d(9);
         languageButtons.addView(basque, basqueP);
-        spanish.setOnClickListener(v -> changeLanguage("es", nameInput, urlInput));
-        basque.setOnClickListener(v -> changeLanguage("eu", nameInput, urlInput));
+        spanish.setOnClickListener(v -> changeLanguage("es", nameInput, urlInput, syncTokenInput));
+        basque.setOnClickListener(v -> changeLanguage("eu", nameInput, urlInput, syncTokenInput));
 
         TextView attribution = label("This product uses the TMDB API but is not endorsed or certified by TMDB.",
                 11, MUTED, false);
@@ -3176,10 +3605,13 @@ public class MainActivity extends Activity {
                 lastCatalogVersionCheckMs = 0L;
             }
             prefs.edit().putString("server", server).putString("server_name", serverName).apply();
+            prefs.edit().putString("profile_sync_token", syncTokenInput.getText().toString().trim()).apply();
             imageCache.evictAll();
             requestedImages.clear();
             showingAdmin = false;
+            lastProfileSyncMs = 0L;
             loadHome();
+            synchronizeProfilesFromServer(true);
         });
     }
 
@@ -3203,10 +3635,12 @@ public class MainActivity extends Activity {
         return value.length() >= 10 ? value : "";
     }
 
-    void changeLanguage(String language, EditText nameInput, EditText urlInput) {
+    void changeLanguage(String language, EditText nameInput, EditText urlInput, EditText syncTokenInput) {
         String name = nameInput.getText().toString();
         String address = urlInput.getText().toString();
+        String syncToken = syncTokenInput.getText().toString();
         prefs.edit().putString("language", language).apply();
+        prefs.edit().putString("profile_sync_token", syncToken).apply();
         renderAdminWindow(name, address);
     }
 
@@ -3251,6 +3685,7 @@ public class MainActivity extends Activity {
         String key = favoriteKey(node.optString("id"));
         if (prefs.contains(key)) prefs.edit().remove(key).apply();
         else prefs.edit().putString(key, node.toString()).apply();
+        scheduleProfileStateSync();
         Toast.makeText(this, prefs.contains(key) ? "Añadido a Mi lista" : "Eliminado de Mi lista", Toast.LENGTH_SHORT).show();
     }
 
@@ -3378,11 +3813,19 @@ public class MainActivity extends Activity {
         intent.putExtra("media_id", mediaId);
         intent.putExtra("owner_kind", ownerKind);
         intent.putExtra("progress_key", key);
+        intent.putExtra("profile_id", activeProfileId());
         startActivity(intent);
     }
 
     @Override protected void onResume() {
         super.onResume();
+        if (hasResumedOnce) {
+            String activeId = activeProfileId();
+            if (!activeId.isEmpty() && prefs.getBoolean(profileStateDirtyKey(activeId), false)) {
+                scheduleProfileStateSync();
+            }
+            if (!startupPrefetchPending) synchronizeProfilesFromServer(false);
+        } else hasResumedOnce = true;
         if (prefs != null && page != null && "home".equals(selectedSection)
                 && !showingDetail && !showingAdmin && content != null
                 && movies.size() + series.size() > 0) {

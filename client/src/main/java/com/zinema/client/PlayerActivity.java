@@ -19,6 +19,7 @@ public class PlayerActivity extends Activity {
     private String mediaId;
     private String ownerKind;
     private String progressKey;
+    private String profileId;
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -30,6 +31,7 @@ public class PlayerActivity extends Activity {
         mediaId = getIntent().getStringExtra("media_id");
         ownerKind = getIntent().getStringExtra("owner_kind");
         progressKey = getIntent().getStringExtra("progress_key");
+        profileId = getIntent().getStringExtra("profile_id");
         if (progressKey == null || progressKey.isEmpty()) progressKey = "watch:" + path;
         long resumeAt = getIntent().getLongExtra("position", 0L);
         if (url == null || url.isEmpty()) {
@@ -61,8 +63,10 @@ public class PlayerActivity extends Activity {
             if (position >= 0L && duration > 0L && position >= duration - 5000L) {
                 getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
                         .remove(progressKey).apply();
+                markProfileStateDirty();
             } else if (position > 10000L) {
                 saveProgress(position);
+                markProfileStateDirty();
             }
         }
         finish();
@@ -86,5 +90,11 @@ public class PlayerActivity extends Activity {
                     .putString(progressKey == null || progressKey.isEmpty() ? "watch:" + path : progressKey,
                             item.toString()).apply();
         } catch (Exception ignored) { }
+    }
+
+    private void markProfileStateDirty() {
+        if (profileId == null || profileId.isEmpty()) return;
+        getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
+                .putBoolean("profile_sync_dirty:" + profileId, true).apply();
     }
 }

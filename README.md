@@ -33,7 +33,7 @@ Requisitos: Docker Engine con Docker Compose v2, `curl` y acceso de lectura del 
    nano .env
    ```
 
-2. Configura `MOVIES_PATH`, `SERIES_PATH` y un `ADMIN_TOKEN` propio. Para TMDb puedes guardar la **API Key v3** en `TMDB_KEY` o el **API Read Access Token** en `TMDB_ACCESS_TOKEN`; basta con configurar uno. No pongas estas credenciales en el cliente ni las subas a Git. `TMDB_LANGUAGE` controla el idioma preferido de los resultados; por defecto es `es-ES`.
+2. Configura `MOVIES_PATH`, `SERIES_PATH`, un `ADMIN_TOKEN` y un `PROFILE_SYNC_TOKEN` propios. El token de perfiles debe ser el mismo en todos los clientes y se introduce en Administración → sincronización de perfiles. Para TMDb puedes guardar la **API Key v3** en `TMDB_KEY` o el **API Read Access Token** en `TMDB_ACCESS_TOKEN`; basta con configurar uno. No pongas estas credenciales en el cliente ni las subas a Git. `TMDB_LANGUAGE` controla el idioma preferido de los resultados; por defecto es `es-ES`.
 
 3. Valida las rutas y arranca el servidor:
 
@@ -131,7 +131,7 @@ El archivo queda en `client/build/outputs/apk/debug/zinema-client-debug.apk`. El
 
 TMDb proporciona metadata e imágenes para este proyecto. La aplicación debe mostrar la atribución requerida por TMDb: **“This product uses the TMDB API but is not endorsed or certified by TMDB.”** Si el uso pasa a ser comercial, revisa las condiciones y licencia con TMDb. Zinema conserva los IDs de IMDb que TMDb devuelva, pero no consulta ni extrae datos directamente de IMDb.
 
-Las rutas de catálogo, metadata e imágenes no requieren autenticación. Las rutas bajo `/api/v1/admin` sí requieren `ADMIN_TOKEN`. Mantén el servicio dentro de una red privada o protégelo detrás de una VPN/autenticación antes de hacerlo accesible desde Internet.
+Las rutas de catálogo, metadata e imágenes no requieren autenticación. Las rutas bajo `/api/v1/admin` requieren `ADMIN_TOKEN`; las rutas `/api/v1/profiles` requieren `PROFILE_SYNC_TOKEN` y sincronizan perfiles, avatares y su estado local entre dispositivos. Mantén el servicio dentro de una red privada o protégelo detrás de una VPN/autenticación antes de hacerlo accesible desde Internet.
 
 ## Comprobaciones
 
