@@ -28,6 +28,7 @@ import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.PopupMenu;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -88,7 +89,6 @@ public class MainActivity extends Activity {
     TextView backButton;
     View brandButton;
     TextView searchButton;
-    TextView settingsButton;
     View profileButton;
     HorizontalScrollView navScroll;
     String server;
@@ -385,19 +385,12 @@ public class MainActivity extends Activity {
         searchButton.setBackground(round(PANEL, d(22)));
         searchButton.setElevation(d(4));
         bar.addView(searchButton, new LinearLayout.LayoutParams(d(44), d(44)));
-        settingsButton = navAction("⚙", "Servidor", v -> showSettings());
-        settingsButton.setBackground(round(PANEL, d(22)));
-        settingsButton.setElevation(d(4));
-        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(d(44), d(44));
-        sp.leftMargin = d(10);
-        bar.addView(settingsButton, sp);
         profileButton = buildProfileChip();
         LinearLayout.LayoutParams profileParams = new LinearLayout.LayoutParams(-2, d(42));
         profileParams.leftMargin = d(10);
         bar.addView(profileButton, profileParams);
         if (showingAdmin || showingProfiles) {
             searchButton.setVisibility(View.GONE);
-            settingsButton.setVisibility(View.GONE);
             profileButton.setVisibility(View.GONE);
         }
         page.addView(bar, new LinearLayout.LayoutParams(-1, d(68)));
@@ -1054,12 +1047,38 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(-2, -2);
         textParams.leftMargin = d(7);
         chip.addView(label, textParams);
+        TextView dropdown = label("▾", 15, MUTED, true);
+        LinearLayout.LayoutParams dropdownParams = new LinearLayout.LayoutParams(-2, -2);
+        dropdownParams.leftMargin = d(5);
+        chip.addView(dropdown, dropdownParams);
         chip.setFocusable(true);
         chip.setClickable(true);
         chip.setContentDescription(t("Cambiar perfil") + ": " + name);
         applyTvFocusStyle(chip, false);
-        chip.setOnClickListener(v -> openProfileManager());
+        chip.setOnClickListener(v -> {
+            PopupMenu menu = new PopupMenu(MainActivity.this, chip);
+            menu.getMenu().add(android.view.Menu.NONE, 1, 1, "👤   " + t("Cambiar perfil"));
+            menu.getMenu().add(android.view.Menu.NONE, 2, 2, "⚙   " + t("Administración"));
+            menu.getMenu().add(android.view.Menu.NONE, 3, 3, "⏻   " + t("Salir"));
+            menu.setOnMenuItemClickListener(item -> {
+                if (item.getItemId() == 1) openProfileManager();
+                else if (item.getItemId() == 2) showSettings();
+                else if (item.getItemId() == 3) finishAffinity();
+                return true;
+            });
+            menu.show();
+        });
         return chip;
+    }
+
+    void refreshProfileChip() {
+        if (profileButton == null || !(profileButton.getParent() instanceof ViewGroup)) return;
+        ViewGroup parent = (ViewGroup) profileButton.getParent();
+        int index = parent.indexOfChild(profileButton);
+        ViewGroup.LayoutParams params = profileButton.getLayoutParams();
+        parent.removeView(profileButton);
+        profileButton = buildProfileChip();
+        parent.addView(profileButton, index, params);
     }
 
     void openProfileManager() {
@@ -1484,6 +1503,7 @@ public class MainActivity extends Activity {
     }
 
     void renderHome() {
+        refreshProfileChip();
         content.removeAllViews();
         List<JSONObject> resume = readContinueWatching();
         if (!resume.isEmpty()) addResumeRow("Seguir viendo", resume);
@@ -2662,7 +2682,6 @@ public class MainActivity extends Activity {
         int menuVisibility = visible ? View.GONE : View.VISIBLE;
         if (brandButton != null) brandButton.setVisibility(menuVisibility);
         if (searchButton != null) searchButton.setVisibility(menuVisibility);
-        if (settingsButton != null) settingsButton.setVisibility(menuVisibility);
         if (navScroll != null) navScroll.setVisibility(menuVisibility);
         metadataEditorMode = visible;
     }
@@ -3022,6 +3041,7 @@ public class MainActivity extends Activity {
             case "Perfiles": return "Profilak";
             case "Perfil": return "Profila";
             case "Cambiar perfil": return "Profila aldatu";
+            case "Salir": return "Irten";
             case "¿Quién está viendo?": return "Nor ari da ikusten?";
             case "Cada perfil conserva su lista y su progreso de reproducción.":
                 return "Profil bakoitzak bere zerrenda eta erreprodukzio-aurrerapena gordetzen ditu.";
