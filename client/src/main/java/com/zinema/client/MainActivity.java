@@ -3115,7 +3115,13 @@ public class MainActivity extends Activity {
             if ("series".equals(kind)) return "TELESAILA";
             if ("season".equals(kind)) return "DENBORALDIA";
             if ("collection".equals(kind)) return "BILDUMA";
+            if ("episode".equals(kind)) return "ATALA";
         }
+        if ("movie".equals(kind)) return "PELÍCULA";
+        if ("series".equals(kind)) return "SERIE";
+        if ("season".equals(kind)) return "TEMPORADA";
+        if ("collection".equals(kind)) return "COLECCIÓN";
+        if ("episode".equals(kind)) return "CAPÍTULO";
         return kind == null ? "" : kind.toUpperCase(java.util.Locale.ROOT);
     }
 
@@ -3506,7 +3512,7 @@ public class MainActivity extends Activity {
         showLoading("Buscando…");
         io.execute(() -> {
             try {
-                JSONArray results = getArray("/api/v1/items?q=" + enc(query.trim()) + "&limit=100");
+                JSONArray results = getArray("/api/v1/search?q=" + enc(query.trim()) + "&limit=100");
                 runOnUiThread(() -> {
                     content.removeAllViews();
                     addSectionHeader("Resultados", results.length() + " encontrados");
@@ -3524,7 +3530,7 @@ public class MainActivity extends Activity {
     void addSearchResult(JSONObject result) {
         LinearLayout row = new LinearLayout(this);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(d(14), d(10), d(14), d(10));
+        row.setPadding(d(14), d(11), d(14), d(11));
         row.setBackground(round(PANEL, d(10)));
         row.setFocusable(true);
         row.setClickable(true);
@@ -3537,51 +3543,128 @@ public class MainActivity extends Activity {
         LinearLayout textBox = new LinearLayout(this);
         textBox.setOrientation(LinearLayout.VERTICAL);
         textBox.setPadding(d(12), 0, d(8), 0);
-        textBox.addView(labelRaw(result.optString("metadata_title", result.optString("title", "Vídeo")), 15, Color.WHITE, true));
-        TextView detail = label(searchSubtitle(result) + "   ·   " + result.optString("extension", "").replace(".", "").toUpperCase(), 12, MUTED, false);
-        if (isMediaSeen(result)) detail.setText(detail.getText() + "   ·   ✓ VISTO");
+        TextView type = label(kindLabel(result.optString("kind")), 10, 0xFFFF646B, true);
+        type.setLetterSpacing(0.08f);
+        textBox.addView(type);
+        TextView title = labelRaw(result.optString("display_title", result.optString("title", "Vídeo")),
+                15, Color.WHITE, true);
+        title.setMaxLines(2);
+        LinearLayout.LayoutParams titleP = new LinearLayout.LayoutParams(-1, -2);
+        titleP.topMargin = d(3);
+        textBox.addView(title, titleP);
+        TextView detail = label(searchSubtitle(result), 12, MUTED, false);
+        detail.setMaxLines(2);
         LinearLayout.LayoutParams detailP = new LinearLayout.LayoutParams(-1, -2);
-        detailP.topMargin = d(5);
+        detailP.topMargin = d(4);
         textBox.addView(detail, detailP);
+        if ("episode".equals(result.optString("kind")) && isMediaSeen(result)) {
+            TextView watched = label("✓ VISTO", 10, 0xFF79E3B7, true);
+            LinearLayout.LayoutParams watchedP = new LinearLayout.LayoutParams(-1, -2);
+            watchedP.topMargin = d(3);
+            textBox.addView(watched, watchedP);
+        }
         row.addView(textBox, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView play = label("▶", 18, Color.WHITE, true);
-        row.addView(play);
-        TextView actions = label("⋮", 22, Color.WHITE, true);
-        actions.setGravity(Gravity.CENTER);
-        actions.setMinWidth(d(34));
-        actions.setFocusable(true);
-        applyTvFocusStyle(actions, false);
-        row.addView(actions);
+        TextView arrow = label("›", 27, MUTED, true);
+        arrow.setGravity(Gravity.CENTER);
+        row.addView(arrow, new LinearLayout.LayoutParams(d(28), d(44)));
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
         p.setMargins(d(16), 0, d(16), d(8));
         content.addView(row, p);
-        String seriesId = result.optString("series_id", "");
-        boolean isEpisode = !seriesId.isEmpty() && !seriesId.equals("null");
-        String metadataId = isEpisode ? seriesId : result.optString("node_id", "");
-        String ownerId = isEpisode ? result.optString("node_id", "") : metadataId;
-        JSONObject metadataNode = new JSONObject();
-        JSONObject owner = new JSONObject();
-        try {
-            metadataNode.put("id", metadataId);
-            metadataNode.put("kind", isEpisode ? "series" : "movie");
-            owner.put("id", ownerId);
-            owner.put("kind", isEpisode ? "season" : "movie");
-        } catch (JSONException ignored) { }
-        row.setOnClickListener(v -> launchPlayer(
-                result.optString("stream_url", "/api/v1/items/" + result.optString("id") + "/stream"),
-                result.optString("title", "Zinema"), result.optString("poster_url", ""),
-                ownerId, result.optString("id", ""), owner.optString("kind", "")));
-        actions.setOnClickListener(v -> showMediaActions(result, owner, metadataNode));
+        row.setOnClickListener(v -> openSearchResult(result));
+    }
+
+    void openSearchResult(JSONObject result) {
+        if ("episode".equals(result.optString("kind"))) openSearchEpisodeDetail(result);
+        else openNode(result);
+    }
+
+    void openSearchEpisodeDetail(JSONObject episode) {
+        leaveStartupHomeWait();
+        detailReturnScrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
+        showingDetail = true;
+        detailNodeId = "";
+        if (backButton != null) backButton.setVisibility(View.VISIBLE);
+        content.removeAllViews();
+
+        FrameLayout banner = new FrameLayout(this);
+        ImageView background = new ImageView(this);
+        background.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        banner.addView(background, new FrameLayout.LayoutParams(-1, -1));
+        loadImage(episode.optString("poster_url", ""), background, true);
+        View shade = new View(this);
+        shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
+                new int[]{BG, 0xCC090A0D, 0x22090A0D}));
+        banner.addView(shade, new FrameLayout.LayoutParams(-1, -1));
+
+        LinearLayout info = new LinearLayout(this);
+        info.setOrientation(LinearLayout.VERTICAL);
+        info.setGravity(Gravity.BOTTOM);
+        info.setPadding(d(24), d(26), d(24), d(24));
+        TextView type = label(kindLabel("episode"), 11, 0xFFFF646B, true);
+        type.setLetterSpacing(0.12f);
+        info.addView(type);
+        TextView title = labelRaw(episode.optString("display_title", episode.optString("title", "Capítulo")),
+                28, Color.WHITE, true);
+        title.setMaxLines(2);
+        LinearLayout.LayoutParams titleP = new LinearLayout.LayoutParams(-1, -2);
+        titleP.topMargin = d(6);
+        info.addView(title, titleP);
+        String episodeMeta = episode.optString("series_title", "") + "  ·  "
+                + String.format(java.util.Locale.ROOT, "T%02d E%02d",
+                episode.optInt("season_number"), episode.optInt("episode_number"));
+        TextView meta = label(episodeMeta, 13, 0xFFD7D9DF, false);
+        LinearLayout.LayoutParams metaP = new LinearLayout.LayoutParams(-1, -2);
+        metaP.topMargin = d(7);
+        info.addView(meta, metaP);
+
+        LinearLayout controls = new LinearLayout(this);
+        controls.setGravity(Gravity.CENTER_VERTICAL);
+        Button play = actionButton("Reproducir", true);
+        controls.addView(play, new LinearLayout.LayoutParams(-2, d(44)));
+        Button details = actionButton("ⓘ  Details", false);
+        LinearLayout.LayoutParams detailsP = new LinearLayout.LayoutParams(-2, d(44));
+        detailsP.leftMargin = d(8);
+        controls.addView(details, detailsP);
+        LinearLayout.LayoutParams controlsP = new LinearLayout.LayoutParams(-1, -2);
+        controlsP.topMargin = d(14);
+        info.addView(controls, controlsP);
+        banner.addView(info, new FrameLayout.LayoutParams(-1, -1));
+        LinearLayout.LayoutParams bannerP = new LinearLayout.LayoutParams(-1, d(390));
+        bannerP.setMargins(d(16), d(10), d(16), d(10));
+        content.addView(banner, bannerP);
+        play.setOnClickListener(v -> launchPlayer(episode.optString("stream_url"),
+                episode.optString("title", "Zinema"), episode.optString("poster_url", ""),
+                episode.optString("node_id", ""), episode.optString("id", ""), "season"));
+        details.setOnClickListener(v -> showVideoFileDetails(episode, episode.optString("library", "")));
     }
 
     String searchSubtitle(JSONObject result) {
-        if (!result.optString("series_id").isEmpty()) {
+        String kind = result.optString("kind");
+        if ("collection".equals(kind)) {
+            int count = result.optInt("item_count");
+            return count + (count == 1 ? " elemento" : " elementos");
+        }
+        if ("series".equals(kind)) {
             int seasons = result.optInt("season_count");
             return seasons + (seasons == 1 ? " " + t("temporada") : " " + t("temporadas"));
         }
+        if ("season".equals(kind)) {
+            JSONArray files = result.optJSONArray("files");
+            int episodes = files == null ? 0 : files.length();
+            return t("Temporada") + " " + String.format(java.util.Locale.ROOT, "%02d", result.optInt("season_number"))
+                    + "  ·  " + episodes + (episodes == 1 ? " capítulo" : " capítulos");
+        }
+        if ("episode".equals(kind)) {
+            return result.optString("series_title", "") + "  ·  "
+                    + String.format(java.util.Locale.ROOT, "T%02d E%02d",
+                    result.optInt("season_number"), result.optInt("episode_number"));
+        }
+        String year = result.isNull("year") ? "" : result.optString("year", "");
         JSONArray genres = result.optJSONArray("genres");
-        if (genres != null && genres.length() > 0) return join(genres);
-        return "Sin género disponible";
+        String genreText = genres == null || genres.length() == 0 ? "" : join(genres);
+        if (!year.isEmpty() && !genreText.isEmpty()) return year + "  ·  " + genreText;
+        if (!year.isEmpty()) return year;
+        return genreText.isEmpty() ? "" : genreText;
     }
 
     void showSettings() {
@@ -4181,6 +4264,10 @@ public class MainActivity extends Activity {
             pendingListingRestoreY = returnScrollY;
             if (breadcrumbs.isEmpty()) {
                 if (libraryMode) openLibrary(currentLibrary);
+                else if (lastSearchQuery != null) {
+                    pendingListingRestoreY = returnScrollY;
+                    performSearch(lastSearchQuery);
+                }
                 else loadHome();
             } else {
                 JSONObject parent = breadcrumbs.get(breadcrumbs.size() - 1);

@@ -1123,6 +1123,87 @@ def list_genres() -> list[str]:
     return sorted(normalize_genres(genres), key=str.casefold)
 
 
+@app.get("/api/v1/search", dependencies=[Depends(require_client)])
+def search_catalog(
+    q: str = Query(min_length=1, max_length=200),
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+) -> list[dict]:
+    """Search titles across catalog entries and individual series episodes."""
+    query = q.strip()
+    if not query:
+        return []
+    escaped = query.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+    pattern = f"%{escaped}%"
+    with closing(database()) as connection:
+        nodes = connection.execute(
+            """SELECT * FROM catalog_nodes
+               WHERE available=1 AND (title LIKE ? ESCAPE '!' COLLATE NOCASE
+                                      OR metadata_title LIKE ? ESCAPE '!' COLLATE NOCASE)
+               ORDER BY CASE WHEN title=? COLLATE NOCASE OR metadata_title=? COLLATE NOCASE THEN 0
+                             WHEN title LIKE ? ESCAPE '!' COLLATE NOCASE
+                               OR metadata_title LIKE ? ESCAPE '!' COLLATE NOCASE THEN 1 ELSE 2 END,
+                        COALESCE(metadata_title, title) COLLATE NOCASE
+               LIMIT ?""",
+            (pattern, pattern, query, query, f"{escaped}%", f"{escaped}%", limit),
+        ).fetchall()
+        results = [_node_payload(row, connection) for row in nodes]
+
+        episodes = connection.execute(
+            """SELECT li.id, COALESCE(li.episode_title, li.title) AS title,
+                      li.title AS filename, li.library, li.relative_path, li.extension,
+                      li.size_bytes, li.modified_at, li.node_id, li.series_node_id AS series_id,
+                      li.season_number, li.episode_number, n.title AS series_title,
+                      n.metadata_title AS series_metadata_title
+               FROM library_items li
+               JOIN catalog_nodes n ON n.id=li.series_node_id AND n.available=1
+               WHERE li.available=1 AND li.series_node_id IS NOT NULL
+                 AND COALESCE(li.episode_title, li.title) LIKE ? ESCAPE '!' COLLATE NOCASE
+               ORDER BY CASE WHEN COALESCE(li.episode_title, li.title)=? COLLATE NOCASE THEN 0
+                             WHEN COALESCE(li.episode_title, li.title) LIKE ? ESCAPE '!' COLLATE NOCASE
+                             THEN 1 ELSE 2 END,
+                        COALESCE(li.episode_title, li.title) COLLATE NOCASE
+               LIMIT ?""",
+            (pattern, query, f"{escaped}%", limit),
+        ).fetchall()
+        for episode in episodes:
+            season = connection.execute(
+                "SELECT * FROM catalog_nodes WHERE id=? AND available=1",
+                (episode["node_id"],),
+            ).fetchone()
+            season_payload = _node_payload(season, connection) if season else {}
+            results.append({
+                "id": episode["id"],
+                "kind": "episode",
+                "title": episode["title"],
+                "display_title": episode["title"],
+                "filename": episode["filename"],
+                "library": episode["library"],
+                "relative_path": episode["relative_path"],
+                "extension": episode["extension"],
+                "size_bytes": episode["size_bytes"],
+                "modified_at": episode["modified_at"],
+                "node_id": episode["node_id"],
+                "series_id": episode["series_id"],
+                "season_number": episode["season_number"],
+                "episode_number": episode["episode_number"],
+                "series_title": episode["series_metadata_title"] or episode["series_title"],
+                "poster_url": season_payload.get("poster_url"),
+                "stream_url": f"/api/v1/items/{episode['id']}/stream",
+            })
+
+    query_folded = query.casefold()
+
+    def result_order(item: dict) -> tuple[int, int, str]:
+        title = str(item.get("display_title") or item.get("title") or "")
+        folded = title.casefold()
+        match_rank = 0 if folded == query_folded else 1 if folded.startswith(query_folded) else 2
+        kind_rank = {"collection": 0, "movie": 1, "series": 2, "season": 3, "episode": 4}
+        return match_rank, kind_rank.get(item.get("kind"), 9), folded
+
+    results.sort(key=result_order)
+    return results[:limit]
+
+
 @app.get("/api/v1/catalog/{node_id}", dependencies=[Depends(require_client)])
 def get_catalog_node(node_id: str) -> dict:
     with closing(database()) as connection:
