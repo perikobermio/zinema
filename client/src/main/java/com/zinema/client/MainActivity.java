@@ -10,6 +10,8 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.text.Editable;
@@ -82,6 +84,8 @@ public class MainActivity extends Activity {
     static final long CATALOG_CACHE_TTL_MS = 30000L;
     static final long IMAGE_DISK_CACHE_MAX_BYTES = 160L * 1024L * 1024L;
     final ExecutorService io = Executors.newFixedThreadPool(4);
+    final Handler adminSyncHandler = new Handler(Looper.getMainLooper());
+    Runnable adminSyncPollTask;
     final LruCache<String, Bitmap> imageCache = new LruCache<String, Bitmap>(bitmapCacheBytes()) {
         @Override protected int sizeOf(String key, Bitmap value) {
             return Math.max(1, value.getAllocationByteCount());
@@ -3266,6 +3270,23 @@ public class MainActivity extends Activity {
             case "Revisa la dirección y el nombre del servidor.":
                 return "Egiaztatu zerbitzariaren helbidea eta izena.";
             case "Idioma de la aplicación": return "Aplikazioaren hizkuntza";
+            case "Sincronización del catálogo": return "Katalogoa sinkronizatzea";
+            case "Escanea las carpetas del NAS y vuelve a obtener metadata.":
+                return "NASeko karpetak eskaneatu eta metadatuak berriro lortzen ditu.";
+            case "Sincronizar ahora": return "Sinkronizatu orain";
+            case "Sincronización nunca ejecutada": return "Sinkronizazioa ez da inoiz egin";
+            case "Iniciando sincronización…": return "Sinkronizazioa hasten…";
+            case "No se pudo iniciar la sincronización": return "Ezin izan da sinkronizazioa hasi";
+            case "No se pudo consultar el estado": return "Ezin izan da egoera kontsultatu";
+            case "Sincronización en cola…": return "Sinkronizazioa ilaran…";
+            case "Escaneando carpetas…": return "Karpetak eskaneatzen…";
+            case "Obteniendo metadata…": return "Metadatuak eskuratzen…";
+            case "Sincronización en curso…": return "Sinkronizazioa egiten…";
+            case "Sincronización completada": return "Sinkronizazioa osatu da";
+            case "archivos revisados": return "fitxategi aztertu dira";
+            case "Sincronización fallida": return "Sinkronizazioak huts egin du";
+            case "El servidor no devolvió el ID de sincronización.":
+                return "Zerbitzariak ez du sinkronizazio IDrik itzuli.";
             case "Probar conexión": return "Konexioa probatu";
             case "Guardar y conectar": return "Gorde eta konektatu";
             case "Dirección pública o local de tu servidor Zinema.": return "Zure Zinema zerbitzariaren helbide publikoa edo lokala.";
@@ -3667,6 +3688,152 @@ public class MainActivity extends Activity {
         return genreText.isEmpty() ? "" : genreText;
     }
 
+    void loadAdminSyncControls(LinearLayout slot) {
+        io.execute(() -> {
+            try {
+                JSONObject account = getJson("/api/v1/auth/me");
+                if (!account.optBoolean("is_admin")) return;
+                JSONObject latest = getJson("/api/v1/admin/sync");
+                runOnUiThread(() -> {
+                    if (!showingAdmin || slot.getParent() == null) return;
+                    if (adminSyncPollTask != null) adminSyncHandler.removeCallbacks(adminSyncPollTask);
+                    slot.removeAllViews();
+                    slot.setVisibility(View.VISIBLE);
+                    LinearLayout card = settingsCard();
+                    slot.addView(card);
+                    card.addView(label(t("Sincronización del catálogo"), 16, Color.WHITE, true));
+                    TextView hint = label(t("Escanea las carpetas del NAS y vuelve a obtener metadata."),
+                            12, MUTED, false);
+                    LinearLayout.LayoutParams hintP = new LinearLayout.LayoutParams(-1, -2);
+                    hintP.topMargin = d(6);
+                    card.addView(hint, hintP);
+                    ProgressBar progress = new ProgressBar(this);
+                    progress.setIndeterminate(true);
+                    LinearLayout.LayoutParams progressP = new LinearLayout.LayoutParams(-1, d(4));
+                    progressP.topMargin = d(14);
+                    card.addView(progress, progressP);
+                    progress.setVisibility(View.GONE);
+                    TextView status = label(t("Sincronización nunca ejecutada"), 12, MUTED, false);
+                    LinearLayout.LayoutParams statusP = new LinearLayout.LayoutParams(-1, -2);
+                    statusP.topMargin = d(10);
+                    card.addView(status, statusP);
+                    Button sync = actionButton("Sincronizar ahora", true);
+                    LinearLayout.LayoutParams syncP = new LinearLayout.LayoutParams(-1, d(46));
+                    syncP.topMargin = d(12);
+                    card.addView(sync, syncP);
+
+                    boolean active = applyAdminSyncState(latest, status, progress, sync, false);
+                    if (active && !latest.optString("id", "").isEmpty())
+                        pollAdminSync(latest.optString("id"), status, progress, sync, false);
+                    sync.setOnClickListener(v -> startCatalogSyncFromAdmin(status, progress, sync));
+                });
+            } catch (Exception ignored) {
+                // Hide admin-only controls if the account cannot be verified.
+            }
+        });
+    }
+
+    void startCatalogSyncFromAdmin(TextView status, ProgressBar progress, Button button) {
+        status.setText(t("Iniciando sincronización…"));
+        progress.setVisibility(View.VISIBLE);
+        button.setEnabled(false);
+        io.execute(() -> {
+            try {
+                JSONObject started;
+                try {
+                    started = postJson("/api/v1/admin/sync");
+                } catch (Exception startError) {
+                    if (startError.getMessage() == null || !startError.getMessage().contains("409"))
+                        throw startError;
+                    started = getJson("/api/v1/admin/sync");
+                }
+                String jobId = started.optString("id", "");
+                if (jobId.isEmpty()) throw new Exception("El servidor no devolvió el ID de sincronización.");
+                runOnUiThread(() -> pollAdminSync(jobId, status, progress, button, true));
+            } catch (Exception e) {
+                String message = e.getMessage() == null ? "Error desconocido" : e.getMessage();
+                runOnUiThread(() -> {
+                    if (!showingAdmin || status.getParent() == null) return;
+                    progress.setVisibility(View.GONE);
+                    button.setEnabled(true);
+                    status.setText(t("No se pudo iniciar la sincronización") + ": " + message);
+                    Toast.makeText(this, t("No se pudo iniciar la sincronización") + ": " + message,
+                            Toast.LENGTH_LONG).show();
+                });
+            }
+        });
+    }
+
+    void pollAdminSync(String jobId, TextView status, ProgressBar progress,
+                       Button button, boolean notifyCompletion) {
+        if (!showingAdmin || status.getParent() == null) return;
+        io.execute(() -> {
+            try {
+                JSONObject job = getJson("/api/v1/admin/sync/" + enc(jobId));
+                runOnUiThread(() -> {
+                    if (!showingAdmin || status.getParent() == null) return;
+                    boolean active = applyAdminSyncState(job, status, progress, button, notifyCompletion);
+                    if (active) scheduleAdminSyncPoll(jobId, status, progress, button, notifyCompletion);
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (!showingAdmin || status.getParent() == null) return;
+                    status.setText(t("No se pudo consultar el estado") + ": " + e.getMessage());
+                    scheduleAdminSyncPoll(jobId, status, progress, button, notifyCompletion);
+                });
+            }
+        });
+    }
+
+    void scheduleAdminSyncPoll(String jobId, TextView status, ProgressBar progress,
+                               Button button, boolean notifyCompletion) {
+        if (adminSyncPollTask != null) adminSyncHandler.removeCallbacks(adminSyncPollTask);
+        adminSyncPollTask = () -> {
+            adminSyncPollTask = null;
+            pollAdminSync(jobId, status, progress, button, notifyCompletion);
+        };
+        adminSyncHandler.postDelayed(adminSyncPollTask, 2000L);
+    }
+
+    boolean applyAdminSyncState(JSONObject job, TextView status, ProgressBar progress,
+                                Button button, boolean notifyCompletion) {
+        String state = job.optString("status", "");
+        String stage = job.optString("stage", "");
+        boolean active = "queued".equals(state) || "running".equals(state);
+        progress.setVisibility(active ? View.VISIBLE : View.GONE);
+        button.setEnabled(!active);
+        if ("queued".equals(state)) status.setText(t("Sincronización en cola…"));
+        else if ("running".equals(state)) {
+            if ("scan".equals(stage)) status.setText(t("Escaneando carpetas…"));
+            else if (stage.startsWith("metadata:"))
+                status.setText(t("Obteniendo metadata…") + " (" + stage.substring("metadata:".length()) + ")");
+            else status.setText(t("Sincronización en curso…"));
+        } else if ("completed".equals(state)) {
+            JSONObject result = job.optJSONObject("result");
+            JSONObject catalog = result == null ? null : result.optJSONObject("catalog");
+            int scanned = catalog == null ? 0 : catalog.optInt("scanned");
+            status.setText(scanned > 0
+                    ? t("Sincronización completada") + " · " + scanned + " " + t("archivos revisados")
+                    : t("Sincronización completada"));
+            clearCatalogCache();
+            catalogVersion = "";
+            lastCatalogVersionCheckMs = 0L;
+            if (notifyCompletion) Toast.makeText(this, t("Sincronización completada"), Toast.LENGTH_LONG).show();
+        } else if ("failed".equals(state)) {
+            String error = job.optString("error", "");
+            status.setText(t("Sincronización fallida") + (error.isEmpty() ? "" : ": " + error));
+            clearCatalogCache();
+            catalogVersion = "";
+            lastCatalogVersionCheckMs = 0L;
+            if (notifyCompletion) Toast.makeText(this, t("Sincronización fallida"), Toast.LENGTH_LONG).show();
+        } else if ("never_run".equals(state)) {
+            status.setText(t("Sincronización nunca ejecutada"));
+        } else {
+            status.setText(t("Estado") + ": " + state);
+        }
+        return active;
+    }
+
     void showSettings() {
         leaveStartupHomeWait();
         if (!showingAdmin) adminReturnDetailId = showingDetail ? detailNodeId : "";
@@ -3757,6 +3924,13 @@ public class MainActivity extends Activity {
         serverCard.addView(status, statusP);
         screen.addView(serverCard);
 
+        LinearLayout syncSlot = new LinearLayout(this);
+        syncSlot.setOrientation(LinearLayout.VERTICAL);
+        syncSlot.setVisibility(View.GONE);
+        LinearLayout.LayoutParams syncSlotParams = new LinearLayout.LayoutParams(-1, -2);
+        syncSlotParams.topMargin = d(14);
+        screen.addView(syncSlot, syncSlotParams);
+
         LinearLayout languageCard = settingsCard();
         LinearLayout.LayoutParams languageP = new LinearLayout.LayoutParams(-1, -2);
         languageP.topMargin = d(14);
@@ -3781,6 +3955,7 @@ public class MainActivity extends Activity {
         attribution.setPadding(d(2), d(16), d(2), 0);
         screen.addView(attribution);
         content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
+        loadAdminSyncControls(syncSlot);
 
         check.setOnClickListener(v -> {
             String candidate = normalizeServerUrl(urlInput.getText().toString());
