@@ -794,6 +794,7 @@ public class MainActivity extends Activity {
             if (activeProfileId().equals(profile.optString("id"))) activeFound = true;
         }
         if (!activeFound) prefs.edit().putString("active_profile", savedProfiles.get(0).optString("id")).apply();
+        syncActiveProfileToServer(activeProfileId());
         showingProfiles = false;
         libraryMode = false;
         showingDetail = false;
@@ -1111,6 +1112,24 @@ public class MainActivity extends Activity {
     }
 
     String activeProfileId() { return prefs.getString("active_profile", ""); }
+
+    void syncActiveProfileToServer(String profileId) {
+        String deviceId = prefs.getString("client_device_id", "");
+        if (profileId == null || profileId.isEmpty() || deviceId.isEmpty() || clientApiToken().isEmpty()) return;
+        String syncKey = deviceId + ":" + profileId;
+        if (syncKey.equals(prefs.getString("active_profile_synced", ""))) return;
+        io.execute(() -> {
+            try {
+                JSONObject payload = new JSONObject();
+                payload.put("profile_id", profileId);
+                putAuthorizedProfileJson("/api/v1/profiles/active", payload);
+                if (profileId.equals(activeProfileId())
+                        && deviceId.equals(prefs.getString("client_device_id", ""))) {
+                    prefs.edit().putString("active_profile_synced", syncKey).apply();
+                }
+            } catch (Exception ignored) { }
+        });
+    }
 
     JSONObject activeProfile() {
         String id = activeProfileId();
@@ -1498,6 +1517,7 @@ public class MainActivity extends Activity {
 
     void selectProfile(String id) {
         prefs.edit().putString("active_profile", id).apply();
+        syncActiveProfileToServer(id);
         lastProfileSyncMs = 0L;
         showingProfiles = false;
         profileEditorVisible = false;

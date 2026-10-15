@@ -110,6 +110,10 @@ class UserProfileRequest(BaseModel):
     avatar: str = Field(default="generic:0", max_length=1500)
 
 
+class ActiveProfileRequest(BaseModel):
+    profile_id: str = Field(min_length=1, max_length=100)
+
+
 class AccountCredentials(BaseModel):
     username: str | None = Field(default=None, min_length=3, max_length=254)
     email: str | None = Field(default=None, min_length=3, max_length=254)
@@ -289,6 +293,10 @@ def database() -> sqlite3.Connection:
     device_columns = {row["name"] for row in connection.execute("PRAGMA table_info(client_devices)")}
     if "user_id" not in device_columns:
         connection.execute("ALTER TABLE client_devices ADD COLUMN user_id TEXT")
+    if "active_profile_id" not in device_columns:
+        connection.execute("ALTER TABLE client_devices ADD COLUMN active_profile_id TEXT")
+    if "active_profile_updated_at" not in device_columns:
+        connection.execute("ALTER TABLE client_devices ADD COLUMN active_profile_updated_at TEXT")
     connection.commit()
     return connection
 
@@ -1059,9 +1067,15 @@ def list_accounts() -> list[dict[str, object]]:
             """SELECT a.id, COALESCE(NULLIF(a.username, ''), a.email) AS username,
                       a.created_at, a.is_admin, a.approved, a.disabled,
                       (SELECT COUNT(*) FROM client_devices d WHERE d.user_id=a.id AND d.revoked=0) AS devices,
-                      (SELECT p.avatar FROM user_profiles p WHERE p.user_id=a.id AND p.deleted=0
-                       ORDER BY CASE WHEN p.avatar IS NULL OR p.avatar='' OR p.avatar LIKE 'generic:%'
-                                     THEN 1 ELSE 0 END, p.created_at, p.id LIMIT 1) AS avatar
+                      COALESCE(
+                        (SELECT p.avatar FROM client_devices d
+                         JOIN user_profiles p ON p.id=d.active_profile_id AND p.user_id=d.user_id
+                         WHERE d.user_id=a.id AND d.revoked=0 AND p.deleted=0
+                         ORDER BY d.active_profile_updated_at DESC, d.created_at DESC LIMIT 1),
+                        (SELECT p.avatar FROM user_profiles p WHERE p.user_id=a.id AND p.deleted=0
+                         ORDER BY CASE WHEN p.avatar IS NULL OR p.avatar='' OR p.avatar LIKE 'generic:%'
+                                       THEN 1 ELSE 0 END, p.created_at, p.id LIMIT 1)
+                      ) AS avatar
                FROM accounts a ORDER BY a.created_at DESC, a.id"""
         ).fetchall()
     return [
@@ -1191,6 +1205,26 @@ def list_profiles(device_id: Annotated[str, Depends(require_client)]) -> list[di
         profile["deleted"] = bool(profile["deleted"])
         result.append(profile)
     return result
+
+
+@app.put("/api/v1/profiles/active")
+def set_active_profile(request: ActiveProfileRequest,
+                       device_id: Annotated[str, Depends(require_client)]) -> dict[str, str]:
+    user_id = account_for_device(device_id)
+    with closing(database()) as connection:
+        owned = connection.execute(
+            "SELECT 1 FROM user_profiles WHERE id=? AND user_id=? AND deleted=0",
+            (request.profile_id, user_id),
+        ).fetchone()
+        if owned is None:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        connection.execute(
+            "UPDATE client_devices SET active_profile_id=?, active_profile_updated_at=? "
+            "WHERE id=? AND user_id=? AND revoked=0",
+            (request.profile_id, datetime.now(timezone.utc).isoformat(), device_id, user_id),
+        )
+        connection.commit()
+    return {"profile_id": request.profile_id}
 
 
 @app.post("/api/v1/profiles")
