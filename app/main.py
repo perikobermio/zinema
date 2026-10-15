@@ -1058,7 +1058,9 @@ def list_accounts() -> list[dict[str, object]]:
         rows = connection.execute(
             """SELECT a.id, COALESCE(NULLIF(a.username, ''), a.email) AS username,
                       a.created_at, a.is_admin, a.approved, a.disabled,
-                      (SELECT COUNT(*) FROM client_devices d WHERE d.user_id=a.id AND d.revoked=0) AS devices
+                      (SELECT COUNT(*) FROM client_devices d WHERE d.user_id=a.id AND d.revoked=0) AS devices,
+                      (SELECT p.avatar FROM user_profiles p WHERE p.user_id=a.id AND p.deleted=0
+                       ORDER BY p.created_at, p.id LIMIT 1) AS avatar
                FROM accounts a ORDER BY a.created_at DESC, a.id"""
         ).fetchall()
     return [

@@ -4513,18 +4513,32 @@ public class MainActivity extends Activity {
                         boolean canAccess = approvalSatisfied && !disabled;
                         String state = isCurrentAccount ? "Sesión actual"
                                 : (disabled ? "Acceso denegado"
-                                : (!approvalSatisfied ? "Pendiente de aprobación" : "Acceso permitido"));
+                                : (!approvalSatisfied ? "Pendiente de aprobación" : ""));
                         LinearLayout card = settingsCard();
                         LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(-1, -2);
                         cardParams.bottomMargin = d(10);
                         screen.addView(card, cardParams);
+                        LinearLayout identity = new LinearLayout(this);
+                        identity.setGravity(Gravity.CENTER_VERTICAL);
+                        card.addView(identity, new LinearLayout.LayoutParams(-1, -2));
+                        FrameLayout accountAvatar = profileAvatarView(
+                                account.optString("avatar", "generic:0"), d(48), username, false);
+                        LinearLayout.LayoutParams accountAvatarParams = new LinearLayout.LayoutParams(d(48), d(48));
+                        accountAvatarParams.rightMargin = d(12);
+                        identity.addView(accountAvatar, accountAvatarParams);
+                        LinearLayout identityDetails = new LinearLayout(this);
+                        identityDetails.setOrientation(LinearLayout.VERTICAL);
+                        identityDetails.setGravity(Gravity.CENTER_VERTICAL);
+                        identity.addView(identityDetails, new LinearLayout.LayoutParams(0, -2, 1));
                         TextView userLabel = label(username + (isAdmin ? "  ·  Admin" : ""), 16, Color.WHITE, true);
-                        card.addView(userLabel);
-                        TextView stateLabel = label(state, 12,
-                                !approvalSatisfied || disabled ? 0xFFFFB1B5 : 0xFF79E3B7, false);
-                        LinearLayout.LayoutParams stateParams = new LinearLayout.LayoutParams(-1, -2);
-                        stateParams.topMargin = d(4);
-                        card.addView(stateLabel, stateParams);
+                        identityDetails.addView(userLabel);
+                        if (!state.isEmpty()) {
+                            TextView stateLabel = label(state, 12,
+                                    !approvalSatisfied || disabled ? 0xFFFFB1B5 : 0xFF79E3B7, false);
+                            LinearLayout.LayoutParams stateParams = new LinearLayout.LayoutParams(-1, -2);
+                            stateParams.topMargin = d(4);
+                            identityDetails.addView(stateLabel, stateParams);
+                        }
 
                         LinearLayout actions = new LinearLayout(this);
                         actions.setGravity(Gravity.CENTER_VERTICAL);
