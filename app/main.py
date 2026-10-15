@@ -31,7 +31,7 @@ MEDIA_ROOTS = {
 }
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/zinema.sqlite3"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
-PROFILE_SYNC_TOKEN = os.getenv("PROFILE_SYNC_TOKEN", "")
+CLIENT_API_TOKEN = os.getenv("CLIENT_API_TOKEN", "")
 TMDB_ACCESS_TOKEN = os.getenv("TMDB_ACCESS_TOKEN", "")
 TMDB_KEY = os.getenv("TMDB_KEY", "") if not TMDB_ACCESS_TOKEN else ""
 TMDB_CONFIGURED = bool(TMDB_ACCESS_TOKEN or TMDB_KEY)
@@ -48,8 +48,12 @@ METADATA_RETRY_COOLDOWN_SECONDS = 60
 METADATA_RETRY_GLOBAL_LAST_REQUEST = 0.0
 METADATA_RETRY_GLOBAL_COOLDOWN_SECONDS = 10
 SCHEDULER_STARTED = False
+PLAYBACK_TICKET_TTL_SECONDS = 8 * 60 * 60
+PLAYBACK_TICKETS: dict[str, tuple[str, float]] = {}
+PLAYBACK_TICKET_LOCK = threading.Lock()
 
-app = FastAPI(title="Zinema Server", version="0.1.0")
+app = FastAPI(title="Zinema Server", version="0.1.0",
+              docs_url=None, redoc_url=None, openapi_url=None)
 
 
 class LibraryItem(BaseModel):
@@ -104,6 +108,11 @@ class UserProfileRequest(BaseModel):
     id: str = Field(min_length=1, max_length=100)
     name: str = Field(min_length=1, max_length=80)
     avatar: str = Field(default="generic:0", max_length=1500)
+
+
+class DevicePairRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    device_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 def database() -> sqlite3.Connection:
@@ -220,6 +229,16 @@ def database() -> sqlite3.Connection:
                updated_at TEXT NOT NULL
            )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS client_devices (
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               token_hash TEXT NOT NULL UNIQUE,
+               created_at TEXT NOT NULL,
+               last_seen_at TEXT,
+               revoked INTEGER NOT NULL DEFAULT 0
+           )"""
+    )
     return connection
 
 
@@ -231,12 +250,28 @@ def require_admin(authorization: Annotated[str | None, Header()] = None) -> None
         raise HTTPException(status_code=401, detail="Invalid bearer token")
 
 
-def require_profile_sync(authorization: Annotated[str | None, Header()] = None) -> None:
-    if not PROFILE_SYNC_TOKEN:
-        raise HTTPException(status_code=503, detail="Profile sync is not configured")
+def require_client_pairing(authorization: Annotated[str | None, Header()] = None) -> None:
+    if not CLIENT_API_TOKEN:
+        raise HTTPException(status_code=503, detail="Client API token is not configured")
     scheme, _, token = (authorization or "").partition(" ")
-    if scheme.lower() != "bearer" or not secrets.compare_digest(token, PROFILE_SYNC_TOKEN):
-        raise HTTPException(status_code=401, detail="Invalid profile sync token")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(token, CLIENT_API_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid device pairing key")
+
+
+def require_client(authorization: Annotated[str | None, Header()] = None) -> None:
+    scheme, _, token = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="Invalid device token")
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with closing(database()) as connection:
+        row = connection.execute(
+            "SELECT id FROM client_devices WHERE token_hash=? AND revoked=0", (token_hash,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=401, detail="Invalid or revoked device token")
+        connection.execute("UPDATE client_devices SET last_seen_at=? WHERE id=?",
+                           (datetime.now(timezone.utc).isoformat(), row["id"]))
+        connection.commit()
 
 
 def display_title(path: Path) -> str:
@@ -702,7 +737,7 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/api/v1/items", response_model=list[LibraryItem])
+@app.get("/api/v1/items", response_model=list[LibraryItem], dependencies=[Depends(require_client)])
 def list_items(
     q: str | None = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
@@ -723,7 +758,7 @@ def list_items(
         return [item_from_row(row, connection) for row in rows]
 
 
-@app.get("/api/v1/items/{item_id}", response_model=LibraryItem)
+@app.get("/api/v1/items/{item_id}", response_model=LibraryItem, dependencies=[Depends(require_client)])
 def get_item(item_id: str) -> LibraryItem:
     with closing(database()) as connection:
         row = connection.execute(
@@ -735,7 +770,7 @@ def get_item(item_id: str) -> LibraryItem:
         return item_from_row(row, connection)
 
 
-@app.get("/api/v1/catalog/version")
+@app.get("/api/v1/catalog/version", dependencies=[Depends(require_client)])
 def get_catalog_version() -> dict[str, str]:
     with closing(database()) as connection:
         nodes = connection.execute(
@@ -759,7 +794,42 @@ def get_catalog_version() -> dict[str, str]:
     return {"version": hashlib.sha256(state.encode("utf-8")).hexdigest()}
 
 
-@app.get("/api/v1/profiles", dependencies=[Depends(require_profile_sync)])
+@app.post("/api/v1/auth/devices", dependencies=[Depends(require_client_pairing)])
+def pair_client_device(request: DevicePairRequest) -> dict[str, str]:
+    device_id = request.device_id or uuid4().hex
+    device_token = secrets.token_urlsafe(40)
+    now = datetime.now(timezone.utc).isoformat()
+    token_hash = hashlib.sha256(device_token.encode("utf-8")).hexdigest()
+    with closing(database()) as connection:
+        connection.execute(
+            """INSERT INTO client_devices(id, name, token_hash, created_at, last_seen_at, revoked)
+               VALUES (?, ?, ?, ?, ?, 0)
+               ON CONFLICT(id) DO UPDATE SET name=excluded.name, token_hash=excluded.token_hash,
+                   created_at=excluded.created_at, last_seen_at=excluded.last_seen_at, revoked=0""",
+            (device_id, request.name.strip(), token_hash, now, now),
+        )
+        connection.commit()
+    return {"device_id": device_id, "token": device_token}
+
+
+@app.get("/api/v1/admin/devices", dependencies=[Depends(require_admin)])
+def list_client_devices() -> list[dict[str, object]]:
+    with closing(database()) as connection:
+        rows = connection.execute(
+            "SELECT id, name, created_at, last_seen_at, revoked FROM client_devices ORDER BY created_at"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.delete("/api/v1/admin/devices/{device_id}", dependencies=[Depends(require_admin)])
+def revoke_client_device(device_id: str) -> dict[str, bool]:
+    with closing(database()) as connection:
+        cursor = connection.execute("UPDATE client_devices SET revoked=1 WHERE id=?", (device_id,))
+        connection.commit()
+    return {"revoked": cursor.rowcount > 0}
+
+
+@app.get("/api/v1/profiles", dependencies=[Depends(require_client)])
 def list_profiles() -> list[dict]:
     with closing(database()) as connection:
         rows = connection.execute(
@@ -773,7 +843,7 @@ def list_profiles() -> list[dict]:
     return result
 
 
-@app.post("/api/v1/profiles", dependencies=[Depends(require_profile_sync)])
+@app.post("/api/v1/profiles", dependencies=[Depends(require_client)])
 def save_profile(profile: UserProfileRequest) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     with closing(database()) as connection:
@@ -792,7 +862,7 @@ def save_profile(profile: UserProfileRequest) -> dict:
     return dict(row)
 
 
-@app.delete("/api/v1/profiles/{profile_id}", dependencies=[Depends(require_profile_sync)])
+@app.delete("/api/v1/profiles/{profile_id}", dependencies=[Depends(require_client)])
 def delete_profile(profile_id: str) -> dict[str, bool]:
     with closing(database()) as connection:
         connection.execute("DELETE FROM profile_state WHERE profile_id=?", (profile_id,))
@@ -804,7 +874,7 @@ def delete_profile(profile_id: str) -> dict[str, bool]:
     return {"deleted": cursor.rowcount > 0}
 
 
-@app.get("/api/v1/profiles/{profile_id}/state", dependencies=[Depends(require_profile_sync)])
+@app.get("/api/v1/profiles/{profile_id}/state", dependencies=[Depends(require_client)])
 def get_profile_state(profile_id: str) -> dict:
     with closing(database()) as connection:
         exists = connection.execute(
@@ -822,7 +892,7 @@ def get_profile_state(profile_id: str) -> dict:
             "revision": row["revision"], "updated_at": row["updated_at"]}
 
 
-@app.put("/api/v1/profiles/{profile_id}/state", dependencies=[Depends(require_profile_sync)])
+@app.put("/api/v1/profiles/{profile_id}/state", dependencies=[Depends(require_client)])
 def save_profile_state(profile_id: str, state: dict[str, object]) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     state_json = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
@@ -846,7 +916,7 @@ def save_profile_state(profile_id: str, state: dict[str, object]) -> dict:
     return {"revision": row["revision"], "updated_at": row["updated_at"]}
 
 
-@app.get("/api/v1/catalog")
+@app.get("/api/v1/catalog", dependencies=[Depends(require_client)])
 def list_catalog(
     library: str = Query(pattern="^(movies|series)$"),
     parent_id: str | None = None,
@@ -875,7 +945,7 @@ def list_catalog(
         return [_node_payload(row, connection) for row in rows]
 
 
-@app.get("/api/v1/genres")
+@app.get("/api/v1/genres", dependencies=[Depends(require_client)])
 def list_genres() -> list[str]:
     with closing(database()) as connection:
         rows = connection.execute(
@@ -891,7 +961,7 @@ def list_genres() -> list[str]:
     return sorted(normalize_genres(genres), key=str.casefold)
 
 
-@app.get("/api/v1/catalog/{node_id}")
+@app.get("/api/v1/catalog/{node_id}", dependencies=[Depends(require_client)])
 def get_catalog_node(node_id: str) -> dict:
     with closing(database()) as connection:
         row = connection.execute(
@@ -902,7 +972,8 @@ def get_catalog_node(node_id: str) -> dict:
         return _node_payload(row, connection)
 
 
-@app.post("/api/v1/catalog/{node_id}/metadata/retry", status_code=202)
+@app.post("/api/v1/catalog/{node_id}/metadata/retry", status_code=202,
+          dependencies=[Depends(require_client)])
 def retry_catalog_metadata(node_id: str) -> dict[str, object]:
     global METADATA_RETRY_GLOBAL_LAST_REQUEST
     if not TMDB_CONFIGURED:
@@ -937,7 +1008,7 @@ def retry_catalog_metadata(node_id: str) -> dict[str, object]:
     }
 
 
-@app.get("/api/v1/catalog/metadata/retry/{job_id}")
+@app.get("/api/v1/catalog/metadata/retry/{job_id}", dependencies=[Depends(require_client)])
 def get_metadata_retry_status(job_id: str) -> SyncJob:
     with closing(database()) as connection:
         row = connection.execute("SELECT * FROM sync_runs WHERE id=?", (job_id,)).fetchone()
@@ -946,7 +1017,7 @@ def get_metadata_retry_status(job_id: str) -> SyncJob:
     return _sync_job_payload(row)
 
 
-@app.post("/api/v1/catalog/{node_id}/metadata/candidates")
+@app.post("/api/v1/catalog/{node_id}/metadata/candidates", dependencies=[Depends(require_client)])
 def catalog_metadata_candidates(node_id: str) -> dict[str, object]:
     if not TMDB_CONFIGURED:
         raise HTTPException(status_code=503, detail="TMDb credentials are not configured")
@@ -986,7 +1057,8 @@ def catalog_metadata_candidates(node_id: str) -> dict[str, object]:
     return {"node_id": node_id, "candidates": candidates}
 
 
-@app.get("/api/v1/catalog/{node_id}/metadata/candidate/{tmdb_id}")
+@app.get("/api/v1/catalog/{node_id}/metadata/candidate/{tmdb_id}",
+         dependencies=[Depends(require_client)])
 def catalog_metadata_candidate(node_id: str, tmdb_id: int) -> dict[str, object]:
     with closing(database()) as connection:
         node = connection.execute(
@@ -1004,7 +1076,7 @@ def catalog_metadata_candidate(node_id: str, tmdb_id: int) -> dict[str, object]:
         raise HTTPException(status_code=502, detail=f"Could not load TMDb candidate: {str(exc)[:300]}") from None
 
 
-@app.get("/api/v1/catalog/{node_id}/metadata/images")
+@app.get("/api/v1/catalog/{node_id}/metadata/images", dependencies=[Depends(require_client)])
 def catalog_metadata_images(node_id: str, q: str | None = None,
                             tmdb_id: int | None = Query(default=None, gt=0)) -> dict[str, object]:
     if not TMDB_CONFIGURED:
@@ -1037,7 +1109,7 @@ def catalog_metadata_images(node_id: str, q: str | None = None,
     return {"images": images[:10]}
 
 
-@app.post("/api/v1/catalog/{node_id}/metadata/manual")
+@app.post("/api/v1/catalog/{node_id}/metadata/manual", dependencies=[Depends(require_client)])
 def save_manual_metadata(node_id: str, request: ManualMetadataRequest) -> dict[str, object]:
     with closing(database()) as connection:
         node = connection.execute(
@@ -1085,7 +1157,7 @@ def save_manual_metadata(node_id: str, request: ManualMetadataRequest) -> dict[s
         return _node_payload(updated, connection)
 
 
-@app.get("/api/v1/catalog/{node_id}/images/{image_type}")
+@app.get("/api/v1/catalog/{node_id}/images/{image_type}", dependencies=[Depends(require_client)])
 def get_catalog_image(node_id: str, image_type: str):
     if image_type not in {"poster", "backdrop"}:
         raise HTTPException(status_code=404, detail="Image type not found")
@@ -1185,8 +1257,40 @@ def metadata_review_queue() -> list[dict[str, object]]:
     ]
 
 
-@app.get("/api/v1/items/{item_id}/stream")
+@app.post("/api/v1/items/{item_id}/playback-ticket", dependencies=[Depends(require_client)])
+def create_playback_ticket(item_id: str) -> dict[str, object]:
+    get_media_file(item_id)
+    now = time.time()
+    ticket = secrets.token_urlsafe(32)
+    with PLAYBACK_TICKET_LOCK:
+        expired = [key for key, (_, expiry) in PLAYBACK_TICKETS.items() if expiry <= now]
+        for key in expired:
+            PLAYBACK_TICKETS.pop(key, None)
+        PLAYBACK_TICKETS[ticket] = (item_id, now + PLAYBACK_TICKET_TTL_SECONDS)
+    return {
+        "url": f"/api/v1/playback/{ticket}",
+        "expires_in": PLAYBACK_TICKET_TTL_SECONDS,
+    }
+
+
+@app.get("/api/v1/playback/{ticket}")
+def stream_with_playback_ticket(ticket: str, request: Request):
+    now = time.time()
+    with PLAYBACK_TICKET_LOCK:
+        grant = PLAYBACK_TICKETS.get(ticket)
+        if grant is None or grant[1] <= now:
+            PLAYBACK_TICKETS.pop(ticket, None)
+            raise HTTPException(status_code=401, detail="Playback ticket expired or invalid")
+        item_id = grant[0]
+    return _stream_item(item_id, request)
+
+
+@app.get("/api/v1/items/{item_id}/stream", dependencies=[Depends(require_client)])
 def stream_item(item_id: str, request: Request):
+    return _stream_item(item_id, request)
+
+
+def _stream_item(item_id: str, request: Request):
     path, row = get_media_file(item_id)
     file_size = path.stat().st_size
     range_header = request.headers.get("range")

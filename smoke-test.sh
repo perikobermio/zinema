@@ -18,7 +18,16 @@ printf '\nArrancando Zinema (la primera vez puede tardar mientras se construye).
 docker compose up --build -d
 
 tmp_dir=$(mktemp -d)
-trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+device_id=
+cleanup() {
+    if [ -n "$device_id" ] && [ -n "${ADMIN_TOKEN:-}" ]; then
+        curl --silent --output /dev/null --request DELETE \
+            --header "Authorization: Bearer $ADMIN_TOKEN" \
+            "$API_BASE_URL/api/v1/admin/devices/$device_id" || true
+    fi
+    rm -rf "$tmp_dir"
+}
+trap cleanup EXIT HUP INT TERM
 
 ready=0
 attempt=0
@@ -47,10 +56,19 @@ scan_response=$(printf 'Authorization: Bearer %s\n' "$ADMIN_TOKEN" | \
     curl --silent --show-error --fail-with-body --max-time 0 \
     --request POST --header @- "$API_BASE_URL/api/v1/admin/scan") || \
     fail "Falló el escaneo. Revisa las rutas y los logs de Docker."
-unset ADMIN_TOKEN
 printf 'OK: respuesta del escaneo: %s\n' "$scan_response"
 
+pair_response=$(curl --silent --show-error --fail-with-body \
+    --request POST --header "Authorization: Bearer $CLIENT_API_TOKEN" \
+    --header 'Content-Type: application/json' \
+    --data '{"name":"zinema-smoke-test"}' \
+    "$API_BASE_URL/api/v1/auth/devices") || fail "No se pudo vincular el dispositivo temporal de comprobación."
+device_id=$(printf '%s\n' "$pair_response" | sed -n 's/.*"device_id":"\([^"]*\)".*/\1/p')
+device_token=$(printf '%s\n' "$pair_response" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+[ -n "$device_id" ] && [ -n "$device_token" ] || fail "La API no devolvió credenciales de dispositivo."
+
 items_response=$(curl --silent --show-error --fail \
+    --header "Authorization: Bearer $device_token" \
     "$API_BASE_URL/api/v1/items?limit=1") || fail "No se pudo consultar el catálogo."
 printf 'OK: consulta del catálogo: %s\n' "$items_response"
 
@@ -60,10 +78,16 @@ if [ -z "$item_id" ]; then
     exit 0
 fi
 
+ticket_response=$(curl --silent --show-error --fail-with-body \
+    --request POST --header "Authorization: Bearer $device_token" \
+    "$API_BASE_URL/api/v1/items/$item_id/playback-ticket") || fail "No se pudo emitir el acceso temporal de streaming."
+ticket_path=$(printf '%s\n' "$ticket_response" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')
+[ -n "$ticket_path" ] || fail "La API no devolvió la URL temporal de streaming."
+
 status=$(curl --silent --show-error --output /dev/null \
     --dump-header "$tmp_dir/stream-headers" --write-out '%{http_code}' \
     --header 'Range: bytes=0-0' \
-    "$API_BASE_URL/api/v1/items/$item_id/stream") || fail "Falló la petición de streaming."
+    "$API_BASE_URL$ticket_path") || fail "Falló la petición de streaming."
 if [ "$status" = "206" ] && grep -Eiq '^Content-Range: bytes 0-0/[1-9][0-9]*' "$tmp_dir/stream-headers"; then
     printf 'OK: streaming acepta rangos de bytes (HTTP 206).\n'
 elif [ "$status" = "416" ] && grep -Eiq '^Content-Range: bytes \*/0' "$tmp_dir/stream-headers"; then

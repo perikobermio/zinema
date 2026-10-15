@@ -10,10 +10,13 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.text.method.PasswordTransformationMethod;
 import android.util.LruCache;
+import android.util.Base64;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -49,6 +52,7 @@ import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.KeyStore;
 import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -60,6 +64,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.UUID;
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -70,6 +78,7 @@ public class MainActivity extends Activity {
     static final int RED = Color.rgb(229, 9, 20);
     static final String PREFS = "zinema_client";
     static final String DEFAULT_SERVER = "https://zinema.ebu.freemyip.com";
+    static final String CLIENT_TOKEN_ALIAS = "zinema_client_device_token";
     static final long CATALOG_CACHE_TTL_MS = 30000L;
     static final long IMAGE_DISK_CACHE_MAX_BYTES = 160L * 1024L * 1024L;
     final ExecutorService io = Executors.newFixedThreadPool(4);
@@ -151,6 +160,7 @@ public class MainActivity extends Activity {
         getWindow().setNavigationBarColor(BG);
         hideSystemBars();
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        prefs.edit().remove("profile_sync_token").apply();
         server = trimBase(prefs.getString("server", DEFAULT_SERVER));
         serverName = prefs.getString("server_name", "Zinema NAS");
         startStartupPrefetch();
@@ -228,7 +238,7 @@ public class MainActivity extends Activity {
                 items = getArray("/api/v1/items?limit=500");
                 try { version = getJson("/api/v1/catalog/version").optString("version", ""); }
                 catch (Exception ignored) { }
-                if (!profileSyncToken().isEmpty()) {
+                if (!clientApiToken().isEmpty()) {
                     try {
                         remoteProfiles = getAuthorizedProfileArray("/api/v1/profiles");
                         remoteStateProfileId = prefs.getString("active_profile", "");
@@ -389,7 +399,7 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams profileParams = new LinearLayout.LayoutParams(-2, d(42));
         profileParams.leftMargin = d(10);
         bar.addView(profileButton, profileParams);
-        if (showingAdmin || showingProfiles) {
+        if (showingAdmin) {
             searchButton.setVisibility(View.GONE);
             profileButton.setVisibility(View.GONE);
         }
@@ -511,11 +521,14 @@ public class MainActivity extends Activity {
     }
 
     JSONObject getJson(String path) throws Exception {
+        String token = clientApiToken();
+        if (token.isEmpty()) throw new Exception("Configura la clave de acceso a la API en Administración.");
         HttpURLConnection connection = (HttpURLConnection) new URL(server + path).openConnection();
         connection.setRequestMethod("GET");
         connection.setConnectTimeout(12000);
         connection.setReadTimeout(20000);
         connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("Authorization", "Bearer " + token);
         int status = connection.getResponseCode();
         InputStream input = status < 400 ? connection.getInputStream() : connection.getErrorStream();
         String body = readText(input);
@@ -525,11 +538,14 @@ public class MainActivity extends Activity {
     }
 
     JSONArray getArray(String path) throws Exception {
+        String token = clientApiToken();
+        if (token.isEmpty()) throw new Exception("Configura la clave de acceso a la API en Administración.");
         HttpURLConnection connection = (HttpURLConnection) new URL(server + path).openConnection();
         connection.setRequestMethod("GET");
         connection.setConnectTimeout(12000);
         connection.setReadTimeout(20000);
         connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("Authorization", "Bearer " + token);
         int status = connection.getResponseCode();
         InputStream input = status < 400 ? connection.getInputStream() : connection.getErrorStream();
         String body = readText(input);
@@ -538,13 +554,51 @@ public class MainActivity extends Activity {
         return new JSONArray(body);
     }
 
-    String profileSyncToken() {
-        return prefs == null ? "" : prefs.getString("profile_sync_token", "").trim();
+    String clientApiToken() {
+        if (prefs == null) return "";
+        String encrypted = prefs.getString("client_api_token_enc", "");
+        if (encrypted.isEmpty()) return "";
+        try {
+            byte[] data = Base64.decode(encrypted, Base64.NO_WRAP);
+            byte[] iv = java.util.Arrays.copyOfRange(data, 0, 12);
+            byte[] ciphertext = java.util.Arrays.copyOfRange(data, 12, data.length);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, clientTokenKey(), new GCMParameterSpec(128, iv));
+            return new String(cipher.doFinal(ciphertext), StandardCharsets.UTF_8).trim();
+        } catch (Exception ignored) { return ""; }
+    }
+
+    void storeClientApiToken(String token) throws Exception {
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.ENCRYPT_MODE, clientTokenKey());
+        byte[] iv = cipher.getIV();
+        byte[] ciphertext = cipher.doFinal(token.getBytes(StandardCharsets.UTF_8));
+        byte[] encrypted = new byte[iv.length + ciphertext.length];
+        System.arraycopy(iv, 0, encrypted, 0, iv.length);
+        System.arraycopy(ciphertext, 0, encrypted, iv.length, ciphertext.length);
+        prefs.edit().putString("client_api_token_enc", Base64.encodeToString(encrypted, Base64.NO_WRAP))
+                .remove("client_api_token").apply();
+    }
+
+    SecretKey clientTokenKey() throws Exception {
+        KeyStore keyStore = KeyStore.getInstance("AndroidKeyStore");
+        keyStore.load(null);
+        if (keyStore.containsAlias(CLIENT_TOKEN_ALIAS)) {
+            return (SecretKey) keyStore.getKey(CLIENT_TOKEN_ALIAS, null);
+        }
+        KeyGenerator generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore");
+        generator.init(new KeyGenParameterSpec.Builder(CLIENT_TOKEN_ALIAS,
+                KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setRandomizedEncryptionRequired(true)
+                .build());
+        return generator.generateKey();
     }
 
     String authorizedProfileRequest(String method, String path, JSONObject payload) throws Exception {
-        String token = profileSyncToken();
-        if (token.isEmpty()) throw new Exception("Configura la clave de sincronización de perfiles en Administración.");
+        String token = clientApiToken();
+        if (token.isEmpty()) throw new Exception("Vincula este dispositivo desde Administración.");
         HttpURLConnection connection = (HttpURLConnection) new URL(server + path).openConnection();
         connection.setRequestMethod(method);
         connection.setConnectTimeout(12000);
@@ -785,7 +839,7 @@ public class MainActivity extends Activity {
     }
 
     void uploadProfileToServer(JSONObject profile) {
-        if (profileSyncToken().isEmpty()) return;
+        if (clientApiToken().isEmpty()) return;
         JSONObject payload = profilePayload(profile);
         io.execute(() -> {
             try {
@@ -805,7 +859,7 @@ public class MainActivity extends Activity {
     }
 
     void deleteProfileFromServer(String profileId) {
-        if (profileSyncToken().isEmpty()) return;
+        if (clientApiToken().isEmpty()) return;
         io.execute(() -> {
             try {
                 authorizedProfileRequest("DELETE", "/api/v1/profiles/" + enc(profileId), null);
@@ -816,7 +870,7 @@ public class MainActivity extends Activity {
     }
 
     void uploadProfileState(String profileId) {
-        if (profileSyncToken().isEmpty()) return;
+        if (clientApiToken().isEmpty()) return;
         JSONObject state = collectProfileState(profileId);
         JSONObject payload = new JSONObject();
         try {
@@ -839,7 +893,7 @@ public class MainActivity extends Activity {
         String id = activeProfileId();
         if (id.isEmpty()) return;
         prefs.edit().putBoolean(profileStateDirtyKey(id), true).apply();
-        if (profileSyncToken().isEmpty()) return;
+        if (clientApiToken().isEmpty()) return;
         if (profileStateSyncRunning) {
             profileStateSyncPending = true;
             return;
@@ -874,7 +928,7 @@ public class MainActivity extends Activity {
     }
 
     void synchronizeProfilesFromServer(boolean notifyError) {
-        String token = profileSyncToken();
+        String token = clientApiToken();
         long now = System.currentTimeMillis();
         if (token.isEmpty() || profileSyncRunning || now - lastProfileSyncMs < 60000L) return;
         profileSyncRunning = true;
@@ -1713,6 +1767,9 @@ public class MainActivity extends Activity {
         connection.setConnectTimeout(10000);
         connection.setReadTimeout(15000);
         connection.setInstanceFollowRedirects(true);
+        if (url.startsWith(server + "/") && !clientApiToken().isEmpty()) {
+            connection.setRequestProperty("Authorization", "Bearer " + clientApiToken());
+        }
         try {
             InputStream input = connection.getInputStream();
             ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -2106,12 +2163,15 @@ public class MainActivity extends Activity {
     }
 
     JSONObject postJson(String path) throws Exception {
+        String token = clientApiToken();
+        if (token.isEmpty()) throw new Exception("Configura la clave de acceso a la API en Administración.");
         HttpURLConnection connection = (HttpURLConnection) new URL(server + path).openConnection();
         connection.setRequestMethod("POST");
         connection.setConnectTimeout(12000);
         connection.setReadTimeout(20000);
         connection.setDoOutput(true);
         connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("Authorization", "Bearer " + token);
         connection.getOutputStream().close();
         int status = connection.getResponseCode();
         InputStream input = status < 400 ? connection.getInputStream() : connection.getErrorStream();
@@ -2127,12 +2187,15 @@ public class MainActivity extends Activity {
     }
 
     JSONObject postJson(String path, JSONObject payload) throws Exception {
+        String token = clientApiToken();
+        if (token.isEmpty()) throw new Exception("Configura la clave de acceso a la API en Administración.");
         HttpURLConnection connection = (HttpURLConnection) new URL(server + path).openConnection();
         connection.setRequestMethod("POST");
         connection.setConnectTimeout(12000);
         connection.setReadTimeout(45000);
         connection.setDoOutput(true);
         connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("Authorization", "Bearer " + token);
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
         connection.getOutputStream().write(payload.toString().getBytes(StandardCharsets.UTF_8));
         int status = connection.getResponseCode();
@@ -3046,9 +3109,12 @@ public class MainActivity extends Activity {
             case "Cada perfil conserva su lista y su progreso de reproducción.":
                 return "Profil bakoitzak bere zerrenda eta erreprodukzio-aurrerapena gordetzen ditu.";
             case "Perfil actual": return "Uneko profila";
-            case "Clave de sincronización de perfiles": return "Profilak sinkronizatzeko gakoa";
-            case "Usa el mismo valor configurado como PROFILE_SYNC_TOKEN en el NAS.":
-                return "Erabili NASeko PROFILE_SYNC_TOKEN gisa ezarritako balio bera.";
+            case "Vincular este dispositivo": return "Gailu hau lotu";
+            case "Introduce la clave del NAS; se guardará una credencial exclusiva para este dispositivo.":
+                return "Sartu NASeko gakoa; gailu honetarako kredentzial esklusibo bat gordeko da.";
+            case "Introduce la clave de vinculación del NAS para este dispositivo.":
+                return "Sartu NASeko lotura-gakoa gailu honetarako.";
+            case "Vinculando este dispositivo…": return "Gailu hau lotzen…";
             case "Usar": return "Erabili";
             case "Editar perfil": return "Profila editatu";
             case "Añadir perfil": return "Gehitu profila";
@@ -3507,6 +3573,10 @@ public class MainActivity extends Activity {
     }
 
     void renderAdminWindow(String initialName, String initialServer) {
+        renderAdminWindow(initialName, initialServer, "");
+    }
+
+    void renderAdminWindow(String initialName, String initialServer, String initialPairingKey) {
         content.removeAllViews();
         LinearLayout screen = new LinearLayout(this);
         screen.setOrientation(LinearLayout.VERTICAL);
@@ -3529,18 +3599,19 @@ public class MainActivity extends Activity {
         serverCard.addView(urlLabel, urlP);
         EditText urlInput = settingsField(initialServer, "https://servidor", true);
         addSettingInput(serverCard, urlInput);
-        TextView syncLabel = label(t("Clave de sincronización de perfiles"), 13, MUTED, true);
-        LinearLayout.LayoutParams syncLabelParams = new LinearLayout.LayoutParams(-1, -2);
-        syncLabelParams.topMargin = d(16);
-        serverCard.addView(syncLabel, syncLabelParams);
-        EditText syncTokenInput = settingsField(prefs.getString("profile_sync_token", ""),
-                "PROFILE_SYNC_TOKEN", false);
-        syncTokenInput.setTransformationMethod(PasswordTransformationMethod.getInstance());
-        addSettingInput(serverCard, syncTokenInput);
-        TextView syncHint = label(t("Usa el mismo valor configurado como PROFILE_SYNC_TOKEN en el NAS."), 12, MUTED, false);
-        LinearLayout.LayoutParams syncHintParams = new LinearLayout.LayoutParams(-1, -2);
-        syncHintParams.topMargin = d(6);
-        serverCard.addView(syncHint, syncHintParams);
+        TextView apiTokenLabel = label(t("Vincular este dispositivo"), 13, MUTED, true);
+        LinearLayout.LayoutParams apiTokenLabelParams = new LinearLayout.LayoutParams(-1, -2);
+        apiTokenLabelParams.topMargin = d(16);
+        serverCard.addView(apiTokenLabel, apiTokenLabelParams);
+        EditText pairingKeyInput = settingsField(initialPairingKey,
+                "CLIENT_API_TOKEN", false);
+        pairingKeyInput.setTransformationMethod(PasswordTransformationMethod.getInstance());
+        addSettingInput(serverCard, pairingKeyInput);
+        TextView apiTokenHint = label(t("Introduce la clave del NAS; se guardará una credencial exclusiva para este dispositivo."),
+                12, MUTED, false);
+        LinearLayout.LayoutParams apiTokenHintParams = new LinearLayout.LayoutParams(-1, -2);
+        apiTokenHintParams.topMargin = d(6);
+        serverCard.addView(apiTokenHint, apiTokenHintParams);
         LinearLayout connectButtons = new LinearLayout(this);
         connectButtons.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams buttonsP = new LinearLayout.LayoutParams(-1, -2);
@@ -3574,8 +3645,8 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams basqueP = new LinearLayout.LayoutParams(0, d(46), 1);
         basqueP.leftMargin = d(9);
         languageButtons.addView(basque, basqueP);
-        spanish.setOnClickListener(v -> changeLanguage("es", nameInput, urlInput, syncTokenInput));
-        basque.setOnClickListener(v -> changeLanguage("eu", nameInput, urlInput, syncTokenInput));
+        spanish.setOnClickListener(v -> changeLanguage("es", nameInput, urlInput, pairingKeyInput));
+        basque.setOnClickListener(v -> changeLanguage("eu", nameInput, urlInput, pairingKeyInput));
 
         TextView attribution = label("This product uses the TMDB API but is not endorsed or certified by TMDB.",
                 11, MUTED, false);
@@ -3615,6 +3686,12 @@ public class MainActivity extends Activity {
             if (value.isEmpty()) { Toast.makeText(this, t("Escribe una URL válida."), Toast.LENGTH_LONG).show(); return; }
             if (name.isEmpty()) { Toast.makeText(this, t("El nombre del servidor no puede estar vacío."), Toast.LENGTH_LONG).show(); return; }
             boolean serverChanged = !server.equals(value);
+            String pairingKey = pairingKeyInput.getText().toString().trim();
+            if (pairingKey.isEmpty() && (clientApiToken().isEmpty() || serverChanged)) {
+                Toast.makeText(this, t("Introduce la clave de vinculación del NAS para este dispositivo."),
+                        Toast.LENGTH_LONG).show();
+                return;
+            }
             server = value;
             serverName = name;
             if (serverChanged) {
@@ -3625,13 +3702,70 @@ public class MainActivity extends Activity {
                 lastCatalogVersionCheckMs = 0L;
             }
             prefs.edit().putString("server", server).putString("server_name", serverName).apply();
-            prefs.edit().putString("profile_sync_token", syncTokenInput.getText().toString().trim()).apply();
             imageCache.evictAll();
             requestedImages.clear();
-            showingAdmin = false;
-            lastProfileSyncMs = 0L;
-            loadHome();
-            synchronizeProfilesFromServer(true);
+            if (!pairingKey.isEmpty()) {
+                String currentDeviceId = serverChanged ? "" : prefs.getString("client_device_id", "");
+                pairClientDevice(pairingKey, currentDeviceId);
+            } else {
+                showingAdmin = false;
+                lastProfileSyncMs = 0L;
+                loadHome();
+                synchronizeProfilesFromServer(true);
+            }
+        });
+    }
+
+    void pairClientDevice(String pairingKey, String currentDeviceId) {
+        Toast.makeText(this, t("Vinculando este dispositivo…"), Toast.LENGTH_SHORT).show();
+        io.execute(() -> {
+            HttpURLConnection connection = null;
+            try {
+                JSONObject payload = new JSONObject();
+                String deviceName = (android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL).trim();
+                payload.put("name", deviceName.isEmpty() ? "Android" : deviceName);
+                if (currentDeviceId != null && !currentDeviceId.isEmpty()) {
+                    payload.put("device_id", currentDeviceId);
+                }
+                connection = (HttpURLConnection) new URL(server + "/api/v1/auth/devices").openConnection();
+                connection.setRequestMethod("POST");
+                connection.setConnectTimeout(12000);
+                connection.setReadTimeout(20000);
+                connection.setDoOutput(true);
+                connection.setRequestProperty("Accept", "application/json");
+                connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+                connection.setRequestProperty("Authorization", "Bearer " + pairingKey);
+                connection.getOutputStream().write(payload.toString().getBytes(StandardCharsets.UTF_8));
+                int status = connection.getResponseCode();
+                InputStream input = status < 400 ? connection.getInputStream() : connection.getErrorStream();
+                String body = readText(input);
+                if (status < 200 || status >= 300) {
+                    String detail = body;
+                    try { detail = new JSONObject(body).optString("detail", body); }
+                    catch (JSONException ignored) { }
+                    throw new Exception("HTTP " + status + (detail.isEmpty() ? "" : ": " + detail));
+                }
+                JSONObject result = new JSONObject(body);
+                String deviceToken = result.optString("token", "");
+                String deviceId = result.optString("device_id", "");
+                if (deviceToken.isEmpty() || deviceId.isEmpty()) {
+                    throw new Exception("El servidor no devolvió las credenciales del dispositivo.");
+                }
+                storeClientApiToken(deviceToken);
+                prefs.edit().putString("client_device_id", deviceId).remove("profile_sync_token").apply();
+                runOnUiThread(() -> {
+                    showingAdmin = false;
+                    lastProfileSyncMs = 0L;
+                    loadHome();
+                    synchronizeProfilesFromServer(true);
+                });
+            } catch (Exception e) {
+                String message = e.getMessage();
+                runOnUiThread(() -> Toast.makeText(this,
+                        "No se pudo vincular el dispositivo: " + message, Toast.LENGTH_LONG).show());
+            } finally {
+                if (connection != null) connection.disconnect();
+            }
         });
     }
 
@@ -3655,13 +3789,13 @@ public class MainActivity extends Activity {
         return value.length() >= 10 ? value : "";
     }
 
-    void changeLanguage(String language, EditText nameInput, EditText urlInput, EditText syncTokenInput) {
+    void changeLanguage(String language, EditText nameInput, EditText urlInput,
+                        EditText pairingKeyInput) {
         String name = nameInput.getText().toString();
         String address = urlInput.getText().toString();
-        String syncToken = syncTokenInput.getText().toString();
+        String pairingKey = pairingKeyInput.getText().toString();
         prefs.edit().putString("language", language).apply();
-        prefs.edit().putString("profile_sync_token", syncToken).apply();
-        renderAdminWindow(name, address);
+        renderAdminWindow(name, address, pairingKey);
     }
 
     void renderError(String error) {
@@ -3818,11 +3952,45 @@ public class MainActivity extends Activity {
     void launchPlayer(String path, String title, String posterUrl,
                       String ownerNodeId, String mediaId, String ownerKind) {
         if (path == null || path.isEmpty()) return;
-        String url = path.startsWith("http") ? path : server + (path.startsWith("/") ? path : "/" + path);
+        String itemId = mediaId == null ? "" : mediaId;
+        if (itemId.isEmpty()) {
+            String relative = path.startsWith(server) ? path.substring(server.length()) : path;
+            String prefix = "/api/v1/items/";
+            String suffix = "/stream";
+            if (relative.startsWith(prefix) && relative.endsWith(suffix)) {
+                itemId = relative.substring(prefix.length(), relative.length() - suffix.length());
+            }
+        }
+        if (itemId.isEmpty()) {
+            Toast.makeText(this, "No se pudo identificar el vídeo para reproducirlo.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        final String resolvedItemId = itemId;
         String key = watchKey(path);
         long position = 0L;
         try { position = new JSONObject(prefs.getString(key, "{}")).optLong("position"); }
         catch (JSONException ignored) { }
+        final long resumePosition = position;
+        Toast.makeText(this, "Preparando reproducción…", Toast.LENGTH_SHORT).show();
+        io.execute(() -> {
+            try {
+                JSONObject ticket = postJson("/api/v1/items/" + enc(resolvedItemId) + "/playback-ticket");
+                String ticketPath = ticket.optString("url", "");
+                if (ticketPath.isEmpty()) throw new Exception("El servidor no devolvió el acceso temporal al vídeo.");
+                String url = ticketPath.startsWith("http") ? ticketPath
+                        : server + (ticketPath.startsWith("/") ? ticketPath : "/" + ticketPath);
+                runOnUiThread(() -> startPlayerActivity(url, path, title, posterUrl, ownerNodeId,
+                        resolvedItemId, ownerKind, key, resumePosition));
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(this,
+                        "No se pudo preparar el vídeo: " + e.getMessage(), Toast.LENGTH_LONG).show());
+            }
+        });
+    }
+
+    void startPlayerActivity(String url, String path, String title, String posterUrl,
+                             String ownerNodeId, String mediaId, String ownerKind,
+                             String key, long position) {
         Intent intent = new Intent(this, PlayerActivity.class);
         intent.putExtra("url", url);
         intent.putExtra("path", path);

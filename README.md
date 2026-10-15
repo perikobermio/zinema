@@ -33,7 +33,7 @@ Requisitos: Docker Engine con Docker Compose v2, `curl` y acceso de lectura del 
    nano .env
    ```
 
-2. Configura `MOVIES_PATH`, `SERIES_PATH`, un `ADMIN_TOKEN` y un `PROFILE_SYNC_TOKEN` propios. El token de perfiles debe ser el mismo en todos los clientes y se introduce en Administración → sincronización de perfiles. Para TMDb puedes guardar la **API Key v3** en `TMDB_KEY` o el **API Read Access Token** en `TMDB_ACCESS_TOKEN`; basta con configurar uno. No pongas estas credenciales en el cliente ni las subas a Git. `TMDB_LANGUAGE` controla el idioma preferido de los resultados; por defecto es `es-ES`.
+2. Configura `MOVIES_PATH`, `SERIES_PATH`, un `ADMIN_TOKEN` y un `CLIENT_API_TOKEN` aleatorios. `CLIENT_API_TOKEN` solo se usa para vincular un dispositivo desde Administración; el servidor entrega después una credencial revocable exclusiva para ese dispositivo. Para TMDb puedes guardar la **API Key v3** en `TMDB_KEY` o el **API Read Access Token** en `TMDB_ACCESS_TOKEN`; basta con configurar uno. No subas estas credenciales a Git. `TMDB_LANGUAGE` controla el idioma preferido de los resultados; por defecto es `es-ES`.
 
 3. Valida las rutas y arranca el servidor:
 
@@ -92,30 +92,54 @@ Tras una sincronización inicial completada, el servidor vuelve a escanear diari
 
 ## API para el cliente
 
+Las rutas del catálogo requieren el token de un dispositivo vinculado. Las rutas `/api/v1/admin` requieren `ADMIN_TOKEN`; `/health` permanece pública para comprobar conectividad.
+
+En Administración del cliente, introduce una vez el `CLIENT_API_TOKEN` del NAS en **Vincular este dispositivo**. El servidor entrega una credencial independiente para esa instalación y no vuelve a guardar la clave de vinculación en el teléfono. Los perfiles, catálogo, imágenes y operaciones de metadata usan esa credencial.
+
+La vinculación también puede hacerse por API. La respuesta contiene el token individual del dispositivo; guárdalo en un gestor seguro y no lo publiques:
+
+```sh
+curl -X POST 'http://localhost:8180/api/v1/auth/devices' \
+  -H "Authorization: Bearer $CLIENT_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Cliente Android"}'
+```
+
 El catálogo se navega por nivel, usando `parent_id` para abrir una colección, serie o temporada:
 
 ```sh
-curl 'http://localhost:8180/api/v1/catalog?library=movies'
-curl 'http://localhost:8180/api/v1/catalog?library=series'
-curl 'http://localhost:8180/api/v1/catalog?library=series&parent_id=ID_DEL_NODO'
-curl 'http://localhost:8180/api/v1/catalog/ID_DEL_NODO'
+set -a; . ./.env; set +a
+curl 'http://localhost:8180/api/v1/catalog?library=movies' -H "Authorization: Bearer $DEVICE_TOKEN"
+curl 'http://localhost:8180/api/v1/catalog?library=series' -H "Authorization: Bearer $DEVICE_TOKEN"
+curl 'http://localhost:8180/api/v1/catalog?library=series&parent_id=ID_DEL_NODO' -H "Authorization: Bearer $DEVICE_TOKEN"
+curl 'http://localhost:8180/api/v1/catalog/ID_DEL_NODO' -H "Authorization: Bearer $DEVICE_TOKEN"
 ```
+
+`DEVICE_TOKEN` es la credencial emitida al vincular la app; no es `CLIENT_API_TOKEN` ni `ADMIN_TOKEN`.
 
 Al reintentar metadata desde el cliente, `POST /api/v1/catalog/ID_DEL_NODO/metadata/candidates` busca coincidencias TMDb para validarlas antes de guardarlas. `GET /api/v1/catalog/ID_DEL_NODO/metadata/candidate/ID_TMDB` carga sus datos completos. La edición manual se guarda con `POST /api/v1/catalog/ID_DEL_NODO/metadata/manual`. Para buscar imágenes se usa `GET /api/v1/catalog/ID_DEL_NODO/metadata/images?q=TITULO`; devuelve hasta diez imágenes TMDb.
 
-Las ediciones manuales permanecen guardadas y no las reemplaza la sincronización diaria. Se pueden volver a solicitar coincidencias después de un minuto por elemento.
+Las rutas de reintento, búsqueda y edición de metadata también requieren `Authorization: Bearer $DEVICE_TOKEN`. Las ediciones manuales permanecen guardadas y no las reemplaza la sincronización diaria. Se pueden volver a solicitar coincidencias después de un minuto por elemento.
 
 Al asociar una serie con TMDb, el servidor consulta también los episodios para guardar sus títulos. Si TMDb no tiene un título para el episodio, el cliente muestra el nombre del archivo. En temporadas intenta usar el póster de temporada, una imagen del primer episodio y, como último recurso, el póster de la serie.
 
 Los nodos y archivos heredan los géneros y el póster de la colección ancestro más cercana cuando no tienen esos datos propios. Un póster o género asignado al nodo prevalece sobre el heredado. `GET /api/v1/genres` devuelve la lista sin duplicados de los géneros que ya aparecen en el catálogo; al importar metadata nueva, sus géneros pasan a estar disponibles automáticamente.
 
-Cada nodo incluye `kind`, `display_title`, `overview`, `year`, `genres`, `poster_url`, `backdrop_url`, `children`, `files` y `mosaic_images`. Los archivos reproducibles conservan sus IDs y URL de streaming:
+Cada nodo incluye `kind`, `display_title`, `overview`, `year`, `genres`, `poster_url`, `backdrop_url`, `children`, `files` y `mosaic_images`. Para reproducir, el cliente solicita un permiso temporal por vídeo; VLC usa la URL resultante durante ocho horas. La ruta directa requiere `DEVICE_TOKEN`:
 
 ```text
 /api/v1/items/ID_DEL_ARCHIVO/stream
 ```
 
-`/api/v1/items` sigue disponible como lista plana. `/health` permite comprobar que el servidor responde.
+`/api/v1/items` sigue disponible como lista plana y también requiere `DEVICE_TOKEN`. Evita guardar rutas `/api/v1/playback/...` en logs de acceso del reverse proxy, porque contienen permisos temporales de reproducción.
+
+Para consultar o revocar dispositivos vinculados, usa `ADMIN_TOKEN`:
+
+```sh
+curl http://localhost:8180/api/v1/admin/devices -H "Authorization: Bearer $ADMIN_TOKEN"
+curl -X DELETE http://localhost:8180/api/v1/admin/devices/ID_DEL_DISPOSITIVO \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
 
 ## Cliente Android
 
@@ -131,7 +155,7 @@ El archivo queda en `client/build/outputs/apk/debug/zinema-client-debug.apk`. El
 
 TMDb proporciona metadata e imágenes para este proyecto. La aplicación debe mostrar la atribución requerida por TMDb: **“This product uses the TMDB API but is not endorsed or certified by TMDB.”** Si el uso pasa a ser comercial, revisa las condiciones y licencia con TMDb. Zinema conserva los IDs de IMDb que TMDb devuelva, pero no consulta ni extrae datos directamente de IMDb.
 
-Las rutas de catálogo, metadata e imágenes no requieren autenticación. Las rutas bajo `/api/v1/admin` requieren `ADMIN_TOKEN`; las rutas `/api/v1/profiles` requieren `PROFILE_SYNC_TOKEN` y sincronizan perfiles, avatares y su estado local entre dispositivos. Mantén el servicio dentro de una red privada o protégelo detrás de una VPN/autenticación antes de hacerlo accesible desde Internet.
+Todas las rutas `/api/v1` requieren credenciales salvo `/health`: el cliente usa un token individual revocable, la vinculación requiere `CLIENT_API_TOKEN` y las operaciones administrativas requieren `ADMIN_TOKEN`. Las rutas de perfiles también usan la credencial del dispositivo. Mantén HTTPS y, si es posible, limita además el acceso a través de una VPN. Las URLs temporales de reproducción deben excluirse de los logs del proxy.
 
 ## Comprobaciones
 
