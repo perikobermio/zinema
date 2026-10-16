@@ -77,6 +77,8 @@ class LibraryItem(BaseModel):
     overview: str | None = None
     year: int | None = None
     genres: list[str] = Field(default_factory=list)
+    age_limit: int | None = None
+    age_rating: str | None = None
     poster_url: str | None = None
 
 
@@ -111,6 +113,7 @@ class UserProfileRequest(BaseModel):
     id: str = Field(min_length=1, max_length=100)
     name: str = Field(min_length=1, max_length=80)
     avatar: str = Field(default="generic:0", max_length=1500)
+    is_kid: bool = False
 
 
 class ActiveProfileRequest(BaseModel):
@@ -181,6 +184,9 @@ def database() -> sqlite3.Connection:
             overview TEXT,
             year INTEGER,
             genres TEXT NOT NULL DEFAULT '[]',
+            age_limit INTEGER,
+            age_rating TEXT,
+            age_rating_checked_at TEXT,
             cast_json TEXT,
             cast_version INTEGER NOT NULL DEFAULT 0,
             tmdb_id INTEGER,
@@ -202,6 +208,10 @@ def database() -> sqlite3.Connection:
     node_columns = {row["name"] for row in connection.execute("PRAGMA table_info(catalog_nodes)")}
     if "episode_metadata_checked_at" not in node_columns:
         connection.execute("ALTER TABLE catalog_nodes ADD COLUMN episode_metadata_checked_at TEXT")
+    for name, sql_type in (("age_limit", "INTEGER"), ("age_rating", "TEXT"),
+                           ("age_rating_checked_at", "TEXT")):
+        if name not in node_columns:
+            connection.execute(f"ALTER TABLE catalog_nodes ADD COLUMN {name} {sql_type}")
     if "cast_json" not in node_columns:
         connection.execute("ALTER TABLE catalog_nodes ADD COLUMN cast_json TEXT")
     if "cast_version" not in node_columns:
@@ -232,6 +242,7 @@ def database() -> sqlite3.Connection:
                user_id TEXT,
                name TEXT NOT NULL,
                avatar TEXT NOT NULL DEFAULT 'generic:0',
+               is_kid INTEGER NOT NULL DEFAULT 0,
                created_at TEXT NOT NULL,
                updated_at TEXT NOT NULL,
                deleted INTEGER NOT NULL DEFAULT 0
@@ -242,6 +253,8 @@ def database() -> sqlite3.Connection:
         connection.execute("ALTER TABLE user_profiles ADD COLUMN user_id TEXT")
     if "deleted" not in profile_columns:
         connection.execute("ALTER TABLE user_profiles ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+    if "is_kid" not in profile_columns:
+        connection.execute("ALTER TABLE user_profiles ADD COLUMN is_kid INTEGER NOT NULL DEFAULT 0")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_profiles_user ON user_profiles(user_id, deleted)")
     connection.execute(
         """CREATE TABLE IF NOT EXISTS profile_state (
@@ -539,6 +552,7 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     node.pop("poster_file", None)
     node.pop("backdrop_file", None)
     node.pop("metadata_error", None)
+    node.pop("age_rating_checked_at", None)
     if node["kind"] == "collection" and not genres:
         genre_row = connection.execute(
             """WITH RECURSIVE descendants(id) AS (
@@ -623,6 +637,7 @@ def _item_select() -> str:
                      li.series_node_id AS series_id, li.season_number, li.episode_number,
                      n.metadata_title, n.overview, COALESCE(n.year, n.source_year) AS year,
                      n.genres AS genres_json,
+                     n.age_limit, n.age_rating,
                      (SELECT COUNT(*) FROM catalog_nodes s
                       WHERE s.parent_id=n.id AND s.kind='season' AND s.available=1) AS season_count,
                      n.id AS metadata_node_id, n.parent_id AS metadata_parent_id, n.poster_file,
@@ -880,6 +895,7 @@ def _sync_job_payload(row: sqlite3.Row) -> SyncJob:
 @app.on_event("startup")
 def initialize_database() -> None:
     global SCHEDULER_STARTED
+    age_rating_backfill_pending = False
     with closing(database()) as connection:
         for row in connection.execute("SELECT id, genres FROM catalog_nodes WHERE genres!='[]'").fetchall():
             try:
@@ -890,7 +906,15 @@ def initialize_database() -> None:
             if encoded != row["genres"]:
                 connection.execute("UPDATE catalog_nodes SET genres=? WHERE id=?", (encoded, row["id"]))
         connection.commit()
+        if TMDB_CONFIGURED:
+            age_rating_backfill_pending = connection.execute(
+                "SELECT 1 FROM catalog_nodes WHERE available=1 AND kind IN ('movie','series') "
+                "AND tmdb_id IS NOT NULL AND age_rating_checked_at IS NULL LIMIT 1"
+            ).fetchone() is not None
     _start_episode_thumbnail_job()
+    if age_rating_backfill_pending:
+        threading.Thread(target=_start_sync_job, daemon=True,
+                         name="zinema-age-rating-backfill").start()
     if not SCHEDULER_STARTED:
         threading.Thread(target=_daily_sync_loop, daemon=True, name="zinema-daily-sync").start()
         SCHEDULER_STARTED = True
@@ -940,6 +964,7 @@ def get_catalog_version() -> dict[str, str]:
         nodes = connection.execute(
             """SELECT id, library, kind, relative_path, parent_id, title, season_number,
                       source_year, metadata_title, original_title, overview, year, genres,
+                      age_limit, age_rating,
                       cast_json, cast_version, tmdb_id, imdb_id, poster_file, backdrop_file,
                       metadata_status, metadata_source, metadata_checked_at,
                       episode_metadata_checked_at, scanned_at, added_at
@@ -1246,13 +1271,14 @@ def list_profiles(device_id: Annotated[str, Depends(require_client)]) -> list[di
     user_id = account_for_device(device_id)
     with closing(database()) as connection:
         rows = connection.execute(
-            """SELECT id, name, avatar, created_at, updated_at, deleted FROM user_profiles
+            """SELECT id, name, avatar, is_kid, created_at, updated_at, deleted FROM user_profiles
                WHERE user_id=? ORDER BY created_at, id""", (user_id,),
         ).fetchall()
     result = []
     for row in rows:
         profile = dict(row)
         profile["deleted"] = bool(profile["deleted"])
+        profile["is_kid"] = bool(profile["is_kid"])
         result.append(profile)
     return result
 
@@ -1284,20 +1310,24 @@ def save_profile(profile: UserProfileRequest,
     now = datetime.now(timezone.utc).isoformat()
     with closing(database()) as connection:
         connection.execute(
-            """INSERT INTO user_profiles(id, user_id, name, avatar, created_at, updated_at, deleted)
-               VALUES (?, ?, ?, ?, ?, ?, 0)
+            """INSERT INTO user_profiles(id, user_id, name, avatar, is_kid, created_at, updated_at, deleted)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0)
                ON CONFLICT(id) DO UPDATE SET name=excluded.name, avatar=excluded.avatar,
-                   updated_at=excluded.updated_at, deleted=0 WHERE user_profiles.user_id=excluded.user_id""",
-            (profile.id, user_id, profile.name.strip(), profile.avatar, now, now),
+                   is_kid=excluded.is_kid, updated_at=excluded.updated_at, deleted=0
+                   WHERE user_profiles.user_id=excluded.user_id""",
+            (profile.id, user_id, profile.name.strip(), profile.avatar, int(profile.is_kid), now, now),
         )
         connection.commit()
         row = connection.execute(
-            "SELECT id, name, avatar, created_at, updated_at, deleted FROM user_profiles WHERE id=? AND user_id=?",
+            "SELECT id, name, avatar, is_kid, created_at, updated_at, deleted FROM user_profiles WHERE id=? AND user_id=?",
             (profile.id, user_id),
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=409, detail="Profile belongs to another account")
-    return dict(row)
+    result = dict(row)
+    result["is_kid"] = bool(result["is_kid"])
+    result["deleted"] = bool(result["deleted"])
+    return result
 
 
 @app.delete("/api/v1/profiles/{profile_id}")
@@ -1522,7 +1552,7 @@ def get_catalog_node(node_id: str) -> dict:
 
 
 @app.post("/api/v1/catalog/{node_id}/metadata/retry", status_code=202,
-          dependencies=[Depends(require_client)])
+          dependencies=[Depends(require_admin)])
 def retry_catalog_metadata(node_id: str) -> dict[str, object]:
     global METADATA_RETRY_GLOBAL_LAST_REQUEST
     if not TMDB_CONFIGURED:
@@ -1658,7 +1688,7 @@ def catalog_metadata_images(node_id: str, q: str | None = None,
     return {"images": images[:10]}
 
 
-@app.post("/api/v1/catalog/{node_id}/metadata/manual", dependencies=[Depends(require_client)])
+@app.post("/api/v1/catalog/{node_id}/metadata/manual", dependencies=[Depends(require_admin)])
 def save_manual_metadata(node_id: str, request: ManualMetadataRequest) -> dict[str, object]:
     with closing(database()) as connection:
         node = connection.execute(

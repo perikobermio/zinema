@@ -143,6 +143,35 @@ def _cast_payload(details: dict) -> list[dict[str, str]]:
     return cast
 
 
+def _spanish_age_rating(details: dict, kind: str) -> tuple[int | None, str | None]:
+    """Return Spain's TMDb age threshold. Missing or unknown ratings stay unrated."""
+    ratings: list[str] = []
+    if kind == "movie":
+        for region in (details.get("release_dates") or {}).get("results", []):
+            if region.get("iso_3166_1") != "ES":
+                continue
+            ratings.extend(str(item.get("certification") or "").strip()
+                           for item in region.get("release_dates", []))
+    else:
+        ratings.extend(str(item.get("rating") or "").strip()
+                       for item in (details.get("content_ratings") or {}).get("results", [])
+                       if item.get("iso_3166_1") == "ES")
+
+    age_by_code = {
+        "TP": 0, "APTA": 0, "0": 0,
+        "7": 7, "7+": 7,
+        "12": 12, "12+": 12,
+        "16": 16, "16+": 16,
+        "18": 18, "18+": 18, "X": 18,
+    }
+    recognized = [(age_by_code[rating.upper()], rating.upper()) for rating in ratings
+                  if rating.upper() in age_by_code]
+    if not recognized:
+        return None, None
+    age, rating = max(recognized, key=lambda item: item[0])
+    return age, rating
+
+
 def _write_match(connection: sqlite3.Connection, node: sqlite3.Row, details: dict,
                  artwork_dir: Path, client: httpx.Client, image_config: tuple[str, str, str],
                  language: str, api_key: str = "") -> None:
@@ -162,16 +191,19 @@ def _write_match(connection: sqlite3.Connection, node: sqlite3.Row, details: dic
     genres = json.dumps(normalize_genres(
         [genre.get("name") for genre in details.get("genres", []) if genre.get("name")]
     ), ensure_ascii=False)
+    age_limit, age_rating = _spanish_age_rating(details, entity_kind)
     cast = _cast_payload(details)
     connection.execute(
         """UPDATE catalog_nodes SET tmdb_id=?, imdb_id=?, metadata_title=?, original_title=?,
-           overview=?, year=?, genres=?, cast_json=?, cast_version=1,
+           overview=?, year=?, genres=?, age_limit=?, age_rating=?, age_rating_checked_at=?,
+           cast_json=?, cast_version=1,
            poster_file=COALESCE(?, poster_file),
            backdrop_file=COALESCE(?, backdrop_file), metadata_status='matched',
            metadata_source='tmdb', metadata_checked_at=?, metadata_candidates=NULL,
            metadata_error=NULL WHERE id=?""",
         (tmdb_id, external_ids.get("imdb_id"), title, original_title,
-         details.get("overview") or "", year, genres,
+         details.get("overview") or "", year, genres, age_limit, age_rating,
+         datetime.now(timezone.utc).isoformat(),
          json.dumps(cast, ensure_ascii=False), poster_file, backdrop_file,
          datetime.now(timezone.utc).isoformat(), safe_id),
     )
@@ -293,8 +325,10 @@ def _write_season_artwork(connection: sqlite3.Connection, node: sqlite3.Row, det
 
 def _fetch_details(client: httpx.Client, kind: str, tmdb_id: int, language: str,
                    api_key: str = "") -> dict:
+    extras = "external_ids,credits,release_dates" if kind == "movie" \
+        else "external_ids,credits,content_ratings"
     return _api_get(client, f"/{kind}/{tmdb_id}",
-                    {"language": language, "append_to_response": "external_ids,credits"}, api_key)
+                    {"language": language, "append_to_response": extras}, api_key)
 
 
 def _search_titles(client: httpx.Client, kind: str, title: str, source_year: int | None,
@@ -357,12 +391,15 @@ def get_candidate_details(kind: str, tmdb_id: int, access_token: str,
     with httpx.Client(headers=headers, timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
         details = _fetch_details(client, entity_kind, tmdb_id, language, api_key)
     release = details.get("release_date") if entity_kind == "movie" else details.get("first_air_date")
+    age_limit, age_rating = _spanish_age_rating(details, entity_kind)
     return {
         "tmdb_id": int(details["id"]),
         "metadata_title": details.get("title") or details.get("name") or "",
         "overview": details.get("overview") or "",
         "year": int(release[:4]) if release and len(release) >= 4 and release[:4].isdigit() else None,
         "genres": [item["name"] for item in details.get("genres", []) if item.get("name")],
+        "age_limit": age_limit,
+        "age_rating": age_rating,
         "poster_path": details.get("poster_path"),
         "backdrop_path": details.get("backdrop_path"),
     }
@@ -435,12 +472,14 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
         """SELECT * FROM catalog_nodes
            WHERE available=1 AND kind IN ('movie', 'series')
              AND (COALESCE(metadata_source, '')!='manual'
-                  OR (tmdb_id IS NOT NULL AND cast_version<1))
+                  OR (tmdb_id IS NOT NULL AND cast_version<1)
+                  OR (tmdb_id IS NOT NULL AND age_rating_checked_at IS NULL))
              AND (? IS NULL OR id=?)
              AND (metadata_checked_at IS NULL
                   OR (metadata_status='error' AND metadata_checked_at < ?)
                   OR (metadata_status!='error' AND metadata_checked_at < ?)
                   OR (tmdb_id IS NOT NULL AND cast_version<1)
+                  OR (tmdb_id IS NOT NULL AND age_rating_checked_at IS NULL)
                   OR (kind='series' AND tmdb_id IS NOT NULL
                       AND episode_metadata_checked_at IS NULL))
            ORDER BY CASE WHEN tmdb_id IS NOT NULL THEN 1 ELSE 0 END, scanned_at
@@ -462,9 +501,12 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
                 kind = "movie" if node["kind"] == "movie" else "tv"
                 if node["metadata_source"] == "manual" and node["tmdb_id"]:
                     details = _fetch_details(client, kind, int(node["tmdb_id"]), language, api_key)
+                    age_limit, age_rating = _spanish_age_rating(details, kind)
                     connection.execute(
-                        "UPDATE catalog_nodes SET cast_json=?, cast_version=1 WHERE id=?",
-                        (json.dumps(_cast_payload(details), ensure_ascii=False), node["id"]),
+                        """UPDATE catalog_nodes SET cast_json=?, cast_version=1,
+                           age_limit=?, age_rating=?, age_rating_checked_at=? WHERE id=?""",
+                        (json.dumps(_cast_payload(details), ensure_ascii=False), age_limit,
+                         age_rating, datetime.now(timezone.utc).isoformat(), node["id"]),
                     )
                     if node["kind"] == "series":
                         _write_season_artwork(connection, node, details, artwork_dir, client,

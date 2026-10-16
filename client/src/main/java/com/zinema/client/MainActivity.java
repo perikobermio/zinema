@@ -45,6 +45,7 @@ import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.content.Context;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
@@ -178,6 +179,7 @@ public class MainActivity extends Activity {
     List<JSONObject> series = new ArrayList<>();
     final Map<String, String> posterByStream = new HashMap<>();
     final Map<String, Set<String>> selectedGenresByLibrary = new HashMap<>();
+    final Set<String> kidAllowedSeasonIds = new HashSet<>();
     final Map<ImageView, String> requestedImages = new WeakHashMap<>();
     final List<JSONObject> breadcrumbs = new ArrayList<>();
     final List<Integer> breadcrumbScrollPositions = new ArrayList<>();
@@ -458,11 +460,32 @@ public class MainActivity extends Activity {
 
     void buildShell(String title) {
         frame = new FrameLayout(this);
+        boolean kidTheme = isActiveKidProfile() && !showingAdmin;
         GradientDrawable appBackground = new GradientDrawable(
                 GradientDrawable.Orientation.TL_BR,
-                new int[]{0xFF22243A, 0xFF141925, 0xFF191520, 0xFF29202D});
+                kidTheme
+                        ? new int[]{0xFF172B55, 0xFF453078, 0xFF8B3C77, 0xFF176C83}
+                        : new int[]{0xFF22243A, 0xFF141925, 0xFF191520, 0xFF29202D});
         frame.setBackground(appBackground);
         frame.setClipChildren(false);
+        if (kidTheme) {
+            View confetti = new View(this) {
+                final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                @Override protected void onDraw(Canvas canvas) {
+                    super.onDraw(canvas);
+                    int[][] dots = {{0x3038E7FF, 12, 15, 78}, {0x30FFE15A, 86, 30, 35},
+                            {0x30FF80C8, 91, 78, 96}, {0x30FFFFFF, 18, 82, 43},
+                            {0x30FFD166, 53, 8, 28}, {0x3047F5B8, 62, 52, 58}};
+                    for (int[] dot : dots) {
+                        paint.setColor(dot[0]);
+                        canvas.drawCircle(getWidth() * dot[1] / 100f,
+                                getHeight() * dot[2] / 100f, d(dot[3]), paint);
+                    }
+                }
+            };
+            confetti.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            frame.addView(confetti, new FrameLayout.LayoutParams(-1, -1));
+        }
         page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
         page.setClipChildren(false);
@@ -471,7 +494,7 @@ public class MainActivity extends Activity {
         LinearLayout bar = new LinearLayout(this);
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setPadding(d(20), d(20), d(16), d(8));
-        bar.setBackgroundColor(0xF0141721);
+        bar.setBackgroundColor(kidTheme ? 0xF12A3767 : 0xF0141721);
         bar.setElevation(d(24));
         bar.setTranslationZ(d(24));
         backButton = navAction("‹", "Atrás", v -> onBackPressed());
@@ -500,7 +523,9 @@ public class MainActivity extends Activity {
         bar.addView(brandButton, brandParams);
         if (!showingAdmin) bar.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
         searchButton = navAction("⌕", "Buscar", v -> showSearch());
-        searchButton.setBackground(round(PANEL, d(22)));
+        searchButton.setBackground(kidTheme
+                ? gradientRound(new int[]{0xFF3779A5, 0xFF7851A2}, d(22))
+                : round(PANEL, d(22)));
         searchButton.setElevation(d(4));
         bar.addView(searchButton, new LinearLayout.LayoutParams(d(44), d(44)));
         profileButton = buildProfileChip();
@@ -517,7 +542,7 @@ public class MainActivity extends Activity {
         navScroll.setHorizontalScrollBarEnabled(false);
         navScroll.setElevation(d(22));
         navScroll.setTranslationZ(d(22));
-        navScroll.setBackgroundColor(0xF0141721);
+        navScroll.setBackgroundColor(kidTheme ? 0xF1373978 : 0xF0141721);
         LinearLayout nav = new LinearLayout(this);
         nav.setPadding(d(16), 0, d(16), d(8));
         nav.addView(navChip("Inicio", () -> loadHome(), selectedSection.equals("home")));
@@ -536,7 +561,9 @@ public class MainActivity extends Activity {
         contentScroller.setVerticalScrollBarEnabled(false);
         GradientDrawable sectionBackground = new GradientDrawable(
                 GradientDrawable.Orientation.LEFT_RIGHT,
-                new int[]{0xFF19243A, 0xFF131925, 0xFF211923});
+                kidTheme
+                        ? new int[]{0xD91B4670, 0xD943347A, 0xD92D6874}
+                        : new int[]{0xFF19243A, 0xFF131925, 0xFF211923});
         contentScroller.setBackground(sectionBackground);
         contentScroller.setClipChildren(false);
         contentScroller.setClipToPadding(false);
@@ -587,7 +614,7 @@ public class MainActivity extends Activity {
         view.setText(t(cleanDisplayText(text)));
         view.setTextSize(size);
         view.setTextColor(color);
-        if (bold) view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        view.setTypeface(activeProfileTypeface(bold));
         return view;
     }
 
@@ -596,8 +623,13 @@ public class MainActivity extends Activity {
         view.setText(cleanDisplayText(text));
         view.setTextSize(size);
         view.setTextColor(color);
-        if (bold) view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        view.setTypeface(activeProfileTypeface(bold));
         return view;
+    }
+
+    Typeface activeProfileTypeface(boolean bold) {
+        int style = bold ? Typeface.BOLD : Typeface.NORMAL;
+        return Typeface.create(isActiveKidProfile() ? "casual" : "sans-serif", style);
     }
 
     String cleanDisplayText(String value) {
@@ -631,7 +663,8 @@ public class MainActivity extends Activity {
         if (view instanceof ViewGroup) ((ViewGroup) view).setClipChildren(false);
         view.setOnFocusChangeListener((focusedView, hasFocus) -> {
             if (!(scaleOnFocus && isTelevision())) {
-                outline.setStroke(d(hasFocus ? 2 : 1), hasFocus ? RED : Color.TRANSPARENT);
+                int focusColor = isActiveKidProfile() ? 0xFFFFD166 : RED;
+                outline.setStroke(d(hasFocus ? 2 : 1), hasFocus ? focusColor : Color.TRANSPARENT);
                 focusedView.setForeground(outline);
             } else {
                 setPosterBrightness(focusedView, hasFocus);
@@ -666,11 +699,14 @@ public class MainActivity extends Activity {
         tab.setOrientation(LinearLayout.VERTICAL);
         tab.setGravity(Gravity.CENTER);
         tab.setPadding(d(14), d(2), d(14), d(2));
-        TextView text = label(title, 14, active ? Color.WHITE : MUTED, active);
+        TextView text = label(title, 14, active ? Color.WHITE
+                : isActiveKidProfile() ? 0xFFE3DCFF : MUTED, active);
         text.setGravity(Gravity.CENTER);
         tab.addView(text, new LinearLayout.LayoutParams(-2, -2));
         View indicator = new View(this);
-        indicator.setBackground(round(active ? RED : Color.TRANSPARENT, d(2)));
+        indicator.setBackground(round(active ? (isActiveKidProfile() ? 0xFFFFD166 : RED)
+                : Color.TRANSPARENT, d(2)));
+        if (isActiveKidProfile()) tab.setBackground(round(active ? 0x554F61B1 : Color.TRANSPARENT, d(14)));
         LinearLayout.LayoutParams indicatorParams = new LinearLayout.LayoutParams(d(24), d(3));
         indicatorParams.topMargin = d(3);
         tab.addView(indicator, indicatorParams);
@@ -981,6 +1017,7 @@ public class MainActivity extends Activity {
             payload.put("id", profile.optString("id"));
             payload.put("name", profile.optString("name", "Profil"));
             payload.put("avatar", profile.optString("avatar", "generic:0"));
+            payload.put("is_kid", profile.optBoolean("is_kid", false));
         } catch (JSONException ignored) { }
         return payload;
     }
@@ -1011,7 +1048,13 @@ public class MainActivity extends Activity {
             boolean replaced = false;
             for (int j = 0; j < local.size(); j++) {
                 if (id.equals(local.get(j).optString("id"))) {
-                    if (!prefs.getBoolean(profileMetadataDirtyKey(id), false)) local.set(j, remote);
+                    if (!prefs.getBoolean(profileMetadataDirtyKey(id), false)) {
+                        if (!remote.has("is_kid")) {
+                            try { remote.put("is_kid", local.get(j).optBoolean("is_kid", false)); }
+                            catch (JSONException ignored) { }
+                        }
+                        local.set(j, remote);
+                    }
                     replaced = true;
                     break;
                 }
@@ -1211,6 +1254,81 @@ public class MainActivity extends Activity {
         return profiles.isEmpty() ? null : profiles.get(0);
     }
 
+    boolean isActiveKidProfile() {
+        if (prefs == null) return false;
+        JSONObject profile = activeProfile();
+        return profile != null && profile.optBoolean("is_kid", false);
+    }
+
+    boolean isAccountAdmin() {
+        return prefs != null && prefs.getBoolean("account_is_admin", false);
+    }
+
+    boolean isKidAllowedNode(JSONObject node) {
+        if (!isActiveKidProfile()) return true;
+        if (node == null) return false;
+        String kind = node.optString("kind", "");
+        if ("collection".equals(kind)) {
+            JSONArray genres = node.optJSONArray("genres");
+            return genres == null || genres.length() == 0 || isKidAllowedByGenres(node);
+        }
+        if ("season".equals(kind)) return kidAllowedSeasonIds.contains(node.optString("id", ""));
+        if ("episode".equals(kind)) {
+            String seriesId = node.optString("series_id", "");
+            JSONObject owner = seriesId.isEmpty() ? null : findCatalogNodeById(seriesId, series);
+            return owner != null && isKidAllowedByGenres(owner);
+        }
+        return isKidAllowedByGenres(node);
+    }
+
+    boolean isKidAllowedByGenres(JSONObject node) {
+        if (node == null) return false;
+        JSONArray genres = node.optJSONArray("genres");
+        if (genres == null || genres.length() == 0) return true;
+        boolean hasFamily = false;
+        boolean hasBlockedGenre = false;
+        for (int i = 0; i < genres.length(); i++) {
+            String genre = normalizeGenre(genres.optString(i, ""));
+            String[] terms = genre.split("[^a-z0-9]+");
+            for (String term : terms) {
+                if (term.equals("familia") || term.equals("family")) hasFamily = true;
+                if (term.equals("guerra") || term.equals("gerra") || term.equals("war")
+                        || term.equals("belica") || term.equals("crimen") || term.equals("crime")
+                        || term.equals("krimena") || term.equals("drama") || term.equals("terror")
+                        || term.equals("horror") || term.equals("beldurrezkoa") || term.equals("western")) {
+                    hasBlockedGenre = true;
+                }
+            }
+        }
+        return !hasBlockedGenre || hasFamily;
+    }
+
+    List<JSONObject> filterKidCatalog(List<JSONObject> nodes) {
+        if (!isActiveKidProfile() || nodes == null) return nodes == null ? new ArrayList<>() : nodes;
+        List<JSONObject> filtered = new ArrayList<>();
+        for (JSONObject node : nodes) if (isKidAllowedNode(node)) filtered.add(node);
+        return filtered;
+    }
+
+    boolean isKidAllowedProgress(JSONObject item) {
+        if (!isActiveKidProfile()) return true;
+        String seriesId = item.optString("series_id", "");
+        if (!seriesId.isEmpty()) {
+            JSONObject owner = findCatalogNodeById(seriesId, series);
+            boolean allowed = owner != null && isKidAllowedByGenres(owner);
+            String seasonId = item.optString("owner_node_id", "");
+            if (allowed && !seasonId.isEmpty()) kidAllowedSeasonIds.add(seasonId);
+            return allowed;
+        }
+        String ownerId = item.optString("owner_node_id", item.optString("node_id", ""));
+        JSONObject owner = findCatalogNodeById(ownerId, movies);
+        if (owner == null) owner = findCatalogNodeById(ownerId, series);
+        if (owner != null) return isKidAllowedNode(owner);
+        JSONObject media = findCatalogNodeById(item.optString("media_id", ""), movies);
+        if (media == null) media = findCatalogNodeById(item.optString("media_id", ""), series);
+        return media != null && isKidAllowedNode(media);
+    }
+
     String activeProfileAvatar() {
         JSONObject profile = activeProfile();
         return profile == null ? "generic:0" : profile.optString("avatar", "generic:0");
@@ -1337,7 +1455,9 @@ public class MainActivity extends Activity {
         LinearLayout chip = new LinearLayout(this);
         chip.setGravity(Gravity.CENTER_VERTICAL);
         chip.setPadding(d(5), d(3), d(10), d(3));
-        chip.setBackground(round(PANEL, d(24)));
+        chip.setBackground(isActiveKidProfile()
+                ? gradientRound(new int[]{0xFF4B3A83, 0xFF137487}, d(24))
+                : round(PANEL, d(24)));
         JSONObject profile = activeProfile();
         String name = profile == null ? t("Perfil") : profile.optString("name", t("Perfil"));
         FrameLayout avatar = profileAvatarView(activeProfileAvatar(), d(34), name, false);
@@ -1357,6 +1477,20 @@ public class MainActivity extends Activity {
         chip.setContentDescription(t("Cambiar perfil") + ": " + name);
         applyTvFocusStyle(chip, false);
         chip.setOnClickListener(v -> {
+            if (isActiveKidProfile()) {
+                List<String> choices = new ArrayList<>();
+                List<Integer> actions = new ArrayList<>();
+                choices.add(t("Cambiar perfil")); actions.add(1);
+                choices.add(t("Administración")); actions.add(2);
+                if (prefs.getBoolean("account_is_admin", false)) {
+                    choices.add(t("Gestión de cuentas")); actions.add(5);
+                }
+                choices.add(t("Cerrar sesión")); actions.add(3);
+                choices.add(t("Salir")); actions.add(4);
+                showStyledActionDialog(t("Menú de perfil"), choices,
+                        selected -> runAvatarMenuAction(actions.get(selected)));
+                return;
+            }
             PopupMenu menu = new PopupMenu(MainActivity.this, chip);
             addAvatarMenuItem(menu, 1, 1, t("Cambiar perfil"), MenuIconDrawable.PROFILE);
             addAvatarMenuItem(menu, 2, 2, t("Administración"), MenuIconDrawable.SETTINGS);
@@ -1366,16 +1500,20 @@ public class MainActivity extends Activity {
             addAvatarMenuItem(menu, 3, 4, t("Cerrar sesión"), MenuIconDrawable.LOGOUT);
             addAvatarMenuItem(menu, 4, 5, t("Salir"), MenuIconDrawable.EXIT);
             menu.setOnMenuItemClickListener(item -> {
-                if (item.getItemId() == 1) openProfileManager();
-                else if (item.getItemId() == 2) showSettings();
-                else if (item.getItemId() == 5) showAccountManagement();
-                else if (item.getItemId() == 3) logoutAccount();
-                else if (item.getItemId() == 4) finishAndRemoveTask();
+                runAvatarMenuAction(item.getItemId());
                 return true;
             });
             menu.show();
         });
         return chip;
+    }
+
+    void runAvatarMenuAction(int id) {
+        if (id == 1) openProfileManager();
+        else if (id == 2) showSettings();
+        else if (id == 5) showAccountManagement();
+        else if (id == 3) logoutAccount();
+        else if (id == 4) finishAndRemoveTask();
     }
 
     void addAvatarMenuItem(PopupMenu menu, int id, int order, String title, int iconKind) {
@@ -1542,6 +1680,11 @@ public class MainActivity extends Activity {
         body.setPadding(d(28), d(18), d(28), d(30));
         scroll.addView(body);
         content.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
+        Button back = actionButton("‹  " + t("Atrás"), false);
+        LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(-2, d(44));
+        backParams.bottomMargin = d(12);
+        body.addView(back, backParams);
+        back.setOnClickListener(v -> onBackPressed());
         body.addView(label(t("¿Quién está viendo?"), 26, Color.WHITE, true));
         TextView hint = label(t("Cada perfil conserva su lista y su progreso de reproducción."), 14, MUTED, false);
         hint.setPadding(0, d(6), 0, d(18));
@@ -1551,7 +1694,10 @@ public class MainActivity extends Activity {
             LinearLayout row = new LinearLayout(this);
             row.setGravity(Gravity.CENTER_VERTICAL);
             row.setPadding(d(12), d(10), d(12), d(10));
-            row.setBackground(round(PANEL, d(12)));
+            boolean kid = profile.optBoolean("is_kid", false);
+            row.setBackground(kid
+                    ? gradientRound(new int[]{0xFF17496B, 0xFF593779}, d(16))
+                    : round(PANEL, d(12)));
             LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, -2);
             rowParams.bottomMargin = d(10);
             body.addView(row, rowParams);
@@ -1566,6 +1712,7 @@ public class MainActivity extends Activity {
             row.addView(info, new LinearLayout.LayoutParams(0, -1, 1));
             info.addView(label(name, 17, Color.WHITE, true));
             if (id.equals(activeProfileId())) info.addView(label(t("Perfil actual"), 12, 0xFFFF777D, false));
+            if (kid) info.addView(label(t("Perfil infantil · filtro por género"), 11, 0xFF9EF4E2, true));
             Button use = actionButton(t("Usar"), true);
             row.addView(use, new LinearLayout.LayoutParams(-2, d(42)));
             use.setOnClickListener(v -> selectProfile(id));
@@ -1607,13 +1754,59 @@ public class MainActivity extends Activity {
         body.setPadding(d(28), d(16), d(28), d(28));
         scroll.addView(body);
         content.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
+        Button back = actionButton("‹  " + t("Atrás"), false);
+        LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(-2, d(42));
+        backParams.bottomMargin = d(6);
+        body.addView(back, backParams);
+        back.setOnClickListener(v -> backFromProfileEditor());
         body.addView(label(existing == null ? t("Crear perfil") : t("Editar perfil"), 25, Color.WHITE, true));
+        LinearLayout buttons = new LinearLayout(this);
+        buttons.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams buttonsParams = new LinearLayout.LayoutParams(-1, -2);
+        buttonsParams.topMargin = d(8);
+        buttonsParams.bottomMargin = d(8);
+        body.addView(buttons, buttonsParams);
+        Button save = actionButton(t("Guardar perfil"), true);
+        buttons.addView(save, new LinearLayout.LayoutParams(0, d(48), 1));
+        Button cancel = actionButton(t("Cancelar"), false);
+        LinearLayout.LayoutParams cancelParams = new LinearLayout.LayoutParams(0, d(48), 1);
+        cancelParams.leftMargin = d(8);
+        buttons.addView(cancel, cancelParams);
+        cancel.setOnClickListener(v -> backFromProfileEditor());
+        if (existing != null) {
+            Button delete = actionButton(t("Eliminar"), false);
+            LinearLayout.LayoutParams deleteParams = new LinearLayout.LayoutParams(0, d(48), 1);
+            deleteParams.leftMargin = d(8);
+            buttons.addView(delete, deleteParams);
+            delete.setOnClickListener(v -> confirmDeleteProfile(existing));
+        }
         TextView nameLabel = label(t("Nombre"), 14, MUTED, true);
         nameLabel.setPadding(0, d(18), 0, d(7));
         body.addView(nameLabel);
         EditText name = metadataField(existing == null ? "" : existing.optString("name", ""), t("Nombre del perfil"), false);
         name.setSingleLine(true);
         body.addView(name, new LinearLayout.LayoutParams(-1, d(50)));
+        LinearLayout kidPanel = new LinearLayout(this);
+        kidPanel.setOrientation(LinearLayout.VERTICAL);
+        kidPanel.setPadding(d(14), d(7), d(14), d(10));
+        kidPanel.setBackground(gradientRound(new int[]{0xFF243F66, 0xFF56366F}, d(16)));
+        LinearLayout.LayoutParams kidPanelParams = new LinearLayout.LayoutParams(-1, -2);
+        kidPanelParams.topMargin = d(16);
+        body.addView(kidPanel, kidPanelParams);
+        CheckBox kidToggle = new CheckBox(this);
+        kidToggle.setText(t("Perfil infantil"));
+        kidToggle.setTextColor(Color.WHITE);
+        kidToggle.setTextSize(16);
+        kidToggle.setTypeface(activeProfileTypeface(true));
+        if (Build.VERSION.SDK_INT >= 21) kidToggle.setButtonTintList(
+                android.content.res.ColorStateList.valueOf(0xFFFFD166));
+        kidToggle.setChecked(existing != null && existing.optBoolean("is_kid", false));
+        save.setOnClickListener(v -> saveProfile(existing, name.getText().toString(), kidToggle.isChecked()));
+        kidPanel.addView(kidToggle, new LinearLayout.LayoutParams(-1, d(48)));
+        TextView kidDescription = label(t("Oculta títulos de Guerra, Crimen, Drama, Terror y Western, salvo los que también incluyan Familia."),
+                12, 0xFFE5E7FF, false);
+        kidDescription.setPadding(d(4), 0, d(4), d(4));
+        kidPanel.addView(kidDescription);
         TextView avatarLabel = label(t("Elige un avatar"), 14, MUTED, true);
         avatarLabel.setPadding(0, d(20), 0, d(10));
         body.addView(avatarLabel);
@@ -1651,26 +1844,6 @@ public class MainActivity extends Activity {
                 });
             } catch (Exception ignored) { }
         });
-        LinearLayout buttons = new LinearLayout(this);
-        buttons.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams buttonsParams = new LinearLayout.LayoutParams(-1, -2);
-        buttonsParams.topMargin = d(20);
-        body.addView(buttons, buttonsParams);
-        Button save = actionButton(t("Guardar perfil"), true);
-        buttons.addView(save, new LinearLayout.LayoutParams(-2, d(48)));
-        Button cancel = actionButton(t("Cancelar"), false);
-        LinearLayout.LayoutParams cancelParams = new LinearLayout.LayoutParams(-2, d(48));
-        cancelParams.leftMargin = d(10);
-        buttons.addView(cancel, cancelParams);
-        cancel.setOnClickListener(v -> backFromProfileEditor());
-        if (existing != null) {
-            Button delete = actionButton(t("Eliminar"), false);
-            LinearLayout.LayoutParams deleteParams = new LinearLayout.LayoutParams(-2, d(48));
-            deleteParams.leftMargin = d(10);
-            buttons.addView(delete, deleteParams);
-            delete.setOnClickListener(v -> confirmDeleteProfile(existing));
-        }
-        save.setOnClickListener(v -> saveProfile(existing, name.getText().toString()));
     }
 
     void renderAvatarGrid(LinearLayout grid, List<JSONObject> options, List<View> cells, String query) {
@@ -1735,7 +1908,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    void saveProfile(JSONObject existing, String rawName) {
+    void saveProfile(JSONObject existing, String rawName, boolean isKid) {
         if (clientApiToken().isEmpty()) {
             Toast.makeText(this, t("Inicia sesión con una cuenta aprobada para crear un perfil."), Toast.LENGTH_LONG).show();
             showSettings();
@@ -1753,6 +1926,7 @@ public class MainActivity extends Activity {
             profile.put("id", id);
             profile.put("name", name);
             profile.put("avatar", selectedProfileAvatar);
+            profile.put("is_kid", isKid);
         } catch (JSONException ignored) { }
         List<JSONObject> profiles = readProfiles();
         boolean replaced = false;
@@ -1778,6 +1952,9 @@ public class MainActivity extends Activity {
         if (first) {
             showingProfiles = false;
             loadHome();
+        } else if (id.equals(activeProfileId())) {
+            buildShell("Perfiles");
+            renderProfileManager();
         } else renderProfileManager();
     }
 
@@ -2030,6 +2207,7 @@ public class MainActivity extends Activity {
         Set<String> includedSeries = new HashSet<>();
         Set<String> includedStreams = new HashSet<>();
         for (JSONObject item : resume) {
+            if (!isKidAllowedProgress(item)) continue;
             JSONObject card = decorateResumeItem(item, false);
             String stream = item.optString("stream", item.optString("path", ""));
             String seriesId = card.optString("series_id", "");
@@ -2041,6 +2219,7 @@ public class MainActivity extends Activity {
         JSONObject legacyNext = readNextEpisode();
         if (legacyNext != null) suggestions.add(legacyNext);
         for (JSONObject suggestion : suggestions) {
+            if (!isKidAllowedProgress(suggestion)) continue;
             String stream = suggestion.optString("stream", suggestion.optString("stream_url", ""));
             String mediaId = suggestion.optString("media_id", suggestion.optString("id", ""));
             JSONObject card = decorateResumeItem(suggestion, true);
@@ -2055,11 +2234,13 @@ public class MainActivity extends Activity {
         Collections.sort(continueItems, (a, b) -> Long.compare(
                 resumeItemUpdated(b), resumeItemUpdated(a)));
         if (!continueItems.isEmpty()) addResumeRow("Seguir viendo", continueItems);
-        List<JSONObject> favorites = readFavorites();
+        List<JSONObject> favorites = filterKidCatalog(readFavorites());
+        List<JSONObject> visibleMovies = filterKidCatalog(movies);
+        List<JSONObject> visibleSeries = filterKidCatalog(series);
         if (!favorites.isEmpty()) addRow("Mi lista", favorites);
-        addRow("Películas", movies);
-        addRow("Series", series);
-        if (movies.isEmpty() && series.isEmpty()) {
+        addRow("Películas", visibleMovies);
+        addRow("Series", visibleSeries);
+        if (visibleMovies.isEmpty() && visibleSeries.isEmpty()) {
             TextView empty = label("Tu biblioteca está vacía. Sincroniza el catálogo en el servidor.", 16, MUTED, false);
             empty.setPadding(d(24), d(36), d(24), d(32));
             content.addView(empty);
@@ -2431,6 +2612,12 @@ public class MainActivity extends Activity {
         return drawable;
     }
 
+    GradientDrawable gradientRound(int[] colors, int radius) {
+        GradientDrawable drawable = new GradientDrawable(GradientDrawable.Orientation.TL_BR, colors);
+        drawable.setCornerRadius(radius);
+        return drawable;
+    }
+
     File imageDiskFile(String url) {
         try {
             byte[] digest = MessageDigest.getInstance("SHA-256").digest(url.getBytes(StandardCharsets.UTF_8));
@@ -2662,6 +2849,7 @@ public class MainActivity extends Activity {
     }
 
     void renderListing(String title, String subtitle, List<JSONObject> nodes) {
+        nodes = filterKidCatalog(nodes);
         currentListingTitle = title;
         currentListingSubtitle = subtitle;
         currentListingNodes = nodes == null ? new ArrayList<>() : new ArrayList<>(nodes);
@@ -2922,6 +3110,10 @@ public class MainActivity extends Activity {
 
     void openNode(JSONObject node) {
         leaveStartupHomeWait();
+        if (!isKidAllowedNode(node)) {
+            Toast.makeText(this, t("Este contenido no está disponible en un perfil infantil."), Toast.LENGTH_LONG).show();
+            return;
+        }
         String kind = node.optString("kind");
         if (kind.equals("collection")) {
             showingDetail = false;
@@ -3026,8 +3218,10 @@ public class MainActivity extends Activity {
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setPadding(d(18), d(18), d(18), d(14));
         GradientDrawable panelBg = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
-                new int[]{0xFF1C2332, 0xFF211B2B});
-        panelBg.setCornerRadius(d(20));
+                isActiveKidProfile()
+                        ? new int[]{0xFF253B78, 0xFF663A87, 0xFF146E82}
+                        : new int[]{0xFF1C2332, 0xFF211B2B});
+        panelBg.setCornerRadius(d(isActiveKidProfile() ? 26 : 20));
         panel.setBackground(panelBg);
         TextView heading = label(title, 21, Color.WHITE, true);
         heading.setPadding(d(4), d(2), d(4), d(14));
@@ -3038,12 +3232,16 @@ public class MainActivity extends Activity {
             option.setGravity(Gravity.CENTER_VERTICAL);
             option.setPadding(d(14), d(4), d(14), d(4));
             GradientDrawable optionBg = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
-                    new int[]{0xFF342737, 0xFF252D3D});
-            optionBg.setCornerRadius(d(12));
+                    isActiveKidProfile()
+                            ? new int[]{0xFF3478A5, 0xFF7650A5}
+                            : new int[]{0xFF342737, 0xFF252D3D});
+            optionBg.setCornerRadius(d(isActiveKidProfile() ? 18 : 12));
             option.setBackground(optionBg);
             option.setFocusable(true);
             option.setClickable(true);
-            TextView symbol = labelRaw("✦", 18, i == 0 ? 0xFFFF858C : 0xFFB7C4E1, true);
+            TextView symbol = labelRaw("✦", 18,
+                    isActiveKidProfile() ? (i % 2 == 0 ? 0xFFFFD166 : 0xFF9EF4E2)
+                            : (i == 0 ? 0xFFFF858C : 0xFFB7C4E1), true);
             symbol.setGravity(Gravity.CENTER);
             option.addView(symbol, new LinearLayout.LayoutParams(d(34), d(48)));
             TextView text = label(options.get(i), 15, Color.WHITE, true);
@@ -3077,8 +3275,10 @@ public class MainActivity extends Activity {
             handlers.add(() -> setNodeWatched(node, true));
             actions.add("Marcar como no visto");
             handlers.add(() -> setNodeWatched(node, false));
-            actions.add("Reintentar metadata (TMDb)");
-            handlers.add(() -> retryMetadata(node));
+            if (isAccountAdmin()) {
+                actions.add("Reintentar metadata (TMDb)");
+                handlers.add(() -> retryMetadata(node));
+            }
         }
         if (kind.equals("collection") && node.optBoolean("poster_is_assigned")) {
             boolean showingMosaic = prefs.getBoolean(collectionMosaicKey(node), false);
@@ -3088,8 +3288,11 @@ public class MainActivity extends Activity {
                 refreshPosterCard(node);
             });
         }
-        actions.add("Metadata manual");
-        handlers.add(() -> showMetadataEditor(node, new JSONArray()));
+        if (isAccountAdmin()) {
+            actions.add("Metadata manual");
+            handlers.add(() -> showMetadataEditor(node, new JSONArray()));
+        }
+        if (actions.isEmpty()) return;
         showStyledActionDialog(t("Acciones"), actions, index -> handlers.get(index).run());
     }
 
@@ -3229,7 +3432,7 @@ public class MainActivity extends Activity {
         List<String> actions = new ArrayList<>();
         List<Runnable> handlers = new ArrayList<>();
         String metadataKind = metadataNode.optString("kind", "");
-        if (metadataKind.equals("movie") || metadataKind.equals("series")) {
+        if (isAccountAdmin() && (metadataKind.equals("movie") || metadataKind.equals("series"))) {
             actions.add("Reintentar metadata (TMDb)");
             handlers.add(() -> retryMetadata(metadataNode));
             actions.add("Metadata manual");
@@ -3447,6 +3650,10 @@ public class MainActivity extends Activity {
     }
 
     void retryMetadata(JSONObject node) {
+        if (!isAccountAdmin()) {
+            Toast.makeText(this, t("Solo los administradores pueden modificar los metadatos."), Toast.LENGTH_LONG).show();
+            return;
+        }
         String nodeId = node.optString("id");
         if (nodeId.isEmpty()) return;
         captureMetadataEditorReturnState();
@@ -3474,6 +3681,7 @@ public class MainActivity extends Activity {
     EditText metadataField(String value, String hint, boolean multiline) {
         EditText field = new EditText(this);
         field.setTextColor(Color.WHITE);
+        field.setTypeface(activeProfileTypeface(false));
         field.setHintTextColor(MUTED);
         field.setHint(hint);
         field.setText(cleanDisplayText(value));
@@ -3488,6 +3696,10 @@ public class MainActivity extends Activity {
     }
 
     void showMetadataEditor(JSONObject node, JSONArray candidates) {
+        if (!isAccountAdmin()) {
+            Toast.makeText(this, t("Solo los administradores pueden modificar los metadatos."), Toast.LENGTH_LONG).show();
+            return;
+        }
         if (!metadataEditorReturnPrepared) captureMetadataEditorReturnState();
         showingDetail = false;
         setMetadataEditorChrome(true);
@@ -3907,9 +4119,23 @@ public class MainActivity extends Activity {
     }
 
     void renderDetail(JSONObject node) {
+        if (!isKidAllowedNode(node)) {
+            showingDetail = false;
+            Toast.makeText(this, t("Este contenido no está disponible en un perfil infantil."), Toast.LENGTH_LONG).show();
+            if (libraryMode) openLibrary(currentLibrary); else loadHome();
+            return;
+        }
         showingDetail = true;
         detailNodeId = node.optString("id");
         currentDetailNode = node;
+        if ("series".equals(node.optString("kind")) && isKidAllowedByGenres(node)) {
+            JSONArray seasons = node.optJSONArray("children");
+            if (seasons != null) for (int i = 0; i < seasons.length(); i++) {
+                JSONObject season = seasons.optJSONObject(i);
+                if (season != null && !season.optString("id", "").isEmpty())
+                    kidAllowedSeasonIds.add(season.optString("id"));
+            }
+        }
         if (backButton != null) backButton.setVisibility(View.VISIBLE);
         if (alphabetToggleButton != null) alphabetToggleButton.setVisibility(View.GONE);
         removeAlphabetRail();
@@ -4080,6 +4306,17 @@ public class MainActivity extends Activity {
             case "Cada perfil conserva su lista y su progreso de reproducción.":
                 return "Profil bakoitzak bere zerrenda eta erreprodukzio-aurrerapena gordetzen ditu.";
             case "Perfil actual": return "Uneko profila";
+            case "Perfil infantil": return "Haurren profila";
+            case "Perfil infantil · filtro por género": return "Haurren profila · genero-iragazkia";
+            case "Oculta títulos de Guerra, Crimen, Drama, Terror y Western, salvo los que también incluyan Familia.":
+                return "Gerra, krimen, drama, beldurrezko eta western generoak dituzten tituluak ezkutatzen ditu, Familia ere badutenak izan ezik.";
+            case "Este contenido no está disponible en un perfil infantil.":
+                return "Eduki hau ez dago eskuragarri haurren profilean.";
+            case "Solo los administradores pueden modificar los metadatos.":
+                return "Administratzaileek soilik alda ditzakete metadatuak.";
+            case "Menú de perfil": return "Profilaren menua";
+            case "No hay contenido infantil para esta búsqueda.":
+                return "Ez dago haurrentzako edukirik bilaketa honetarako.";
             case "Vincular este dispositivo": return "Gailu hau lotu";
             case "Introduce la clave del NAS; se guardará una credencial exclusiva para este dispositivo.":
                 return "Sartu NASeko gakoa; gailu honetarako kredentzial esklusibo bat gordeko da.";
@@ -4446,6 +4683,10 @@ public class MainActivity extends Activity {
     }
 
     void playFirst(JSONObject node) {
+        if (!isKidAllowedNode(node)) {
+            Toast.makeText(this, t("Este contenido no está disponible en un perfil infantil."), Toast.LENGTH_LONG).show();
+            return;
+        }
         JSONArray files = node.optJSONArray("files");
         if (files != null && files.length() > 0) {
             JSONObject file = files.optJSONObject(0);
@@ -4460,6 +4701,10 @@ public class MainActivity extends Activity {
     }
 
     void playNextSeriesEpisode(JSONObject seriesNode) {
+        if (!isKidAllowedNode(seriesNode)) {
+            Toast.makeText(this, t("Este contenido no está disponible en un perfil infantil."), Toast.LENGTH_LONG).show();
+            return;
+        }
         JSONArray seasonNodes = seriesNode.optJSONArray("children");
         if (seasonNodes == null || seasonNodes.length() == 0) {
             Toast.makeText(this, "No hay capítulos disponibles.", Toast.LENGTH_SHORT).show();
@@ -4548,9 +4793,13 @@ public class MainActivity extends Activity {
         button.setTextSize(13);
         button.setTextColor(Color.WHITE);
         button.setAllCaps(false);
-        button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        button.setTypeface(activeProfileTypeface(true));
         button.setPadding(d(15), 0, d(15), 0);
-        button.setBackground(round(primary ? RED : 0xCC22252C, d(8)));
+        button.setBackground(isActiveKidProfile()
+                ? gradientRound(primary
+                        ? new int[]{0xFFFF8A5B, 0xFFEC4D91}
+                        : new int[]{0xFF326CB3, 0xFF6653B8}, d(18))
+                : round(primary ? RED : 0xCC22252C, d(8)));
         applyTvFocusStyle(button, false);
         return button;
     }
@@ -4598,13 +4847,13 @@ public class MainActivity extends Activity {
             try {
                 JSONArray results = getArray("/api/v1/search?q=" + enc(query.trim()) + "&limit=100");
                 runOnUiThread(() -> {
+                    List<JSONObject> visibleResults = filterKidCatalog(toList(results));
                     content.removeAllViews();
-                    addSectionHeader("Resultados", results.length() + " encontrados");
-                    for (int i = 0; i < results.length(); i++) {
-                        JSONObject result = results.optJSONObject(i);
-                        if (result != null) addSearchResult(result);
-                    }
-                    if (results.length() == 0) addEmpty("No encontramos resultados para “" + query + "”.");
+                    addSectionHeader("Resultados", visibleResults.size() + " encontrados");
+                    for (JSONObject result : visibleResults) addSearchResult(result);
+                    if (visibleResults.isEmpty()) addEmpty(isActiveKidProfile()
+                            ? t("No hay contenido infantil para esta búsqueda.")
+                            : "No encontramos resultados para “" + query + "”.");
                     restoreListingScrollIfPending();
                 });
             } catch (Exception e) { runOnUiThread(() -> renderError(e.getMessage())); }
@@ -5885,6 +6134,20 @@ public class MainActivity extends Activity {
 
     void launchPlayer(String path, String title, String posterUrl,
                       String ownerNodeId, String mediaId, String ownerKind) {
+        if (isActiveKidProfile()) {
+            JSONObject owner = findCatalogNodeById(ownerNodeId, movies);
+            if (owner == null) owner = findCatalogNodeById(ownerNodeId, series);
+            if (owner != null && !isKidAllowedNode(owner)) {
+                Toast.makeText(this, t("Este contenido no está disponible en un perfil infantil."), Toast.LENGTH_LONG).show();
+                return;
+            }
+            boolean allowedSeason = owner == null && "season".equals(ownerKind)
+                    && kidAllowedSeasonIds.contains(ownerNodeId);
+            if (owner == null && !allowedSeason) {
+                Toast.makeText(this, t("Este contenido no está disponible en un perfil infantil."), Toast.LENGTH_LONG).show();
+                return;
+            }
+        }
         if (path == null || path.isEmpty()) return;
         String itemId = mediaId == null ? "" : mediaId;
         if (itemId.isEmpty()) {
