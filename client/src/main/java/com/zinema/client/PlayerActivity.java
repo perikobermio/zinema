@@ -27,6 +27,8 @@ public class PlayerActivity extends Activity {
     private String ownerNodeId;
     private String mediaId;
     private String ownerKind;
+    private String seriesId;
+    private int seasonNumber;
     private String progressKey;
     private String profileId;
     private VideoView videoView;
@@ -58,6 +60,8 @@ public class PlayerActivity extends Activity {
         ownerNodeId = getIntent().getStringExtra("owner_node_id");
         mediaId = getIntent().getStringExtra("media_id");
         ownerKind = getIntent().getStringExtra("owner_kind");
+        seriesId = getIntent().getStringExtra("series_id");
+        seasonNumber = getIntent().getIntExtra("season_number", 0);
         progressKey = getIntent().getStringExtra("progress_key");
         profileId = getIntent().getStringExtra("profile_id");
         String nextRaw = getIntent().getStringExtra("next_episode_json");
@@ -256,6 +260,8 @@ public class PlayerActivity extends Activity {
             item.put("node_id", ownerNodeId == null ? "" : ownerNodeId);
             item.put("media_id", mediaId == null ? "" : mediaId);
             item.put("owner_kind", ownerKind == null ? "" : ownerKind);
+            item.put("series_id", seriesId == null ? "" : seriesId);
+            item.put("season_number", seasonNumber);
             item.put("position", (int) Math.min(Integer.MAX_VALUE, position));
             item.put("updated", System.currentTimeMillis());
             getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
@@ -265,7 +271,7 @@ public class PlayerActivity extends Activity {
     }
 
     private boolean isComplete(long position, long duration) {
-        return duration > 0L && position >= duration * 0.95d;
+        return duration > 0L && position >= duration * 0.90d;
     }
 
     private void markCompleted() {
@@ -279,8 +285,32 @@ public class PlayerActivity extends Activity {
                     .putString("completed_kind:" + profileId, ownerKind == null ? "" : ownerKind);
             if ("movie".equals(ownerKind) && ownerNodeId != null && !ownerNodeId.isEmpty())
                 editor.putBoolean("p:" + profileId + ":seen:node:" + ownerNodeId, true);
-            if (nextEpisode != null) editor.putString("next_episode:" + profileId, nextEpisode.toString());
-            else if ("season".equals(ownerKind)) editor.remove("next_episode:" + profileId);
+            if ("season".equals(ownerKind) && seriesId != null && !seriesId.isEmpty()) {
+                String seriesSuggestionKey = "series_next_episode:" + profileId + ":" + seriesId;
+                if (nextEpisode != null) {
+                    try {
+                        JSONObject suggestion = new JSONObject(nextEpisode.toString());
+                        suggestion.put("series_id", seriesId);
+                        suggestion.put("suggestion_type", ownerNodeId != null
+                                && ownerNodeId.equals(suggestion.optString("owner_node_id"))
+                                ? "next_episode" : "next_season");
+                        suggestion.put("updated", System.currentTimeMillis());
+                        editor.putString(seriesSuggestionKey, suggestion.toString())
+                                .putString("next_episode:" + profileId, suggestion.toString());
+                    } catch (Exception ignored) { }
+                } else {
+                    editor.remove(seriesSuggestionKey);
+                    String oldSuggestion = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE)
+                            .getString("next_episode:" + profileId, "");
+                    try {
+                        if (!oldSuggestion.isEmpty()
+                                && seriesId.equals(new JSONObject(oldSuggestion).optString("series_id")))
+                            editor.remove("next_episode:" + profileId);
+                    } catch (Exception ignored) { }
+                }
+            } else if (nextEpisode != null) {
+                editor.putString("next_episode:" + profileId, nextEpisode.toString());
+            }
         }
         editor.apply();
         markProfileStateDirty();

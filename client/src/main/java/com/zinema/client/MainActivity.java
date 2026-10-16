@@ -130,6 +130,7 @@ public class MainActivity extends Activity {
     String selectedSection = "home";
     String lastSearchQuery;
     String detailNodeId = "";
+    JSONObject currentDetailNode;
     String catalogVersion = "";
     int detailReturnScrollY;
     int pendingListingRestoreY = -1;
@@ -141,6 +142,7 @@ public class MainActivity extends Activity {
     boolean profileStateSyncPending;
     boolean hasResumedOnce;
     boolean playerLaunched;
+    boolean seriesSuggestionBackfillRunning;
     boolean libraryMode;
     boolean showingDetail;
     boolean showingAdmin;
@@ -2024,9 +2026,35 @@ public class MainActivity extends Activity {
         refreshProfileChip();
         content.removeAllViews();
         List<JSONObject> resume = readContinueWatching();
-        if (!resume.isEmpty()) addResumeRow("Seguir viendo", resume);
-        JSONObject nextEpisode = readNextEpisode();
-        if (nextEpisode != null) addResumeRow("Siguiente capítulo", Collections.singletonList(nextEpisode));
+        List<JSONObject> continueItems = new ArrayList<>();
+        Set<String> includedSeries = new HashSet<>();
+        Set<String> includedStreams = new HashSet<>();
+        for (JSONObject item : resume) {
+            JSONObject card = decorateResumeItem(item, false);
+            String stream = item.optString("stream", item.optString("path", ""));
+            String seriesId = card.optString("series_id", "");
+            if (!stream.isEmpty() && !includedStreams.add(stream)) continue;
+            if (!seriesId.isEmpty() && !includedSeries.add(seriesId)) continue;
+            continueItems.add(card);
+        }
+        List<JSONObject> suggestions = readSeriesNextEpisodes();
+        JSONObject legacyNext = readNextEpisode();
+        if (legacyNext != null) suggestions.add(legacyNext);
+        for (JSONObject suggestion : suggestions) {
+            String stream = suggestion.optString("stream", suggestion.optString("stream_url", ""));
+            String mediaId = suggestion.optString("media_id", suggestion.optString("id", ""));
+            JSONObject card = decorateResumeItem(suggestion, true);
+            String seriesId = card.optString("series_id", "");
+            if ((!stream.isEmpty() && includedStreams.contains(stream))
+                    || (!seriesId.isEmpty() && includedSeries.contains(seriesId))
+                    || (!mediaId.isEmpty() && isMediaSeen(suggestion))) continue;
+            continueItems.add(card);
+            if (!stream.isEmpty()) includedStreams.add(stream);
+            if (!seriesId.isEmpty()) includedSeries.add(seriesId);
+        }
+        Collections.sort(continueItems, (a, b) -> Long.compare(
+                resumeItemUpdated(b), resumeItemUpdated(a)));
+        if (!continueItems.isEmpty()) addResumeRow("Seguir viendo", continueItems);
         List<JSONObject> favorites = readFavorites();
         if (!favorites.isEmpty()) addRow("Mi lista", favorites);
         addRow("Películas", movies);
@@ -2037,6 +2065,204 @@ public class MainActivity extends Activity {
             content.addView(empty);
         }
         restoreListingScrollIfPending();
+        backfillMissingSeriesSuggestions();
+    }
+
+    long resumeItemUpdated(JSONObject item) {
+        return item.optLong("updated", item.optLong("suggested_at", 0L));
+    }
+
+    void backfillMissingSeriesSuggestions() {
+        String profileId = activeProfileId();
+        if (profileId.isEmpty() || seriesSuggestionBackfillRunning) return;
+        String timestampKey = "series_suggestion_backfill_v2_ms:" + profileId;
+        if (System.currentTimeMillis() - prefs.getLong(timestampKey, 0L) < 5 * 60 * 1000L) return;
+        List<JSONObject> allSeries = new ArrayList<>();
+        for (JSONObject root : series) collectSeriesNodes(root, allSeries);
+        if (allSeries.isEmpty()) return;
+        Set<String> seenFileIds = new HashSet<>();
+        String seenPrefix = "p:" + profileId + ":seen:file:";
+        for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
+            if (entry.getKey().startsWith(seenPrefix) && Boolean.TRUE.equals(entry.getValue()))
+                seenFileIds.add(entry.getKey().substring(seenPrefix.length()));
+        }
+        if (seenFileIds.isEmpty()) return;
+        seriesSuggestionBackfillRunning = true;
+        io.execute(() -> {
+            boolean succeeded = false;
+            boolean checked = false;
+            try {
+                Set<String> startedSeriesIds = new HashSet<>();
+                int offset = 0;
+                JSONArray catalogItems;
+                do {
+                    catalogItems = getArray("/api/v1/items?limit=500&offset=" + offset);
+                    for (int i = 0; i < catalogItems.length(); i++) {
+                        JSONObject file = catalogItems.optJSONObject(i);
+                        if (file != null && seenFileIds.contains(file.optString("id"))) {
+                            String id = file.optString("series_id", "");
+                            if (!id.isEmpty() && !"null".equals(id)) startedSeriesIds.add(id);
+                        }
+                    }
+                    offset += catalogItems.length();
+                    checked = true;
+                } while (catalogItems.length() == 500);
+                for (JSONObject summary : allSeries) {
+                    String seriesId = summary.optString("id", "");
+                    if (seriesId.isEmpty() || !startedSeriesIds.contains(seriesId)) continue;
+                    String suggestionKey = "series_next_episode:" + profileId + ":" + seriesId;
+                    JSONObject fullSeries = getJson("/api/v1/catalog/" + enc(seriesId));
+                    checked = true;
+                    List<JSONObject> seasons = toList(fullSeries.optJSONArray("children"));
+                    Collections.sort(seasons, Comparator.comparingInt(value -> value.optInt("season_number")));
+                    boolean hasActiveEpisode = false;
+                    int lastSeenIndex = -1;
+                    List<JSONObject> orderedFiles = new ArrayList<>();
+                    List<JSONObject> orderedSeasons = new ArrayList<>();
+                    for (JSONObject seasonSummary : seasons) {
+                        String seasonId = seasonSummary.optString("id", "");
+                        if (seasonId.isEmpty()) continue;
+                        JSONObject fullSeason = getJson("/api/v1/catalog/" + enc(seasonId));
+                        JSONArray files = fullSeason.optJSONArray("files");
+                        if (files == null) continue;
+                        for (int i = 0; i < files.length(); i++) {
+                            JSONObject file = files.optJSONObject(i);
+                            if (file == null) continue;
+                            orderedFiles.add(file);
+                            orderedSeasons.add(fullSeason);
+                            int episodeIndex = orderedFiles.size() - 1;
+                            if (isMediaSeen(file)) {
+                                lastSeenIndex = episodeIndex;
+                            } else {
+                                long position = mediaProgressPosition(file);
+                                if (position > 10000L) hasActiveEpisode = true;
+                            }
+                        }
+                    }
+                    if (hasActiveEpisode) continue;
+                    int nextIndex = lastSeenIndex + 1;
+                    if (lastSeenIndex < 0 || nextIndex >= orderedFiles.size()) {
+                        SharedPreferences.Editor editor = prefs.edit().remove(suggestionKey);
+                        String global = prefs.getString("next_episode:" + profileId, "");
+                        try {
+                            if (!global.isEmpty() && seriesId.equals(new JSONObject(global).optString("series_id")))
+                                editor.remove("next_episode:" + profileId);
+                        } catch (JSONException ignored) { }
+                        editor.apply();
+                        continue;
+                    }
+                    JSONObject nextFile = orderedFiles.get(nextIndex);
+                    JSONObject nextSeason = orderedSeasons.get(nextIndex);
+                    JSONObject lastSeenSeason = orderedSeasons.get(lastSeenIndex);
+                    JSONObject suggestion = nextEpisodePayload(nextFile, nextSeason);
+                    if (suggestion == null) continue;
+                    suggestion.put("series_id", seriesId);
+                    suggestion.put("suggestion_type", !lastSeenSeason.optString("id").equals(nextSeason.optString("id"))
+                            ? "next_season" : "next_episode");
+                    String existing = prefs.getString(suggestionKey, "");
+                    long suggestionTime = System.currentTimeMillis();
+                    try {
+                        JSONObject previous = new JSONObject(existing);
+                        if (nextFile.optString("id").equals(previous.optString("media_id")))
+                            suggestionTime = previous.optLong("updated", suggestionTime);
+                    } catch (JSONException ignored) { }
+                    suggestion.put("updated", suggestionTime);
+                    prefs.edit().putString(suggestionKey, suggestion.toString())
+                            .putString("next_episode:" + profileId, suggestion.toString()).apply();
+                    succeeded = true;
+                }
+            } catch (Exception ignored) { }
+            if (checked) prefs.edit().putLong(timestampKey, System.currentTimeMillis()).apply();
+            seriesSuggestionBackfillRunning = false;
+            if (succeeded) runOnUiThread(() -> {
+                if ("home".equals(selectedSection) && !showingDetail && !showingAdmin)
+                    renderHome();
+            });
+        });
+    }
+
+    void collectSeriesNodes(JSONObject node, List<JSONObject> output) {
+        if (node == null) return;
+        if ("series".equals(node.optString("kind"))) {
+            output.add(node);
+            return;
+        }
+        JSONArray children = node.optJSONArray("children");
+        if (children == null) return;
+        for (int i = 0; i < children.length(); i++) collectSeriesNodes(children.optJSONObject(i), output);
+    }
+
+    JSONObject decorateResumeItem(JSONObject item, boolean nextEpisode) {
+        JSONObject decorated;
+        try { decorated = new JSONObject(item.toString()); }
+        catch (JSONException ignored) { decorated = new JSONObject(); }
+        String seasonId = item.optString("owner_node_id", item.optString("node_id", ""));
+        JSONObject seriesNode = findSeriesForSeason(seasonId);
+        if (seriesNode != null) {
+            try {
+                if (decorated.optString("series_id", "").isEmpty())
+                    decorated.put("series_id", seriesNode.optString("id", ""));
+                decorated.put("series_title", displayTitle(seriesNode));
+                decorated.put("series_poster_url", posterField(seriesNode, "poster_url"));
+                decorated.put("episode_title", item.optString("title", ""));
+                JSONObject seasonNode = findSeasonNode(seriesNode, seasonId);
+                if (seasonNode != null)
+                    decorated.put("season_poster_url", posterField(seasonNode, "poster_url"));
+            } catch (JSONException ignored) { }
+        }
+        if (decorated.optString("episode_title", "").isEmpty()) {
+            try { decorated.put("episode_title", item.optString("title", "")); }
+            catch (JSONException ignored) { }
+        }
+        try { decorated.put("next_episode_row", nextEpisode); }
+        catch (JSONException ignored) { }
+        return decorated;
+    }
+
+    String posterField(JSONObject node, String key) {
+        String value = node == null ? "" : node.optString(key, "").trim();
+        return "null".equalsIgnoreCase(value) ? "" : value;
+    }
+
+    JSONObject findSeasonNode(JSONObject seriesNode, String seasonId) {
+        JSONArray seasons = seriesNode == null ? null : seriesNode.optJSONArray("children");
+        if (seasons == null) return null;
+        for (int i = 0; i < seasons.length(); i++) {
+            JSONObject season = seasons.optJSONObject(i);
+            if (season != null && seasonId.equals(season.optString("id", ""))) return season;
+        }
+        return null;
+    }
+
+    JSONObject findSeriesForSeason(String seasonId) {
+        if (seasonId.isEmpty()) return null;
+        for (JSONObject root : series) {
+            JSONObject match = findSeriesForSeason(root, seasonId);
+            if (match != null) return match;
+        }
+        return null;
+    }
+
+    JSONObject findSeriesForSeason(JSONObject node, String seasonId) {
+        if ("series".equals(node.optString("kind"))) {
+            JSONArray seasons = node.optJSONArray("children");
+            if (seasons != null) {
+                for (int i = 0; i < seasons.length(); i++) {
+                    JSONObject season = seasons.optJSONObject(i);
+                    if (season != null && seasonId.equals(season.optString("id"))) return node;
+                }
+            }
+            return null;
+        }
+        JSONArray children = node.optJSONArray("children");
+        if (children == null) return null;
+        for (int i = 0; i < children.length(); i++) {
+            JSONObject child = children.optJSONObject(i);
+            if (child == null) continue;
+            JSONObject found = findSeriesForSeason(child, seasonId);
+            if (found != null) return found;
+        }
+        return null;
     }
 
     void cachePosterByStream(JSONArray items) {
@@ -2279,8 +2505,15 @@ public class MainActivity extends Activity {
     }
 
     void loadImage(String path, ImageView target, boolean backdrop) {
+        loadImage(path, target, backdrop, "");
+    }
+
+    void loadImage(String path, ImageView target, boolean backdrop, String fallbackPath) {
         if (path == null || path.trim().isEmpty() || "null".equalsIgnoreCase(path.trim())) {
-            target.setBackground(round(PANEL, d(8)));
+            if (fallbackPath != null && !fallbackPath.trim().isEmpty()
+                    && !"null".equalsIgnoreCase(fallbackPath.trim()))
+                loadImage(fallbackPath, target, backdrop, "");
+            else target.setBackground(round(PANEL, d(8)));
             return;
         }
         String url = path.startsWith("http") ? path : server + (path.startsWith("/") ? path : "/" + path);
@@ -2311,10 +2544,15 @@ public class MainActivity extends Activity {
             Bitmap result = bitmap;
             runOnUiThread(() -> {
                 List<ImageView> targets = pendingImageTargets.remove(url);
+                if (targets == null) return;
                 if (result != null) imageCache.put(url, result);
-                if (targets == null || result == null) return;
                 for (ImageView image : targets) {
-                    if (url.equals(image.getTag())) image.setImageBitmap(result);
+                    if (!url.equals(image.getTag())) continue;
+                    if (result != null) image.setImageBitmap(result);
+                    else if (fallbackPath != null && !fallbackPath.isEmpty()
+                            && !fallbackPath.equals(path))
+                        loadImage(fallbackPath, image, backdrop, "");
+                    else image.setBackground(round(PANEL, d(8)));
                 }
             });
         });
@@ -2879,6 +3117,15 @@ public class MainActivity extends Activity {
         loadVisibleLazyRows();
     }
 
+    void refreshWatchedDisplay(JSONObject node) {
+        if (showingDetail && currentDetailNode != null
+                && detailNodeId.equals(currentDetailNode.optString("id", ""))) {
+            renderDetail(currentDetailNode);
+            return;
+        }
+        refreshPosterCard(node);
+    }
+
     View findTaggedView(View view, String tag) {
         if (tag.equals(view.getTag())) return view;
         if (view instanceof ViewGroup) {
@@ -2916,7 +3163,7 @@ public class MainActivity extends Activity {
         if (id.isEmpty()) return;
         setNodeSeen(id, seen);
         removeContinueForNode(id);
-        refreshPosterCard(node);
+        refreshWatchedDisplay(node);
         io.execute(() -> {
             try {
                 JSONObject full = getJson("/api/v1/catalog/" + enc(id));
@@ -3003,6 +3250,7 @@ public class MainActivity extends Activity {
         scheduleProfileStateSync();
         if ("movie".equals(owner.optString("kind"))) setNodeSeen(owner.optString("id"), seen);
         if ("season".equals(owner.optString("kind"))) {
+            if (seen) updateSeriesSuggestionAfterManualWatch();
             if (owner.optJSONArray("files") != null) refreshSeasonSeen(owner);
             else io.execute(() -> {
                 try {
@@ -3012,8 +3260,15 @@ public class MainActivity extends Activity {
             });
         }
         else refreshParentOfNode(owner.optString("id", ""));
-        refreshPosterCard(owner);
+        refreshWatchedDisplay(owner);
         Toast.makeText(this, seen ? "Marcado como visto" : "Marcado como no visto", Toast.LENGTH_SHORT).show();
+    }
+
+    void updateSeriesSuggestionAfterManualWatch() {
+        String profileId = activeProfileId();
+        if (profileId.isEmpty()) return;
+        prefs.edit().remove("series_suggestion_backfill_v2_ms:" + profileId).apply();
+        backfillMissingSeriesSuggestions();
     }
 
     void refreshSeasonSeen(JSONObject season) {
@@ -3067,16 +3322,67 @@ public class MainActivity extends Activity {
     }
 
     void showResumeActions(JSONObject item) {
-        List<String> actions = java.util.Arrays.asList("Marcar como visto", "Marcar como no visto", "Quitar de Seguir viendo");
+        List<String> actions = java.util.Arrays.asList(
+                "Marcar como visto", "Marcar como no visto", "Quitar de Seguir viendo", t("Ir al detalle"));
         showStyledActionDialog(t("Acciones"), actions, which -> {
                     if (which == 0) setResumeSeen(item, true);
                     else if (which == 1) setResumeSeen(item, false);
+                    else if (which == 3) {
+                        openResumeDetail(item);
+                        return;
+                    }
                     else {
                         prefs.edit().remove(watchKey(item.optString("path", item.optString("stream")))).apply();
                         scheduleProfileStateSync();
                     }
                     removeResumeCard(item);
                 });
+    }
+
+    void openResumeDetail(JSONObject item) {
+        String ownerKind = item.optString("owner_kind", "");
+        String nodeId = item.optString("owner_node_id", item.optString("node_id", ""));
+        String kind = ownerKind;
+        if ("season".equals(ownerKind)) {
+            nodeId = item.optString("series_id", "");
+            if (nodeId.isEmpty()) {
+                JSONObject ownerSeries = findSeriesForSeason(item.optString("owner_node_id", ""));
+                if (ownerSeries != null) nodeId = ownerSeries.optString("id", "");
+            }
+            kind = "series";
+        }
+        if (nodeId.isEmpty()) {
+            Toast.makeText(this, "No se encontró el detalle de este elemento.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        JSONObject node = findCatalogNodeById(nodeId, movies);
+        if (node == null) node = findCatalogNodeById(nodeId, series);
+        if (node == null) node = new JSONObject();
+        try {
+            node.put("id", nodeId);
+            if (node.optString("kind", "").isEmpty()) node.put("kind", kind);
+        } catch (JSONException ignored) { }
+        openNode(node);
+    }
+
+    JSONObject findCatalogNodeById(String id, List<JSONObject> roots) {
+        for (JSONObject root : roots) {
+            JSONObject found = findCatalogNodeById(id, root);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    JSONObject findCatalogNodeById(String id, JSONObject node) {
+        if (node == null) return null;
+        if (id.equals(node.optString("id", ""))) return node;
+        JSONArray children = node.optJSONArray("children");
+        if (children == null) return null;
+        for (int i = 0; i < children.length(); i++) {
+            JSONObject found = findCatalogNodeById(id, children.optJSONObject(i));
+            if (found != null) return found;
+        }
+        return null;
     }
 
     void removeResumeCard(JSONObject item) {
@@ -3603,20 +3909,24 @@ public class MainActivity extends Activity {
     void renderDetail(JSONObject node) {
         showingDetail = true;
         detailNodeId = node.optString("id");
+        currentDetailNode = node;
         if (backButton != null) backButton.setVisibility(View.VISIBLE);
         if (alphabetToggleButton != null) alphabetToggleButton.setVisibility(View.GONE);
         removeAlphabetRail();
         content.setPadding(0, 0, 0, d(28));
         content.removeAllViews();
+        if (contentScroller != null) contentScroller.scrollTo(0, 0);
         FrameLayout banner = new FrameLayout(this);
         ImageView bgImage = new ImageView(this);
         bgImage.setScaleType(ImageView.ScaleType.CENTER_CROP);
         banner.addView(bgImage, new FrameLayout.LayoutParams(-1, -1));
-        String detailBackdrop = node.optString("backdrop_url", "");
-        if (detailBackdrop.isEmpty() || "null".equalsIgnoreCase(detailBackdrop))
-            detailBackdrop = node.optString("poster_url", "");
-        if ("null".equalsIgnoreCase(detailBackdrop)) detailBackdrop = "";
-        loadImage(detailBackdrop, bgImage, true);
+        String detailPoster = posterField(node, "poster_url");
+        String detailBackdrop = posterField(node, "backdrop_url");
+        boolean seriesDetail = "series".equals(node.optString("kind"));
+        String detailImage = seriesDetail ? detailPoster : detailBackdrop;
+        String detailFallback = seriesDetail ? detailBackdrop : detailPoster;
+        if (detailImage.isEmpty()) detailImage = detailFallback;
+        loadImage(detailImage, bgImage, true, detailFallback);
         View shade = new View(this);
         shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
                 new int[]{BG, 0xCC090A0D, 0x22090A0D}));
@@ -3673,16 +3983,23 @@ public class MainActivity extends Activity {
         });
         banner.addView(info, new FrameLayout.LayoutParams(-1, -1));
         banner.setOnLongClickListener(v -> { showActions(node); return true; });
-        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(-1, d(390));
-        bp.setMargins(0, d(10), 0, d(10));
+        int heroHeight = contentScroller == null ? 0 : contentScroller.getHeight();
+        if (heroHeight <= 0)
+            heroHeight = getResources().getDisplayMetrics().heightPixels - d(116);
+        heroHeight = Math.max(d(390), heroHeight);
+        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(-1, heroHeight);
+        bp.setMargins(0, 0, 0, d(10));
         content.addView(banner, bp);
 
-        if ("movie".equals(node.optString("kind")) || "series".equals(node.optString("kind"))) {
-            addCastSection(node.optJSONArray("cast"));
-        }
         JSONArray children = node.optJSONArray("children");
-        if (children != null && children.length() > 0) {
-            addSectionHeader(node.optString("kind").equals("series") ? "Temporadas" : "Explorar", "Selecciona para continuar");
+        if ("series".equals(node.optString("kind")) && children != null && children.length() > 0) {
+            addSectionHeader("Temporadas", "Selecciona para continuar");
+            addGrid(toList(children));
+        }
+        if ("movie".equals(node.optString("kind")) || "series".equals(node.optString("kind")))
+            addCastSection(node.optJSONArray("cast"));
+        if (!"series".equals(node.optString("kind")) && children != null && children.length() > 0) {
+            addSectionHeader("Explorar", "Selecciona para continuar");
             addGrid(toList(children));
         }
         if (files != null && files.length() > 0) {
@@ -3833,6 +4150,12 @@ public class MainActivity extends Activity {
             case "títulos": return "izenburu";
             case "VISTO": return "IKUSITA";
             case "CONTINUAR": return "JARRAITU";
+            case "SIGUIENTE CAPÍTULO": return "HURRENGO ATALA";
+            case "EMPEZAR SIGUIENTE TEMPORADA": return "HASI HURRENGO DENBORALDIA";
+            case "CONTINUAR CAPÍTULO": return "ATALA IKUSTEN JARRAITU";
+            case "CONTINUAR PELÍCULA": return "FILMA IKUSTEN JARRAITU";
+            case "Ir al detalle": return "Joan xehetasunera";
+            case "Capítulo": return "Atala";
             case "Tu biblioteca está vacía. Sincroniza el catálogo en el servidor.":
                 return "Zure liburutegia hutsik dago. Sinkronizatu katalogoa zerbitzarian.";
             case "Explora tu biblioteca": return "Arakatu zure liburutegia";
@@ -4069,8 +4392,12 @@ public class MainActivity extends Activity {
             if (file == null) continue;
             LinearLayout item = new LinearLayout(this);
             item.setGravity(Gravity.CENTER_VERTICAL);
-            item.setPadding(d(18), d(13), d(18), d(13));
-            item.setBackground(round(PANEL, d(10)));
+            item.setPadding(d(12), d(9), d(12), d(9));
+            GradientDrawable episodeRowBackground = new GradientDrawable(
+                    GradientDrawable.Orientation.LEFT_RIGHT,
+                    new int[]{0xFF202838, 0xFF191D29});
+            episodeRowBackground.setCornerRadius(d(13));
+            item.setBackground(episodeRowBackground);
             item.setFocusable(true);
             item.setClickable(true);
             applyTvFocusStyle(item, true);
@@ -4079,15 +4406,16 @@ public class MainActivity extends Activity {
             thumbnail.setBackground(round(0xFF202534, d(8)));
             String episodePoster = file.optString("poster_url", fallbackPoster);
             loadImage(episodePoster, thumbnail, false);
-            LinearLayout.LayoutParams thumbParams = new LinearLayout.LayoutParams(d(128), d(72));
-            thumbParams.rightMargin = d(14);
+            LinearLayout.LayoutParams thumbParams = new LinearLayout.LayoutParams(d(150), d(84));
+            thumbParams.rightMargin = d(22);
             item.addView(thumbnail, thumbParams);
             TextView play = label("▶", 20, Color.WHITE, true);
             play.setGravity(Gravity.CENTER);
             play.setVisibility(View.GONE);
             LinearLayout texts = new LinearLayout(this);
             texts.setOrientation(LinearLayout.VERTICAL);
-            TextView name = labelRaw(file.optString("title", "Vídeo"), 15, Color.WHITE, true);
+            TextView name = labelRaw((i + 1) + ". " + file.optString("title", "Vídeo"),
+                    16, Color.WHITE, true);
             boolean watchedEpisode = isMediaSeen(file);
             long position = mediaProgressPosition(file);
             boolean inProgress = !watchedEpisode && position > 10000L;
@@ -5416,6 +5744,24 @@ public class MainActivity extends Activity {
     }
 
     String nextEpisodeKey() { return "next_episode:" + activeProfileId(); }
+    String seriesNextEpisodePrefix() { return "series_next_episode:" + activeProfileId() + ":"; }
+    String seriesNextEpisodeKey(String seriesId) { return seriesNextEpisodePrefix() + seriesId; }
+
+    List<JSONObject> readSeriesNextEpisodes() {
+        List<JSONObject> list = new ArrayList<>();
+        String prefix = seriesNextEpisodePrefix();
+        for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
+            if (!entry.getKey().startsWith(prefix)) continue;
+            try {
+                JSONObject item = new JSONObject(String.valueOf(entry.getValue()));
+                String mediaId = item.optString("media_id", item.optString("id", ""));
+                if (!mediaId.isEmpty() && isMediaSeen(item)) continue;
+                list.add(item);
+            } catch (JSONException ignored) { }
+        }
+        Collections.sort(list, Comparator.comparingInt(value -> value.optInt("season_number")));
+        return list;
+    }
 
     JSONObject readNextEpisode() {
         try {
@@ -5426,7 +5772,6 @@ public class MainActivity extends Activity {
     }
 
     void addResumeRow(String title, List<JSONObject> items) {
-        boolean nextEpisodeRow = "Siguiente capítulo".equals(title);
         LinearLayout section = new LinearLayout(this);
         section.setOrientation(LinearLayout.VERTICAL);
         TextView heading = label(title, 22, Color.WHITE, true);
@@ -5441,6 +5786,7 @@ public class MainActivity extends Activity {
         cards.setClipChildren(false);
         cards.setPadding(d(16), 0, d(16), d(8));
         for (JSONObject item : items) {
+            boolean nextEpisodeRow = item.optBoolean("next_episode_row", false);
             FrameLayout card = new FrameLayout(this);
             card.setBackground(round(PANEL, d(12)));
             card.setClipToOutline(true);
@@ -5459,21 +5805,51 @@ public class MainActivity extends Activity {
             details.setOrientation(LinearLayout.VERTICAL);
             details.setGravity(Gravity.BOTTOM);
             details.setPadding(d(14), d(12), d(14), d(12));
-            details.addView(label(nextEpisodeRow ? "▶  " + t("SIGUIENTE CAPÍTULO")
-                            : "▶  " + t("CONTINUAR") + " · " + formatTime(item.optInt("position")),
+            String actionLabel;
+            if (nextEpisodeRow) {
+                actionLabel = "next_season".equals(item.optString("suggestion_type"))
+                        ? "▶  " + t("EMPEZAR SIGUIENTE TEMPORADA")
+                        : "▶  " + t("SIGUIENTE CAPÍTULO");
+            } else {
+                actionLabel = "season".equals(item.optString("owner_kind"))
+                        ? "▶  " + t("CONTINUAR CAPÍTULO") + " · " + formatTime(item.optInt("position"))
+                        : "▶  " + t("CONTINUAR PELÍCULA") + " · " + formatTime(item.optInt("position"));
+            }
+            details.addView(label(actionLabel,
                     10, 0xFFFF858A, true));
-            TextView name = labelRaw(item.optString("title", "Vídeo"), 14, Color.WHITE, true);
+            String cardTitle = item.optString("series_title", item.optString("title", "Vídeo"));
+            TextView name = labelRaw(cardTitle, 14, Color.WHITE, true);
             name.setMaxLines(2);
             LinearLayout.LayoutParams nameParams = new LinearLayout.LayoutParams(-1, -2);
             nameParams.topMargin = d(5);
             details.addView(name, nameParams);
+            String episodeTitle = item.optString("episode_title", "");
+            if (!episodeTitle.isEmpty() && !episodeTitle.equals(cardTitle)) {
+                TextView episode = labelRaw(episodeTitle, 12, 0xFFD4D7E0, false);
+                episode.setMaxLines(1);
+                episode.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                details.addView(episode);
+            }
+            String episodeMarker = "";
+            int markerSeason = item.optInt("season_number");
+            int markerEpisode = item.optInt("episode_number");
+            if (markerSeason > 0 && markerEpisode > 0)
+                episodeMarker = t("Temporada") + " " + markerSeason + " · " + t("Capítulo") + " " + markerEpisode;
+            else if (markerSeason > 0) episodeMarker = t("Temporada") + " " + markerSeason;
+            if (!episodeMarker.isEmpty()) details.addView(labelRaw(episodeMarker, 11, 0xFFB8BEC9, false));
             card.addView(details, new FrameLayout.LayoutParams(-1, -1));
-            String cover = item.optString("poster_url", "");
-            if (cover.isEmpty()) cover = posterByStream.get(item.optString("stream", ""));
+            boolean nextSeasonRow = nextEpisodeRow && "next_season".equals(item.optString("suggestion_type"));
+            String cover = nextSeasonRow ? posterField(item, "season_poster_url")
+                    : posterField(item, "poster_url");
+            if (cover.isEmpty() && !nextSeasonRow)
+                cover = posterByStream.get(item.optString("stream", ""));
+            if (cover.isEmpty()) cover = nextSeasonRow ? posterField(item, "series_poster_url")
+                    : posterField(item, "season_poster_url");
+            if (cover.isEmpty() && !nextSeasonRow) cover = posterField(item, "series_poster_url");
             String resumePoster = cover == null ? "" : cover;
             showPoster(resumePoster, poster, true);
             card.setOnClickListener(v -> {
-                if (nextEpisodeRow) prefs.edit().remove(nextEpisodeKey())
+                if (nextEpisodeRow) prefs.edit()
                         .remove(watchKey(item.optString("stream"))).apply();
                 launchPlayer(item.optString("stream"),
                     item.optString("title", "Zinema"), resumePoster,
@@ -5534,8 +5910,20 @@ public class MainActivity extends Activity {
             try {
                 JSONObject ticket = postJson("/api/v1/items/" + enc(resolvedItemId) + "/playback-ticket");
                 JSONObject nextEpisode = null;
+                String seriesId = "";
+                int seasonNumber = 0;
                 if ("season".equals(ownerKind) && ownerNodeId != null && !ownerNodeId.isEmpty()) {
-                    try { nextEpisode = findNextEpisode(ownerNodeId, resolvedItemId); }
+                    try {
+                        JSONObject playingSeason = getJson("/api/v1/catalog/" + enc(ownerNodeId));
+                        seriesId = playingSeason.optString("parent_id", "");
+                        seasonNumber = playingSeason.optInt("season_number");
+                        nextEpisode = findNextEpisode(ownerNodeId, resolvedItemId);
+                        if (nextEpisode != null && !seriesId.isEmpty()) {
+                            nextEpisode.put("series_id", seriesId);
+                            nextEpisode.put("suggestion_type", ownerNodeId.equals(nextEpisode.optString("owner_node_id"))
+                                    ? "next_episode" : "next_season");
+                        }
+                    }
                     catch (Exception ignored) { }
                 }
                 String ticketPath = ticket.optString("url", "");
@@ -5543,8 +5931,11 @@ public class MainActivity extends Activity {
                 String url = ticketPath.startsWith("http") ? ticketPath
                         : server + (ticketPath.startsWith("/") ? ticketPath : "/" + ticketPath);
                 String nextEpisodeJson = nextEpisode == null ? "" : nextEpisode.toString();
+                String playingSeriesId = seriesId;
+                int playingSeasonNumber = seasonNumber;
                 runOnUiThread(() -> startPlayerActivity(url, path, title, posterUrl, ownerNodeId,
-                        resolvedItemId, ownerKind, key, resumePosition, nextEpisodeJson));
+                        resolvedItemId, ownerKind, key, resumePosition, nextEpisodeJson,
+                        playingSeriesId, playingSeasonNumber));
             } catch (Exception e) {
                 runOnUiThread(() -> Toast.makeText(this,
                         "No se pudo preparar el vídeo: " + e.getMessage(), Toast.LENGTH_LONG).show());
@@ -5554,7 +5945,8 @@ public class MainActivity extends Activity {
 
     void startPlayerActivity(String url, String path, String title, String posterUrl,
                              String ownerNodeId, String mediaId, String ownerKind,
-                             String key, long position, String nextEpisodeJson) {
+                             String key, long position, String nextEpisodeJson,
+                             String seriesId, int seasonNumber) {
         Intent intent = new Intent(this, PlayerActivity.class);
         intent.putExtra("url", url);
         intent.putExtra("path", path);
@@ -5567,6 +5959,8 @@ public class MainActivity extends Activity {
         intent.putExtra("progress_key", key);
         intent.putExtra("profile_id", activeProfileId());
         intent.putExtra("next_episode_json", nextEpisodeJson);
+        intent.putExtra("series_id", seriesId);
+        intent.putExtra("season_number", seasonNumber);
         playerLaunched = true;
         startActivity(intent);
     }
@@ -5607,10 +6001,27 @@ public class MainActivity extends Activity {
             next.put("title", file.optString("title", "Siguiente capítulo"));
             next.put("stream", stream);
             next.put("stream_url", stream);
-            next.put("poster_url", file.optString("poster_url", season.optString("poster_url", "")));
+            String seasonPoster = posterField(season, "poster_url");
+            String episodePoster = posterField(file, "poster_url");
+            if (episodePoster.isEmpty()) episodePoster = seasonPoster;
+            next.put("poster_url", episodePoster);
+            next.put("season_poster_url", seasonPoster);
             next.put("media_id", file.optString("id", ""));
             next.put("owner_node_id", season.optString("id", ""));
             next.put("owner_kind", "season");
+            JSONObject seriesNode = findSeriesForSeason(season.optString("id", ""));
+            if (seriesNode != null) {
+                next.put("series_id", seriesNode.optString("id", ""));
+                next.put("series_poster_url", posterField(seriesNode, "poster_url"));
+            }
+            int seasonNumber = season.optInt("season_number");
+            int episodeNumber = file.optInt("episode_number", file.optInt("episode", 0));
+            next.put("season_number", seasonNumber);
+            next.put("episode_number", episodeNumber);
+            if (seasonNumber > 0 && episodeNumber > 0)
+                next.put("season_episode_label", "Temporada " + seasonNumber + " · Capítulo " + episodeNumber);
+            else if (seasonNumber > 0)
+                next.put("season_episode_label", "Temporada " + seasonNumber);
         } catch (JSONException ignored) { return null; }
         return next;
     }
