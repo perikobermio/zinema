@@ -87,6 +87,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
@@ -95,6 +97,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
+    static final Pattern EPISODE_MARKER_PATTERN = Pattern.compile(
+            "(?i)s(\\d{1,2})\\s*e(\\d{1,3})|(?:^|[^0-9])(\\d{1,2})x(\\d{1,3})(?:$|[^0-9])");
     static final int BG = Color.rgb(9, 10, 13);
     static final int PANEL = Color.rgb(24, 26, 32);
     static final int MUTED = Color.rgb(168, 172, 182);
@@ -4637,21 +4641,26 @@ public class MainActivity extends Activity {
             item.setBackground(episodeRowBackground);
             item.setFocusable(true);
             item.setClickable(true);
-            applyTvFocusStyle(item, true);
+            applyTvFocusStyle(item, false);
+            int episodeNumber = episodeNumberForDisplay(file, i + 1);
+            int thumbnailWidth = d(150);
+            int thumbnailHeight = d(84);
+            FrameLayout thumbnailFrame = new FrameLayout(this);
+            thumbnailFrame.setBackground(round(0xFF202534, d(8)));
             ImageView thumbnail = new ImageView(this);
             thumbnail.setScaleType(ImageView.ScaleType.CENTER_CROP);
-            thumbnail.setBackground(round(0xFF202534, d(8)));
             String episodePoster = file.optString("poster_url", fallbackPoster);
             loadImage(episodePoster, thumbnail, false);
-            LinearLayout.LayoutParams thumbParams = new LinearLayout.LayoutParams(d(150), d(84));
+            thumbnailFrame.addView(thumbnail, new FrameLayout.LayoutParams(-1, -1));
+            LinearLayout.LayoutParams thumbParams = new LinearLayout.LayoutParams(thumbnailWidth, thumbnailHeight);
             thumbParams.rightMargin = d(22);
-            item.addView(thumbnail, thumbParams);
+            item.addView(thumbnailFrame, thumbParams);
             TextView play = label("▶", 20, Color.WHITE, true);
             play.setGravity(Gravity.CENTER);
             play.setVisibility(View.GONE);
             LinearLayout texts = new LinearLayout(this);
             texts.setOrientation(LinearLayout.VERTICAL);
-            TextView name = labelRaw((i + 1) + ". " + file.optString("title", "Vídeo"),
+            TextView name = labelRaw(episodeNumber + ". " + episodeTitleForDisplay(file, episodeNumber),
                     16, Color.WHITE, true);
             boolean watchedEpisode = isMediaSeen(file);
             long position = mediaProgressPosition(file);
@@ -4680,6 +4689,35 @@ public class MainActivity extends Activity {
                 return true;
             });
         }
+    }
+
+    int episodeNumberForDisplay(JSONObject file, int fallback) {
+        String filename = file.optString("filename", "");
+        Matcher marker = EPISODE_MARKER_PATTERN.matcher(filename);
+        boolean found = marker.find();
+        if (!found) {
+            marker = EPISODE_MARKER_PATTERN.matcher(file.optString("title", ""));
+            found = marker.find();
+        }
+        if (found) {
+            String number = marker.group(2) != null ? marker.group(2) : marker.group(4);
+            try { return Integer.parseInt(number); }
+            catch (NumberFormatException ignored) { }
+        }
+        int number = file.optInt("episode_number", 0);
+        return number > 0 ? number : fallback;
+    }
+
+    String episodeTitleForDisplay(JSONObject file, int episodeNumber) {
+        String title = file.optString("title", "").trim();
+        String filename = file.optString("filename", "").trim();
+        if (title.isEmpty() || title.equalsIgnoreCase("null")) title = filename;
+        Matcher marker = EPISODE_MARKER_PATTERN.matcher(title);
+        if (marker.find()) title = marker.replaceAll(" ");
+        title = title.replaceAll("[._]+", " ")
+                .replaceAll("^[\\s\\-–—:]+|[\\s\\-–—:]+$", "")
+                .replaceAll("\\s+", " ").trim();
+        return title.isEmpty() ? t("Episodio") + " " + episodeNumber : title;
     }
 
     void playFirst(JSONObject node) {
