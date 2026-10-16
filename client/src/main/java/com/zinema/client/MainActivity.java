@@ -2544,6 +2544,16 @@ public class MainActivity extends Activity {
             collectionParams.setMargins(d(6), d(6), 0, 0);
             art.addView(collectionIcon, collectionParams);
         }
+        if ("series".equals(node.optString("kind")) && node.optBoolean("incomplete")) {
+            TextView incomplete = label(t("INCOMPLETA"), 9, 0xFF211600, true);
+            incomplete.setGravity(Gravity.CENTER);
+            incomplete.setPadding(d(8), d(6), d(8), d(6));
+            incomplete.setBackground(round(0xFFFFC857, d(9)));
+            FrameLayout.LayoutParams incompleteParams = new FrameLayout.LayoutParams(
+                    -2, -2, Gravity.TOP | Gravity.RIGHT);
+            incompleteParams.setMargins(0, d(7), d(7), 0);
+            art.addView(incomplete, incompleteParams);
+        }
         LinearLayout.LayoutParams ap = new LinearLayout.LayoutParams(width, d(204));
         card.addView(art, ap);
         TextView name = labelRaw(displayTitle(node), 13, Color.WHITE, true);
@@ -2607,6 +2617,18 @@ public class MainActivity extends Activity {
             return join(new JSONArray(shown));
         }
         return kind.equals("movie") ? "Sin género disponible" : "";
+    }
+
+    String incompleteSummary(JSONObject node) {
+        if (!"series".equals(node.optString("kind")) || !node.optBoolean("incomplete")) return "";
+        int seasons = node.optJSONArray("missing_seasons") == null
+                ? 0 : node.optJSONArray("missing_seasons").length();
+        int episodes = node.optInt("missing_episode_count");
+        ArrayList<String> parts = new ArrayList<>();
+        if (seasons > 0) parts.add(seasons + " " + t(seasons == 1 ? "temporada" : "temporadas"));
+        if (episodes > 0) parts.add(episodes + " " + t(episodes == 1 ? "capítulo" : "capítulos"));
+        if (parts.isEmpty()) return t("Serie incompleta");
+        return t("Faltan") + " " + android.text.TextUtils.join(" · ", parts);
     }
 
     GradientDrawable round(int color, int radius) {
@@ -4168,6 +4190,12 @@ public class MainActivity extends Activity {
         TextView kind = label(kindLabel(node.optString("kind")), 11, 0xFFFF646B, true);
         kind.setLetterSpacing(0.12f);
         info.addView(kind);
+        String incompleteText = incompleteSummary(node);
+        if (!incompleteText.isEmpty()) {
+            TextView incomplete = label(incompleteText, 12, 0xFFFFD278, true);
+            incomplete.setPadding(0, d(5), 0, 0);
+            info.addView(incomplete);
+        }
         if (isNodeSeen(node)) {
             TextView watched = label("✓  " + t("VISTO"), 11, 0xFF79E3B7, true);
             watched.setPadding(0, d(5), 0, 0);
@@ -4300,6 +4328,11 @@ public class MainActivity extends Activity {
     String t(String text) {
         if (text == null || prefs == null || !"eu".equals(prefs.getString("language", "es"))) return text;
         switch (text) {
+            case "INCOMPLETA": return "OSATUGABEA";
+            case "Serie incompleta": return "Telesaila osatu gabe";
+            case "Faltan": return "Falta dira";
+            case "capítulo": return "atal";
+            case "capítulos": return "atal";
             case "Inicio": return "Hasiera";
             case "Perfiles": return "Profilak";
             case "Perfil": return "Profila";

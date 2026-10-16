@@ -224,6 +224,9 @@ def _write_season_artwork(connection: sqlite3.Connection, node: sqlite3.Row, det
         "ORDER BY CASE WHEN season_number=0 THEN 1 ELSE 0 END, season_number",
         (node["id"],),
     ).fetchall()
+    local_seasons = {int(row["season_number"] or 0): row for row in season_rows}
+    season_numbers = sorted(set(seasons) | set(local_seasons),
+                            key=lambda value: (value == 0, value))
     image_base, poster_size, backdrop_size = image_config
     series_row = connection.execute(
         "SELECT poster_file FROM catalog_nodes WHERE id=?", (node["id"],),
@@ -231,8 +234,10 @@ def _write_season_artwork(connection: sqlite3.Connection, node: sqlite3.Row, det
     series_poster = series_row["poster_file"] if series_row else None
     first_available_poster = None
     episode_metadata_ok = True
-    for season in season_rows:
-        season_number = int(season["season_number"] or 0)
+    aired_episodes: list[dict[str, int]] = []
+    today = datetime.now(timezone.utc).date().isoformat()
+    for season_number in season_numbers:
+        season = local_seasons.get(season_number)
         tmdb_season = seasons.get(season_number, {})
         season_details = {}
         try:
@@ -249,6 +254,11 @@ def _write_season_artwork(connection: sqlite3.Connection, node: sqlite3.Row, det
         )
         for episode in episodes:
             episode_number = episode.get("episode_number")
+            air_date = (episode.get("air_date") or "")[:10]
+            if (season_number > 0 and episode_number is not None and int(episode_number) > 0
+                    and air_date and air_date <= today):
+                aired_episodes.append({"season_number": season_number,
+                                       "episode_number": int(episode_number)})
             episode_title = (episode.get("name") or "").strip()
             if episode_number is not None and episode_title:
                 connection.execute(
@@ -281,6 +291,8 @@ def _write_season_artwork(connection: sqlite3.Connection, node: sqlite3.Row, det
                             (still_file, media["id"]),
                         )
 
+        if season is None:
+            continue
         image_path = (tmdb_season.get("poster_path") or season_details.get("poster_path"))
         image_type = "poster"
         if not image_path:
@@ -318,8 +330,10 @@ def _write_season_artwork(connection: sqlite3.Connection, node: sqlite3.Row, det
         )
     if episode_metadata_ok:
         connection.execute(
-            "UPDATE catalog_nodes SET episode_metadata_checked_at=? WHERE id=?",
-            (datetime.now(timezone.utc).isoformat(), node["id"]),
+            """UPDATE catalog_nodes SET episode_metadata_checked_at=?, tmdb_episodes_json=?
+               WHERE id=?""",
+            (datetime.now(timezone.utc).isoformat(),
+             json.dumps(aired_episodes, separators=(",", ":")), node["id"]),
         )
 
 
@@ -473,7 +487,8 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
            WHERE available=1 AND kind IN ('movie', 'series')
              AND (COALESCE(metadata_source, '')!='manual'
                   OR (tmdb_id IS NOT NULL AND cast_version<1)
-                  OR (tmdb_id IS NOT NULL AND age_rating_checked_at IS NULL))
+                  OR (tmdb_id IS NOT NULL AND age_rating_checked_at IS NULL)
+                  OR (kind='series' AND tmdb_id IS NOT NULL AND tmdb_episodes_json IS NULL))
              AND (? IS NULL OR id=?)
              AND (metadata_checked_at IS NULL
                   OR (metadata_status='error' AND metadata_checked_at < ?)
@@ -481,7 +496,7 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
                   OR (tmdb_id IS NOT NULL AND cast_version<1)
                   OR (tmdb_id IS NOT NULL AND age_rating_checked_at IS NULL)
                   OR (kind='series' AND tmdb_id IS NOT NULL
-                      AND episode_metadata_checked_at IS NULL))
+                      AND (episode_metadata_checked_at IS NULL OR tmdb_episodes_json IS NULL)))
            ORDER BY CASE WHEN tmdb_id IS NOT NULL THEN 1 ELSE 0 END, scanned_at
            LIMIT ?""",
         (node_id, node_id, error_cutoff, cutoff, batch_size),

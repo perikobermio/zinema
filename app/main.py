@@ -199,6 +199,7 @@ def database() -> sqlite3.Connection:
             metadata_candidates TEXT,
             metadata_error TEXT,
             episode_metadata_checked_at TEXT,
+            tmdb_episodes_json TEXT,
             scanned_at TEXT NOT NULL,
             added_at TEXT NOT NULL DEFAULT '',
             available INTEGER NOT NULL DEFAULT 1,
@@ -208,6 +209,8 @@ def database() -> sqlite3.Connection:
     node_columns = {row["name"] for row in connection.execute("PRAGMA table_info(catalog_nodes)")}
     if "episode_metadata_checked_at" not in node_columns:
         connection.execute("ALTER TABLE catalog_nodes ADD COLUMN episode_metadata_checked_at TEXT")
+    if "tmdb_episodes_json" not in node_columns:
+        connection.execute("ALTER TABLE catalog_nodes ADD COLUMN tmdb_episodes_json TEXT")
     for name, sql_type in (("age_limit", "INTEGER"), ("age_rating", "TEXT"),
                            ("age_rating_checked_at", "TEXT")):
         if name not in node_columns:
@@ -516,6 +519,45 @@ def _collection_artwork(connection: sqlite3.Connection, collection_id: str) -> d
             "single_item_poster_url": single_poster_url}
 
 
+def _series_completion(connection: sqlite3.Connection, series_id: str,
+                       expected_raw: str | None) -> dict[str, object]:
+    known = expected_raw is not None
+    missing_episodes: list[dict[str, object]] = []
+    missing_seasons: list[int] = []
+    if known:
+        expected = json.loads(expected_raw or "[]")
+        present_rows = connection.execute(
+            """SELECT DISTINCT season_number, episode_number FROM library_items
+               WHERE series_node_id=? AND available=1
+                 AND season_number IS NOT NULL AND episode_number IS NOT NULL""",
+            (series_id,),
+        ).fetchall()
+        present = {(int(item["season_number"]), int(item["episode_number"]))
+                   for item in present_rows}
+        missing_by_season: dict[int, list[int]] = {}
+        for episode in expected:
+            season_number = int(episode["season_number"])
+            episode_number = int(episode["episode_number"])
+            if (season_number, episode_number) not in present:
+                missing_by_season.setdefault(season_number, []).append(episode_number)
+        for season_number, episode_numbers in sorted(missing_by_season.items()):
+            has_local_season = connection.execute(
+                """SELECT 1 FROM catalog_nodes WHERE parent_id=? AND kind='season'
+                   AND season_number=? AND available=1 LIMIT 1""",
+                (series_id, season_number),
+            ).fetchone()
+            if not has_local_season:
+                missing_seasons.append(season_number)
+            missing_episodes.append({"season_number": season_number,
+                                     "episode_numbers": sorted(episode_numbers)})
+    missing_count = sum(len(item["episode_numbers"]) for item in missing_episodes)
+    return {"completion_known": known,
+            "missing_seasons": missing_seasons,
+            "missing_episodes": missing_episodes,
+            "missing_episode_count": missing_count,
+            "incomplete": bool(missing_episodes) if known else False}
+
+
 def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     node = dict(row)
     genres = normalize_genres(json.loads(node.pop("genres", "[]") or "[]"))
@@ -527,6 +569,8 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     if not genres and inherited_genres:
         genres = normalize_genres(json.loads(inherited_genres[1] or "[]"))
     node["genres"] = genres
+    if node["kind"] == "series":
+        node.update(_series_completion(connection, node["id"], node.get("tmdb_episodes_json")))
     poster_file = node.get("poster_file")
     collection_artwork = _collection_artwork(connection, node["id"]) if node["kind"] == "collection" else None
     single_item_poster = collection_artwork["single_item_poster_url"] if collection_artwork else None
@@ -573,7 +617,8 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
         )
 
     child_rows = connection.execute(
-        """SELECT id, kind, title, metadata_title, poster_file, season_number, parent_id
+        """SELECT id, kind, title, metadata_title, poster_file, season_number, parent_id,
+                  tmdb_episodes_json
            FROM catalog_nodes WHERE parent_id=? AND available=1
            ORDER BY CASE kind WHEN 'collection' THEN 0 WHEN 'series' THEN 1
                               WHEN 'season' THEN 2 ELSE 3 END,
@@ -599,6 +644,10 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
                             if available else None),
              "poster_available": available,
              "poster_is_assigned": bool(child["poster_file"])}
+        if child["kind"] == "series":
+            child_payload.update(_series_completion(
+                connection, child["id"], child["tmdb_episodes_json"],
+            ))
         if child["kind"] == "collection":
             child_artwork = _collection_artwork(connection, child["id"])
             if not child["poster_file"] and child_artwork["single_item_poster_url"]:
@@ -967,7 +1016,7 @@ def get_catalog_version() -> dict[str, str]:
                       age_limit, age_rating,
                       cast_json, cast_version, tmdb_id, imdb_id, poster_file, backdrop_file,
                       metadata_status, metadata_source, metadata_checked_at,
-                      episode_metadata_checked_at, scanned_at, added_at
+                      episode_metadata_checked_at, tmdb_episodes_json, scanned_at, added_at
                FROM catalog_nodes WHERE available=1 ORDER BY id"""
         ).fetchall()
         files = connection.execute(
