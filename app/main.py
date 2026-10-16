@@ -25,6 +25,7 @@ from app.catalog import scan_catalog
 from app.tmdb import (apply_tmdb_id, enrich_pending, get_candidate_details,
                       search_image_options, search_metadata_candidates,
                       _image_config, _save_image, normalize_genres)
+from app.video_thumbnails import extract_episode_thumbnails
 
 MEDIA_ROOTS = {
     "movies": Path(os.getenv("MOVIES_ROOT", "/library/movies")).resolve(),
@@ -51,6 +52,8 @@ SCHEDULER_STARTED = False
 PLAYBACK_TICKET_TTL_SECONDS = 8 * 60 * 60
 PLAYBACK_TICKETS: dict[str, tuple[str, float, str]] = {}
 PLAYBACK_TICKET_LOCK = threading.Lock()
+EPISODE_THUMBNAIL_LOCK = threading.Lock()
+EPISODE_THUMBNAIL_RUNNING = False
 
 app = FastAPI(title="Zinema Server", version="0.1.0",
               docs_url=None, redoc_url=None, openapi_url=None)
@@ -159,7 +162,7 @@ def database() -> sqlite3.Connection:
     for name, sql_type in (
         ("node_id", "TEXT"), ("series_node_id", "TEXT"),
         ("season_number", "INTEGER"), ("episode_number", "INTEGER"),
-        ("episode_title", "TEXT"),
+        ("episode_title", "TEXT"), ("poster_file", "TEXT"),
     ):
         if name not in columns:
             connection.execute(f"ALTER TABLE library_items ADD COLUMN {name} {sql_type}")
@@ -268,6 +271,17 @@ def database() -> sqlite3.Connection:
     connection.execute("UPDATE accounts SET username=email WHERE username IS NULL OR username='' ")
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_username ON accounts(username COLLATE NOCASE)")
     connection.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    episode_art_migration = connection.execute(
+        "SELECT value FROM app_settings WHERE key='episode_still_artwork_v1'"
+    ).fetchone()
+    if episode_art_migration is None:
+        connection.execute(
+            "UPDATE catalog_nodes SET episode_metadata_checked_at=NULL "
+            "WHERE kind='series' AND tmdb_id IS NOT NULL"
+        )
+        connection.execute(
+            "INSERT INTO app_settings(key, value) VALUES ('episode_still_artwork_v1', '1')"
+        )
     approval_migration = connection.execute(
         "SELECT value FROM app_settings WHERE key='account_approval_enforced_v1'"
     ).fetchone()
@@ -377,17 +391,27 @@ def _artwork_url(node_id: str, image_type: str, filename: str | None = None,
     return f"/api/v1/catalog/{node_id}/images/{image_type}?v={version}"
 
 
+def _episode_poster_url(item_id: str, poster_file: str, modified_at: str = "") -> str:
+    version = hashlib.sha256(f"{poster_file}:{modified_at}".encode("utf-8")).hexdigest()[:12]
+    return f"/api/v1/items/{item_id}/poster?v={version}"
+
+
 def item_from_row(row: sqlite3.Row, connection: sqlite3.Connection) -> LibraryItem:
     data = dict(row)
     data["genres"] = normalize_genres(json.loads(data.pop("genres_json", "[]") or "[]"))
     metadata_node_id = data.pop("metadata_node_id", None)
     metadata_parent_id = data.pop("metadata_parent_id", None)
     poster_file = data.pop("poster_file", None)
+    episode_poster_file = data.pop("episode_poster_file", None)
     if not data["genres"]:
         inherited_genres = _inherited_collection_value(connection, metadata_parent_id, "genres")
         if inherited_genres:
             data["genres"] = normalize_genres(json.loads(inherited_genres[1] or "[]"))
-    if metadata_node_id and poster_file:
+    if episode_poster_file:
+        data["poster_url"] = _episode_poster_url(
+            data["id"], episode_poster_file, data.get("modified_at", ""),
+        )
+    elif metadata_node_id and poster_file:
         data["poster_url"] = _artwork_url(metadata_node_id, "poster", poster_file)
     return LibraryItem(**data)
 
@@ -572,16 +596,20 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     file_rows = connection.execute(
         """SELECT id, COALESCE(episode_title, title) AS title, title AS filename,
                   relative_path, extension, size_bytes, modified_at, season_number,
-                  episode_number
+                  episode_number, poster_file
            FROM library_items WHERE node_id=? AND available=1
            ORDER BY season_number, episode_number, title COLLATE NOCASE""",
         (node["id"],),
     ).fetchall()
-    node["files"] = [
-        {**dict(media), "stream_url": f"/api/v1/items/{media['id']}/stream",
-         "poster_url": node["poster_url"]}
-        for media in file_rows
-    ]
+    node["files"] = []
+    for media in file_rows:
+        poster = (_episode_poster_url(media["id"], media["poster_file"], media["modified_at"])
+                  if media["poster_file"] else node["poster_url"])
+        media_payload = dict(media)
+        media_payload.pop("poster_file", None)
+        node["files"].append({**media_payload,
+                              "stream_url": f"/api/v1/items/{media['id']}/stream",
+                              "poster_url": poster})
     node["mosaic_images"] = collection_artwork["mosaic_images"] if collection_artwork else []
     if collection_artwork:
         node["item_count"] = collection_artwork["item_count"]
@@ -597,7 +625,8 @@ def _item_select() -> str:
                      n.genres AS genres_json,
                      (SELECT COUNT(*) FROM catalog_nodes s
                       WHERE s.parent_id=n.id AND s.kind='season' AND s.available=1) AS season_count,
-                     n.id AS metadata_node_id, n.parent_id AS metadata_parent_id, n.poster_file
+                     n.id AS metadata_node_id, n.parent_id AS metadata_parent_id, n.poster_file,
+                     li.poster_file AS episode_poster_file
               FROM library_items li
               LEFT JOIN catalog_nodes n ON n.id=COALESCE(li.series_node_id, li.node_id)
               WHERE li.available=1"""
@@ -649,12 +678,32 @@ def _update_sync_job(job_id: str, **values: object) -> None:
         connection.commit()
 
 
+def _start_episode_thumbnail_job() -> None:
+    global EPISODE_THUMBNAIL_RUNNING
+    with EPISODE_THUMBNAIL_LOCK:
+        if EPISODE_THUMBNAIL_RUNNING:
+            return
+        EPISODE_THUMBNAIL_RUNNING = True
+
+    def run() -> None:
+        global EPISODE_THUMBNAIL_RUNNING
+        try:
+            with closing(database()) as connection:
+                extract_episode_thumbnails(connection, MEDIA_ROOTS, ARTWORK_DIR)
+        finally:
+            with EPISODE_THUMBNAIL_LOCK:
+                EPISODE_THUMBNAIL_RUNNING = False
+
+    threading.Thread(target=run, name="episode-thumbnails", daemon=True).start()
+
+
 def _run_sync_job(job_id: str) -> None:
     try:
         started = datetime.now(timezone.utc).isoformat()
         _update_sync_job(job_id, status="running", stage="scan", started_at=started)
         with closing(database()) as connection:
             scan_result = scan_catalog(connection, MEDIA_ROOTS)
+        _start_episode_thumbnail_job()
         _update_sync_job(job_id, stage="metadata")
         metadata_result = {"matched": 0, "needs_review": 0, "not_found": 0,
                            "errors": 0, "processed": 0}
@@ -841,6 +890,7 @@ def initialize_database() -> None:
             if encoded != row["genres"]:
                 connection.execute("UPDATE catalog_nodes SET genres=? WHERE id=?", (encoded, row["id"]))
         connection.commit()
+    _start_episode_thumbnail_job()
     if not SCHEDULER_STARTED:
         threading.Thread(target=_daily_sync_loop, daemon=True, name="zinema-daily-sync").start()
         SCHEDULER_STARTED = True
@@ -898,7 +948,7 @@ def get_catalog_version() -> dict[str, str]:
         files = connection.execute(
             """SELECT id, library, title, relative_path, extension, size_bytes,
                       modified_at, scanned_at, node_id, series_node_id, season_number,
-                      episode_number, episode_title
+                      episode_number, episode_title, poster_file
                FROM library_items WHERE available=1 ORDER BY id"""
         ).fetchall()
     state = json.dumps(
@@ -1358,6 +1408,24 @@ def list_genres() -> list[str]:
     return sorted(normalize_genres(genres), key=str.casefold)
 
 
+@app.get("/api/v1/profile-avatars", dependencies=[Depends(require_client)])
+def list_catalog_avatars() -> list[dict[str, str]]:
+    with closing(database()) as connection:
+        rows = connection.execute(
+            """SELECT * FROM catalog_nodes
+               WHERE available=1 AND kind IN ('movie', 'series', 'collection')
+               ORDER BY COALESCE(metadata_title, title) COLLATE NOCASE, id"""
+        ).fetchall()
+        result = []
+        for row in rows:
+            node = _node_payload(row, connection)
+            poster = node.get("poster_url")
+            if poster:
+                result.append({"id": node["id"], "title": node.get("display_title") or node["title"],
+                               "avatar": f"catalog:{node['id']}", "poster_url": poster})
+        return result
+
+
 @app.get("/api/v1/search", dependencies=[Depends(require_client)])
 def search_catalog(
     q: str = Query(min_length=1, max_length=200),
@@ -1387,7 +1455,7 @@ def search_catalog(
             """SELECT li.id, COALESCE(li.episode_title, li.title) AS title,
                       li.title AS filename, li.library, li.relative_path, li.extension,
                       li.size_bytes, li.modified_at, li.node_id, li.series_node_id AS series_id,
-                      li.season_number, li.episode_number, n.title AS series_title,
+                      li.season_number, li.episode_number, li.poster_file, li.modified_at, n.title AS series_title,
                       n.metadata_title AS series_metadata_title
                FROM library_items li
                JOIN catalog_nodes n ON n.id=li.series_node_id AND n.available=1
@@ -1406,6 +1474,9 @@ def search_catalog(
                 (episode["node_id"],),
             ).fetchone()
             season_payload = _node_payload(season, connection) if season else {}
+            episode_poster_url = (_episode_poster_url(
+                                      episode["id"], episode["poster_file"], episode["modified_at"])
+                                  if episode["poster_file"] else season_payload.get("poster_url"))
             results.append({
                 "id": episode["id"],
                 "kind": "episode",
@@ -1422,7 +1493,7 @@ def search_catalog(
                 "season_number": episode["season_number"],
                 "episode_number": episode["episode_number"],
                 "series_title": episode["series_metadata_title"] or episode["series_title"],
-                "poster_url": season_payload.get("poster_url"),
+                "poster_url": episode_poster_url,
                 "stream_url": f"/api/v1/items/{episode['id']}/stream",
             })
 
@@ -1672,6 +1743,24 @@ def get_catalog_image(node_id: str, image_type: str):
     raise HTTPException(status_code=404, detail="Image not found")
 
 
+@app.get("/api/v1/items/{item_id}/poster", dependencies=[Depends(require_client)])
+def get_episode_poster(item_id: str):
+    with closing(database()) as connection:
+        row = connection.execute(
+            "SELECT poster_file FROM library_items WHERE id=? AND available=1", (item_id,)
+        ).fetchone()
+    if row is None or not row["poster_file"]:
+        raise HTTPException(status_code=404, detail="Episode image not found")
+    image_path = (ARTWORK_DIR / row["poster_file"]).resolve()
+    try:
+        image_path.relative_to(ARTWORK_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Episode image not found") from None
+    if not image_path.is_file():
+        raise HTTPException(status_code=404, detail="Episode image not found")
+    return FileResponse(image_path)
+
+
 @app.post("/api/v1/admin/sync", status_code=202, dependencies=[Depends(require_admin)])
 def start_catalog_sync() -> dict[str, str]:
     if not TMDB_CONFIGURED:
@@ -1821,4 +1910,5 @@ def scan_library() -> ScanResult:
             result = scan_catalog(connection, MEDIA_ROOTS)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
+    _start_episode_thumbnail_job()
     return ScanResult(**result)

@@ -7,6 +7,8 @@ import android.content.Intent;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.widget.FrameLayout;
@@ -30,7 +32,22 @@ public class PlayerActivity extends Activity {
     private VideoView videoView;
     private boolean internalPlayer;
     private boolean prepared;
+    private boolean playbackFinishing;
     private MediaController mediaController;
+    private TextView nextEpisodeButton;
+    private JSONObject nextEpisode;
+    private final Handler progressHandler = new Handler(Looper.getMainLooper());
+    private final Runnable nextEpisodeTicker = new Runnable() {
+        @Override public void run() {
+            if (!internalPlayer || !prepared || videoView == null || nextEpisode == null) return;
+            int duration = videoView.getDuration();
+            int position = videoView.getCurrentPosition();
+            if (duration > 0 && duration - position <= Math.min(30000, duration / 20)) {
+                if (nextEpisodeButton != null) nextEpisodeButton.setVisibility(TextView.VISIBLE);
+            } else if (nextEpisodeButton != null) nextEpisodeButton.setVisibility(TextView.GONE);
+            progressHandler.postDelayed(this, 1000L);
+        }
+    };
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -43,6 +60,9 @@ public class PlayerActivity extends Activity {
         ownerKind = getIntent().getStringExtra("owner_kind");
         progressKey = getIntent().getStringExtra("progress_key");
         profileId = getIntent().getStringExtra("profile_id");
+        String nextRaw = getIntent().getStringExtra("next_episode_json");
+        try { if (nextRaw != null && !nextRaw.isEmpty()) nextEpisode = new JSONObject(nextRaw); }
+        catch (Exception ignored) { }
         if (progressKey == null || progressKey.isEmpty()) progressKey = "watch:" + path;
         long resumeAt = getIntent().getLongExtra("position", 0L);
         if (url == null || url.isEmpty()) {
@@ -92,6 +112,28 @@ public class PlayerActivity extends Activity {
         FrameLayout.LayoutParams headingParams = new FrameLayout.LayoutParams(-1, -2,
                 Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         root.addView(heading, headingParams);
+        if (nextEpisode != null) {
+            nextEpisodeButton = new TextView(this);
+            nextEpisodeButton.setText("Ver siguiente capítulo  ▶");
+            nextEpisodeButton.setTextColor(Color.WHITE);
+            nextEpisodeButton.setTextSize(16);
+            nextEpisodeButton.setTypeface(null, android.graphics.Typeface.BOLD);
+            nextEpisodeButton.setGravity(Gravity.CENTER);
+            nextEpisodeButton.setPadding(24, 14, 24, 14);
+            nextEpisodeButton.setBackgroundColor(0xEEB20710);
+            nextEpisodeButton.setFocusable(true);
+            nextEpisodeButton.setClickable(true);
+            nextEpisodeButton.setVisibility(TextView.GONE);
+            FrameLayout.LayoutParams nextParams = new FrameLayout.LayoutParams(-2, -2,
+                    Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+            nextParams.bottomMargin = 90;
+            root.addView(nextEpisodeButton, nextParams);
+            nextEpisodeButton.setOnClickListener(v -> {
+                getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
+                        .putString("auto_play_episode:" + profileId, nextEpisode.toString()).apply();
+                finishWithProgress(true);
+            });
+        }
         setContentView(root);
         mediaController = new MediaController(this);
         mediaController.setAnchorView(videoView);
@@ -105,6 +147,8 @@ public class PlayerActivity extends Activity {
             }
             videoView.start();
             videoView.requestFocus();
+            progressHandler.removeCallbacks(nextEpisodeTicker);
+            progressHandler.postDelayed(nextEpisodeTicker, 1000L);
         });
         videoView.setOnCompletionListener(player -> finishWithProgress(true));
         videoView.setOnErrorListener((player, what, extra) -> {
@@ -122,10 +166,8 @@ public class PlayerActivity extends Activity {
         if (resultCode == RESULT_OK && data != null) {
             long position = data.getLongExtra("extra_position", -1L);
             long duration = data.getLongExtra("extra_duration", -1L);
-            if (position >= 0L && duration > 0L && position >= duration - 5000L) {
-                getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
-                        .remove(progressKey).apply();
-                markProfileStateDirty();
+            if (isComplete(position, duration)) {
+                markCompleted();
             } else if (position > 10000L) {
                 saveProgress(position);
                 markProfileStateDirty();
@@ -163,21 +205,20 @@ public class PlayerActivity extends Activity {
     }
 
     @Override protected void onPause() {
-        if (internalPlayer && prepared) saveCurrentProgress(false);
+        if (internalPlayer && prepared && !playbackFinishing) saveCurrentProgress(false);
         super.onPause();
     }
 
     private void finishWithProgress(boolean completed) {
+        playbackFinishing = true;
         if (videoView == null) {
             finish();
             return;
         }
         long position = Math.max(0, videoView.getCurrentPosition());
         long duration = Math.max(0, videoView.getDuration());
-        if (completed || (duration > 0 && position >= duration - 5000L)) {
-            getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
-                    .remove(progressKey).apply();
-            markProfileStateDirty();
+        if (completed || isComplete(position, duration)) {
+            markCompleted();
         } else if (position > 10000L) {
             saveProgress(position);
             markProfileStateDirty();
@@ -186,6 +227,7 @@ public class PlayerActivity extends Activity {
         result.putExtra("extra_position", position);
         result.putExtra("extra_duration", duration);
         setResult(RESULT_OK, result);
+        progressHandler.removeCallbacks(nextEpisodeTicker);
         if (videoView.isPlaying()) videoView.pause();
         finish();
     }
@@ -194,9 +236,8 @@ public class PlayerActivity extends Activity {
         if (videoView == null || !prepared) return;
         long position = Math.max(0, videoView.getCurrentPosition());
         long duration = Math.max(0, videoView.getDuration());
-        if (completed || (duration > 0 && position >= duration - 5000L)) {
-            getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
-                    .remove(progressKey).apply();
+        if (completed || isComplete(position, duration)) {
+            markCompleted();
         } else if (position > 10000L) {
             saveProgress(position);
         }
@@ -221,6 +262,28 @@ public class PlayerActivity extends Activity {
                     .putString(progressKey == null || progressKey.isEmpty() ? "watch:" + path : progressKey,
                             item.toString()).apply();
         } catch (Exception ignored) { }
+    }
+
+    private boolean isComplete(long position, long duration) {
+        return duration > 0L && position >= duration * 0.95d;
+    }
+
+    private void markCompleted() {
+        android.content.SharedPreferences.Editor editor = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE)
+                .edit().remove(progressKey);
+        if (profileId != null && !profileId.isEmpty() && mediaId != null && !mediaId.isEmpty()
+                && !"null".equals(mediaId)) {
+            editor.putBoolean("p:" + profileId + ":seen:file:" + mediaId, true)
+                    .putString("completed_media:" + profileId, mediaId)
+                    .putString("completed_owner:" + profileId, ownerNodeId == null ? "" : ownerNodeId)
+                    .putString("completed_kind:" + profileId, ownerKind == null ? "" : ownerKind);
+            if ("movie".equals(ownerKind) && ownerNodeId != null && !ownerNodeId.isEmpty())
+                editor.putBoolean("p:" + profileId + ":seen:node:" + ownerNodeId, true);
+            if (nextEpisode != null) editor.putString("next_episode:" + profileId, nextEpisode.toString());
+            else if ("season".equals(ownerKind)) editor.remove("next_episode:" + profileId);
+        }
+        editor.apply();
+        markProfileStateDirty();
     }
 
     private void markProfileStateDirty() {

@@ -14,6 +14,8 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.ColorMatrix;
+import android.graphics.ColorMatrixColorFilter;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
@@ -138,6 +140,7 @@ public class MainActivity extends Activity {
     boolean profileStateSyncRunning;
     boolean profileStateSyncPending;
     boolean hasResumedOnce;
+    boolean playerLaunched;
     boolean libraryMode;
     boolean showingDetail;
     boolean showingAdmin;
@@ -176,6 +179,14 @@ public class MainActivity extends Activity {
     final Map<ImageView, String> requestedImages = new WeakHashMap<>();
     final List<JSONObject> breadcrumbs = new ArrayList<>();
     final List<Integer> breadcrumbScrollPositions = new ArrayList<>();
+    final Map<Character, View> alphabetAnchors = new HashMap<>();
+    View alphabetRail;
+    View alphabetToggleButton;
+    boolean alphabetVisible;
+    List<JSONObject> currentListingNodes;
+    String currentListingTitle = "";
+    String currentListingSubtitle = "";
+    boolean advancingCompletedEpisode;
 
     static int bitmapCacheBytes() {
         return (int) Math.min(32L * 1024L * 1024L,
@@ -433,6 +444,10 @@ public class MainActivity extends Activity {
 
     int d(float value) { return (int) (value * getResources().getDisplayMetrics().density + 0.5f); }
 
+    boolean isTelevision() {
+        return getPackageManager().hasSystemFeature(PackageManager.FEATURE_LEANBACK);
+    }
+
     String trimBase(String value) {
         String result = value == null ? "" : value.trim();
         while (result.endsWith("/")) result = result.substring(0, result.length() - 1);
@@ -441,18 +456,27 @@ public class MainActivity extends Activity {
 
     void buildShell(String title) {
         frame = new FrameLayout(this);
-        frame.setBackgroundColor(BG);
+        GradientDrawable appBackground = new GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                new int[]{0xFF22243A, 0xFF141925, 0xFF191520, 0xFF29202D});
+        frame.setBackground(appBackground);
+        frame.setClipChildren(false);
         page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
+        page.setClipChildren(false);
         frame.addView(page, new FrameLayout.LayoutParams(-1, -1));
 
         LinearLayout bar = new LinearLayout(this);
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setPadding(d(20), d(20), d(16), d(8));
-        bar.setBackgroundColor(BG);
+        bar.setBackgroundColor(0xF0141721);
+        bar.setElevation(d(24));
+        bar.setTranslationZ(d(24));
         backButton = navAction("‹", "Atrás", v -> onBackPressed());
         backButton.setTextSize(30);
-        backButton.setVisibility(title.equals("Inicio") ? View.GONE : View.VISIBLE);
+        boolean libraryRoot = libraryMode && !showingDetail && breadcrumbs.isEmpty()
+                && ("movies".equals(selectedSection) || "series".equals(selectedSection));
+        backButton.setVisibility(title.equals("Inicio") || libraryRoot ? View.GONE : View.VISIBLE);
         LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(d(36), d(42));
         backParams.rightMargin = d(8);
         bar.addView(backButton, backParams);
@@ -489,11 +513,18 @@ public class MainActivity extends Activity {
 
         navScroll = new HorizontalScrollView(this);
         navScroll.setHorizontalScrollBarEnabled(false);
+        navScroll.setElevation(d(22));
+        navScroll.setTranslationZ(d(22));
+        navScroll.setBackgroundColor(0xF0141721);
         LinearLayout nav = new LinearLayout(this);
         nav.setPadding(d(16), 0, d(16), d(8));
         nav.addView(navChip("Inicio", () -> loadHome(), selectedSection.equals("home")));
         nav.addView(navChip("Películas", () -> openLibrary("movies"), selectedSection.equals("movies")));
         nav.addView(navChip("Series", () -> openLibrary("series"), selectedSection.equals("series")));
+        alphabetToggleButton = navChip("A–Z", this::toggleAlphabet, alphabetVisible);
+        alphabetToggleButton.setContentDescription(t("Mostrar u ocultar el abecedario"));
+        nav.addView(alphabetToggleButton);
+        alphabetToggleButton.setVisibility(View.GONE);
         navScroll.addView(nav);
         page.addView(navScroll, new LinearLayout.LayoutParams(-1, d(48)));
         if (showingAdmin || showingProfiles) navScroll.setVisibility(View.GONE);
@@ -501,9 +532,16 @@ public class MainActivity extends Activity {
         contentScroller = new ScrollView(this);
         contentScroller.setFillViewport(true);
         contentScroller.setVerticalScrollBarEnabled(false);
-        contentScroller.setBackgroundColor(BG);
+        GradientDrawable sectionBackground = new GradientDrawable(
+                GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[]{0xFF19243A, 0xFF131925, 0xFF211923});
+        contentScroller.setBackground(sectionBackground);
+        contentScroller.setClipChildren(false);
+        contentScroller.setClipToPadding(false);
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
+        content.setClipChildren(false);
+        content.setClipToPadding(false);
         content.setPadding(0, 0, 0, d(28));
         contentScroller.addView(content);
         contentScroller.setOnScrollChangeListener((View view, int x, int y, int oldX, int oldY) ->
@@ -544,7 +582,7 @@ public class MainActivity extends Activity {
 
     TextView label(String text, int size, int color, boolean bold) {
         TextView view = new TextView(this);
-        view.setText(t(text));
+        view.setText(t(cleanDisplayText(text)));
         view.setTextSize(size);
         view.setTextColor(color);
         if (bold) view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
@@ -553,11 +591,18 @@ public class MainActivity extends Activity {
 
     TextView labelRaw(String text, int size, int color, boolean bold) {
         TextView view = new TextView(this);
-        view.setText(text);
+        view.setText(cleanDisplayText(text));
         view.setTextSize(size);
         view.setTextColor(color);
         if (bold) view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         return view;
+    }
+
+    String cleanDisplayText(String value) {
+        if (value == null) return "";
+        return value.replaceAll("(?i)\\bnull\\b", "")
+                .replaceAll("^[\\s·•|]+|[\\s·•|]+$", "")
+                .replaceAll("\\s{2,}", " ").trim();
     }
 
     TextView navAction(String glyph, String hint, View.OnClickListener onClick) {
@@ -579,15 +624,39 @@ public class MainActivity extends Activity {
         outline.setColor(Color.TRANSPARENT);
         outline.setCornerRadius(d(9));
         outline.setStroke(d(1), Color.TRANSPARENT);
-        view.setForeground(outline);
+        boolean posterFocus = scaleOnFocus && isTelevision();
+        if (!posterFocus) view.setForeground(outline);
+        if (view instanceof ViewGroup) ((ViewGroup) view).setClipChildren(false);
         view.setOnFocusChangeListener((focusedView, hasFocus) -> {
-            outline.setStroke(d(hasFocus ? 2 : 1), hasFocus ? RED : Color.TRANSPARENT);
-            focusedView.setForeground(outline);
+            if (!(scaleOnFocus && isTelevision())) {
+                outline.setStroke(d(hasFocus ? 2 : 1), hasFocus ? RED : Color.TRANSPARENT);
+                focusedView.setForeground(outline);
+            } else {
+                setPosterBrightness(focusedView, hasFocus);
+            }
             focusedView.animate().cancel();
-            float scale = hasFocus && scaleOnFocus ? 1.045f : 1f;
+            float scale = hasFocus && scaleOnFocus && isTelevision() ? 1.035f : 1f;
             focusedView.animate().scaleX(scale).scaleY(scale).setDuration(120).start();
             focusedView.setElevation(hasFocus ? d(7) : 0);
         });
+    }
+
+    void setPosterBrightness(View root, boolean focused) {
+        if (root instanceof ImageView) {
+            ImageView image = (ImageView) root;
+            if (focused) {
+                ColorMatrix matrix = new ColorMatrix(new float[]{
+                        1.12f, 0, 0, 0, 5,
+                        0, 1.12f, 0, 0, 5,
+                        0, 0, 1.12f, 0, 5,
+                        0, 0, 0, 1, 0
+                });
+                image.setColorFilter(new ColorMatrixColorFilter(matrix));
+            } else image.clearColorFilter();
+        } else if (root instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) root;
+            for (int i = 0; i < group.getChildCount(); i++) setPosterBrightness(group.getChildAt(i), focused);
+        }
     }
 
     View navChip(String title, Runnable action, boolean active) {
@@ -1547,47 +1616,39 @@ public class MainActivity extends Activity {
         avatarLabel.setPadding(0, d(20), 0, d(10));
         body.addView(avatarLabel);
         List<JSONObject> options = profileAvatarOptions();
-        int columns = getResources().getDisplayMetrics().widthPixels / getResources().getDisplayMetrics().density > 850 ? 5 : 4;
         List<View> cells = new ArrayList<>();
-        int rows = (options.size() + columns - 1) / columns;
-        for (int r = 0; r < rows; r++) {
-            LinearLayout line = new LinearLayout(this);
-            line.setGravity(Gravity.CENTER_VERTICAL);
-            body.addView(line, new LinearLayout.LayoutParams(-1, d(112)));
-            for (int c = 0; c < columns; c++) {
-                int index = r * columns + c;
-                if (index >= options.size()) {
-                    line.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
-                    continue;
-                }
-                JSONObject option = options.get(index);
-                String avatar = option.optString("avatar", "generic:0");
-                LinearLayout cell = new LinearLayout(this);
-                cell.setOrientation(LinearLayout.VERTICAL);
-                cell.setGravity(Gravity.CENTER);
-                cell.setPadding(d(4), d(4), d(4), d(4));
-                cell.setBackground(round(avatar.equals(selectedProfileAvatar) ? 0x664C2028 : Color.TRANSPARENT, d(10)));
-                cell.setFocusable(true);
-                cell.setClickable(true);
-                cell.setTag(avatar);
-                applyTvFocusStyle(cell, false);
-                FrameLayout picture = profileAvatarView(avatar, d(58), option.optString("title", "Avatar"), false);
-                cell.addView(picture, new LinearLayout.LayoutParams(d(58), d(58)));
-                TextView title = label(option.optString("title", "Avatar"), 10, Color.WHITE, false);
-                title.setGravity(Gravity.CENTER);
-                title.setMaxLines(2);
-                cell.addView(title, new LinearLayout.LayoutParams(-1, d(34)));
-                cells.add(cell);
-                line.addView(cell, new LinearLayout.LayoutParams(0, -1, 1));
-                cell.setOnClickListener(v -> {
-                    selectedProfileAvatar = avatar;
-                    for (View entry : cells) {
-                        String value = String.valueOf(entry.getTag());
-                        entry.setBackground(round(value.equals(selectedProfileAvatar) ? 0x664C2028 : Color.TRANSPARENT, d(10)));
-                    }
-                });
+        EditText avatarSearch = metadataField("", t("Buscar entre los pósteres"), false);
+        avatarSearch.setSingleLine(true);
+        LinearLayout.LayoutParams searchParams = new LinearLayout.LayoutParams(-1, d(48));
+        searchParams.bottomMargin = d(12);
+        body.addView(avatarSearch, searchParams);
+        LinearLayout avatarGrid = new LinearLayout(this);
+        avatarGrid.setOrientation(LinearLayout.VERTICAL);
+        avatarGrid.setClipChildren(false);
+        body.addView(avatarGrid, new LinearLayout.LayoutParams(-1, -2));
+        renderAvatarGrid(avatarGrid, options, cells, "");
+        avatarSearch.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                renderAvatarGrid(avatarGrid, options, cells, s.toString());
             }
-        }
+            @Override public void afterTextChanged(Editable s) { }
+        });
+        io.execute(() -> {
+            try {
+                JSONArray remote = getArray("/api/v1/profile-avatars");
+                runOnUiThread(() -> {
+                    if (avatarGrid.getParent() == null || !profileEditorVisible) return;
+                    Set<String> known = new HashSet<>();
+                    for (JSONObject option : options) known.add(option.optString("avatar", ""));
+                    for (int i = 0; i < remote.length(); i++) {
+                        JSONObject option = remote.optJSONObject(i);
+                        if (option != null && known.add(option.optString("avatar", ""))) options.add(option);
+                    }
+                    renderAvatarGrid(avatarGrid, options, cells, avatarSearch.getText().toString());
+                });
+            } catch (Exception ignored) { }
+        });
         LinearLayout buttons = new LinearLayout(this);
         buttons.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams buttonsParams = new LinearLayout.LayoutParams(-1, -2);
@@ -1608,6 +1669,68 @@ public class MainActivity extends Activity {
             delete.setOnClickListener(v -> confirmDeleteProfile(existing));
         }
         save.setOnClickListener(v -> saveProfile(existing, name.getText().toString()));
+    }
+
+    void renderAvatarGrid(LinearLayout grid, List<JSONObject> options, List<View> cells, String query) {
+        grid.removeAllViews();
+        cells.clear();
+        String needle = query == null ? "" : query.trim().toLowerCase(java.util.Locale.ROOT);
+        List<JSONObject> matches = new ArrayList<>();
+        for (JSONObject option : options) {
+            String title = option.optString("title", "").toLowerCase(java.util.Locale.ROOT);
+            if (needle.isEmpty() || title.contains(needle)) matches.add(option);
+        }
+        int columns = isTelevision() ? Math.max(6, Math.min(10,
+                getResources().getDisplayMetrics().widthPixels / d(122)))
+                : (getResources().getDisplayMetrics().widthPixels / getResources().getDisplayMetrics().density > 850 ? 5 : 4);
+        int cellHeight = d(isTelevision() ? 142 : 112);
+        int imageSize = d(isTelevision() ? 94 : 62);
+        for (int r = 0; r * columns < matches.size(); r++) {
+            LinearLayout line = new LinearLayout(this);
+            line.setGravity(Gravity.CENTER_VERTICAL);
+            line.setClipChildren(false);
+            grid.addView(line, new LinearLayout.LayoutParams(-1, cellHeight));
+            for (int c = 0; c < columns; c++) {
+                int index = r * columns + c;
+                if (index >= matches.size()) break;
+                JSONObject option = matches.get(index);
+                String avatar = option.optString("avatar", "generic:0");
+                LinearLayout cell = new LinearLayout(this);
+                cell.setOrientation(LinearLayout.VERTICAL);
+                cell.setGravity(Gravity.CENTER);
+                cell.setPadding(d(4), d(4), d(4), d(4));
+                cell.setBackground(round(avatar.equals(selectedProfileAvatar) ? 0xB9472732 : 0x33242A38, d(12)));
+                cell.setFocusable(true);
+                cell.setClickable(true);
+                cell.setTag(avatar);
+                applyTvFocusStyle(cell, false);
+                FrameLayout picture = profileAvatarView(avatar, imageSize,
+                        option.optString("title", "Avatar"), false);
+                LinearLayout.LayoutParams pictureParams = new LinearLayout.LayoutParams(imageSize, imageSize);
+                pictureParams.bottomMargin = d(4);
+                cell.addView(picture, pictureParams);
+                TextView title = label(option.optString("title", "Avatar"), isTelevision() ? 11 : 10,
+                        Color.WHITE, false);
+                title.setGravity(Gravity.CENTER);
+                title.setMaxLines(2);
+                cell.addView(title, new LinearLayout.LayoutParams(-1, d(isTelevision() ? 34 : 30)));
+                cells.add(cell);
+                line.addView(cell, new LinearLayout.LayoutParams(0, -1, 1));
+                cell.setOnClickListener(v -> {
+                    selectedProfileAvatar = avatar;
+                    for (View entry : cells) {
+                        String value = String.valueOf(entry.getTag());
+                        entry.setBackground(round(value.equals(selectedProfileAvatar)
+                                ? 0xB9472732 : 0x33242A38, d(12)));
+                    }
+                });
+            }
+        }
+        if (matches.isEmpty()) {
+            TextView empty = label("No se encontraron pósteres.", 13, MUTED, false);
+            empty.setPadding(d(8), d(16), d(8), d(16));
+            grid.addView(empty);
+        }
     }
 
     void saveProfile(JSONObject existing, String rawName) {
@@ -1739,6 +1862,7 @@ public class MainActivity extends Activity {
 
     List<JSONObject> toList(JSONArray array) {
         List<JSONObject> result = new ArrayList<>();
+        if (array == null) return result;
         for (int i = 0; i < array.length(); i++) {
             JSONObject value = array.optJSONObject(i);
             if (value != null) result.add(value);
@@ -1749,6 +1873,20 @@ public class MainActivity extends Activity {
     void sortNewestFirst(List<JSONObject> nodes) {
         Collections.sort(nodes, (left, right) ->
                 right.optString("added_at", "").compareTo(left.optString("added_at", "")));
+    }
+
+    void sortAlphabetically(List<JSONObject> nodes) {
+        java.text.Collator collator = java.text.Collator.getInstance(java.util.Locale.forLanguageTag("es"));
+        collator.setStrength(java.text.Collator.PRIMARY);
+        Collections.sort(nodes, (left, right) -> collator.compare(displayTitle(left), displayTitle(right)));
+    }
+
+    char alphabetInitial(String title) {
+        String normalized = Normalizer.normalize(title == null ? "" : title.trim(), Normalizer.Form.NFD)
+                .replaceAll("\\p{M}+", "").toUpperCase(java.util.Locale.ROOT);
+        if (normalized.isEmpty()) return '#';
+        char first = normalized.charAt(0);
+        return first >= 'A' && first <= 'Z' ? first : '#';
     }
 
     String catalogCacheKey(String library, String parentId) {
@@ -1803,7 +1941,7 @@ public class MainActivity extends Activity {
             }
             try {
                 List<JSONObject> rows = toList(getArray(catalogListingPath(library, parentId)));
-                if (parentId == null) sortNewestFirst(rows);
+                if (parentId == null) sortAlphabetically(rows);
                 runOnUiThread(() -> {
                     catalogVersionCheckRunning = false;
                     if (!remoteVersion.isEmpty() && !remoteVersion.equals(catalogVersion)) clearCatalogCache();
@@ -1887,6 +2025,8 @@ public class MainActivity extends Activity {
         content.removeAllViews();
         List<JSONObject> resume = readContinueWatching();
         if (!resume.isEmpty()) addResumeRow("Seguir viendo", resume);
+        JSONObject nextEpisode = readNextEpisode();
+        if (nextEpisode != null) addResumeRow("Siguiente capítulo", Collections.singletonList(nextEpisode));
         List<JSONObject> favorites = readFavorites();
         if (!favorites.isEmpty()) addRow("Mi lista", favorites);
         addRow("Películas", movies);
@@ -1911,7 +2051,8 @@ public class MainActivity extends Activity {
     }
 
     String displayTitle(JSONObject node) {
-        String title = node.optString("display_title", node.optString("title", "Zinema"));
+        String title = cleanDisplayText(node.optString("display_title", node.optString("title", "Zinema")));
+        if (title.isEmpty()) title = cleanDisplayText(node.optString("title", "Zinema"));
         if (node.optString("kind").equals("season")) return t("Temporada") + " " + String.format("%02d", node.optInt("season_number"));
         return title;
     }
@@ -1925,8 +2066,11 @@ public class MainActivity extends Activity {
         section.addView(heading);
         HorizontalScrollView horizontal = new HorizontalScrollView(this);
         horizontal.setHorizontalScrollBarEnabled(false);
+        horizontal.setClipChildren(false);
+        horizontal.setClipToPadding(false);
         horizontal.setTag("zinema-lazy-posters");
         LinearLayout cards = new LinearLayout(this);
+        cards.setClipChildren(false);
         cards.setPadding(d(16), 0, d(16), d(8));
         for (JSONObject node : nodes) cards.addView(posterCard(node, true));
         horizontal.addView(cards);
@@ -1998,17 +2142,10 @@ public class MainActivity extends Activity {
         TextView meta = label(cardSubtitle(node), 11, MUTED, false);
         meta.setPadding(d(2), d(3), d(2), 0);
         card.addView(meta);
-        TextView actions = label("⋮", 22, Color.WHITE, true);
-        actions.setGravity(Gravity.CENTER);
-        actions.setFocusable(true);
-        actions.setBackground(round(0xCC111318, d(18)));
-        actions.setElevation(d(4));
-        applyTvFocusStyle(actions, false);
-        FrameLayout.LayoutParams actionParams = new FrameLayout.LayoutParams(d(36), d(36), Gravity.TOP | Gravity.RIGHT);
-        actionParams.setMargins(0, d(6), d(6), 0);
-        art.addView(actions, actionParams);
-        actions.setOnClickListener(v -> showActions(node));
-        if (isNodeSeen(node)) {
+        card.setOnLongClickListener(v -> { showActions(node); return true; });
+        boolean seenNode = "episode".equals(node.optString("kind"))
+                ? isMediaSeen(node) : isNodeSeen(node);
+        if (seenNode) {
             TextView seen = label("✓ VISTO", 10, Color.WHITE, true);
             seen.setGravity(Gravity.CENTER);
             seen.setPadding(d(8), d(5), d(8), d(5));
@@ -2142,7 +2279,7 @@ public class MainActivity extends Activity {
     }
 
     void loadImage(String path, ImageView target, boolean backdrop) {
-        if (path == null || path.trim().isEmpty()) {
+        if (path == null || path.trim().isEmpty() || "null".equalsIgnoreCase(path.trim())) {
             target.setBackground(round(PANEL, d(8)));
             return;
         }
@@ -2188,7 +2325,7 @@ public class MainActivity extends Activity {
             loadImage(path, target, false);
             return;
         }
-        if (path == null || path.trim().isEmpty()) {
+        if (path == null || path.trim().isEmpty() || "null".equalsIgnoreCase(path.trim())) {
             target.setBackground(round(PANEL, d(8)));
             return;
         }
@@ -2287,10 +2424,18 @@ public class MainActivity extends Activity {
     }
 
     void renderListing(String title, String subtitle, List<JSONObject> nodes) {
+        currentListingTitle = title;
+        currentListingSubtitle = subtitle;
+        currentListingNodes = nodes == null ? new ArrayList<>() : new ArrayList<>(nodes);
         content.removeAllViews();
-        boolean showGenreFilter = breadcrumbs.isEmpty() && libraryMode
+        boolean showAlphabet = breadcrumbs.isEmpty() && libraryMode
                 && ("movies".equals(selectedSection) || "series".equals(selectedSection));
+        boolean showGenreFilter = showAlphabet
+                && ("movies".equals(selectedSection) || "series".equals(selectedSection));
+        List<JSONObject> alphabetized = new ArrayList<>(nodes);
+        if (showAlphabet) sortAlphabetically(alphabetized);
         List<JSONObject> visibleNodes = nodes;
+        if (showAlphabet) visibleNodes = alphabetized;
         Set<String> selected = null;
         if (showGenreFilter) {
             String library = selectedSection;
@@ -2299,12 +2444,21 @@ public class MainActivity extends Activity {
                 selected = new HashSet<>();
                 selectedGenresByLibrary.put(library, selected);
             }
-            visibleNodes = filterByGenres(nodes, selected);
+            visibleNodes = filterByGenres(alphabetized, selected);
             addLibraryListingHeader(title, subtitle, library, nodes, selected);
         } else {
             addSectionHeader(title, subtitle);
         }
         addGrid(visibleNodes);
+        boolean showAlphabetRail = showAlphabet && alphabetVisible;
+        content.setPadding(0, 0, showAlphabetRail ? d(42) : 0, d(28));
+        if (showAlphabetRail) addAlphabetRail(); else removeAlphabetRail();
+        if (alphabetToggleButton != null) {
+            alphabetToggleButton.setVisibility(showAlphabet ? View.VISIBLE : View.GONE);
+            alphabetToggleButton.setAlpha(alphabetVisible ? 1f : 0.72f);
+            alphabetToggleButton.setSelected(alphabetVisible);
+            updateAlphabetToggleAppearance();
+        }
         if (visibleNodes.isEmpty()) {
             addEmpty(showGenreFilter && selected != null && !selected.isEmpty()
                     ? "No hay títulos que coincidan con los géneros seleccionados."
@@ -2313,11 +2467,84 @@ public class MainActivity extends Activity {
         restoreListingScrollIfPending();
     }
 
+    void toggleAlphabet() {
+        if (currentListingNodes == null || contentScroller == null) return;
+        alphabetVisible = !alphabetVisible;
+        pendingListingRestoreY = contentScroller.getScrollY();
+        renderListing(currentListingTitle, currentListingSubtitle, currentListingNodes);
+    }
+
+    void updateAlphabetToggleAppearance() {
+        if (!(alphabetToggleButton instanceof ViewGroup)) return;
+        ViewGroup button = (ViewGroup) alphabetToggleButton;
+        if (button.getChildCount() < 2 || !(button.getChildAt(0) instanceof TextView)) return;
+        TextView label = (TextView) button.getChildAt(0);
+        label.setTextColor(alphabetVisible ? Color.WHITE : MUTED);
+        View indicator = button.getChildAt(1);
+        indicator.setBackground(round(alphabetVisible ? RED : Color.TRANSPARENT, d(2)));
+    }
+
     void restoreListingScrollIfPending() {
         if (pendingListingRestoreY < 0 || contentScroller == null) return;
         int restoreY = pendingListingRestoreY;
         pendingListingRestoreY = -1;
         contentScroller.post(() -> contentScroller.scrollTo(0, restoreY));
+    }
+
+    void addAlphabetRail() {
+        removeAlphabetRail();
+        ScrollView scroll = new ScrollView(this);
+        scroll.setVerticalScrollBarEnabled(false);
+        scroll.setBackground(round(0xBB151923, d(18)));
+        LinearLayout letters = new LinearLayout(this);
+        letters.setOrientation(LinearLayout.VERTICAL);
+        letters.setPadding(d(3), d(6), d(3), d(6));
+        String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ#";
+        for (int i = 0; i < alphabet.length(); i++) {
+            char letter = alphabet.charAt(i);
+            boolean available = alphabetAnchors.containsKey(letter);
+            TextView key = labelRaw(String.valueOf(letter), 11,
+                    available ? Color.WHITE : 0xFF666B77, true);
+            key.setGravity(Gravity.CENTER);
+            key.setFocusable(available);
+            key.setClickable(available);
+            if (available) {
+                key.setOnClickListener(v -> {
+                    View anchor = alphabetAnchors.get(letter);
+                    if (anchor != null && contentScroller != null) {
+                        contentScroller.smoothScrollTo(0, viewTopInContent(anchor));
+                        anchor.requestFocus();
+                    }
+                });
+                applyTvFocusStyle(key, false);
+            }
+            letters.addView(key, new LinearLayout.LayoutParams(-1, d(21)));
+        }
+        scroll.addView(letters);
+        int railHeight = Math.max(d(200), Math.min(d(620),
+                getResources().getDisplayMetrics().heightPixels - d(120)));
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(d(38), railHeight,
+                Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+        params.rightMargin = d(5);
+        frame.addView(scroll, params);
+        alphabetRail = scroll;
+    }
+
+    void removeAlphabetRail() {
+        if (alphabetRail != null && alphabetRail.getParent() instanceof ViewGroup)
+            ((ViewGroup) alphabetRail.getParent()).removeView(alphabetRail);
+        alphabetRail = null;
+    }
+
+    int viewTopInContent(View target) {
+        int top = 0;
+        View current = target;
+        while (current != null && current != content) {
+            top += current.getTop();
+            if (!(current.getParent() instanceof View)) break;
+            current = (View) current.getParent();
+        }
+        return Math.max(0, top);
     }
 
     void addLibraryListingHeader(String title, String subtitle, String library,
@@ -2421,8 +2648,18 @@ public class MainActivity extends Activity {
     }
 
     void addGrid(List<JSONObject> nodes) {
-        int columns = getResources().getConfiguration().orientation == 2 ? 5 : 2;
-        int gridWidth = getResources().getDisplayMetrics().widthPixels - d(32);
+        alphabetAnchors.clear();
+        boolean reserveAlphabetRail = alphabetVisible && libraryMode && !showingDetail
+                && breadcrumbs.isEmpty()
+                && ("movies".equals(selectedSection) || "series".equals(selectedSection));
+        int screenWidthDp = Math.round(getResources().getDisplayMetrics().widthPixels
+                / getResources().getDisplayMetrics().density);
+        int availableWidthDp = screenWidthDp - 32 - (reserveAlphabetRail ? 42 : 0);
+        int columns = isTelevision()
+                ? Math.max(2, Math.min(6, availableWidthDp / 160))
+                : (getResources().getConfiguration().orientation == 2 ? 5 : 2);
+        int gridWidth = getResources().getDisplayMetrics().widthPixels - d(32)
+                - (reserveAlphabetRail ? d(42) : 0);
         int cellWidth = Math.max(1, (gridWidth - d(columns * 8)) / columns);
         LinearLayout row = null;
         int count = 0;
@@ -2430,10 +2667,14 @@ public class MainActivity extends Activity {
             if (count % columns == 0) {
                 row = new LinearLayout(this);
                 row.setGravity(Gravity.TOP);
+                row.setClipChildren(false);
                 row.setPadding(d(16), 0, d(16), d(14));
+                if (!nodes.isEmpty()) row.setTag("alphabet-anchor:" + alphabetInitial(displayTitle(node)));
                 content.addView(row, new LinearLayout.LayoutParams(-1, -2));
             }
             View card = posterCard(node);
+            char initial = alphabetInitial(displayTitle(node));
+            if (!alphabetAnchors.containsKey(initial)) alphabetAnchors.put(initial, card);
             LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(cellWidth, -2);
             p.setMargins(d(4), 0, d(4), 0);
             row.addView(card, p);
@@ -2537,6 +2778,58 @@ public class MainActivity extends Activity {
         return new JSONObject(body);
     }
 
+    interface StyledActionHandler { void run(int selected); }
+
+    void showStyledActionDialog(String title, List<String> options, StyledActionHandler handler) {
+        AlertDialog dialog = new AlertDialog.Builder(this).create();
+        ScrollView scroll = new ScrollView(this);
+        scroll.setBackgroundColor(Color.TRANSPARENT);
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(d(18), d(18), d(18), d(14));
+        GradientDrawable panelBg = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                new int[]{0xFF1C2332, 0xFF211B2B});
+        panelBg.setCornerRadius(d(20));
+        panel.setBackground(panelBg);
+        TextView heading = label(title, 21, Color.WHITE, true);
+        heading.setPadding(d(4), d(2), d(4), d(14));
+        panel.addView(heading);
+        for (int i = 0; i < options.size(); i++) {
+            final int index = i;
+            LinearLayout option = new LinearLayout(this);
+            option.setGravity(Gravity.CENTER_VERTICAL);
+            option.setPadding(d(14), d(4), d(14), d(4));
+            GradientDrawable optionBg = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                    new int[]{0xFF342737, 0xFF252D3D});
+            optionBg.setCornerRadius(d(12));
+            option.setBackground(optionBg);
+            option.setFocusable(true);
+            option.setClickable(true);
+            TextView symbol = labelRaw("✦", 18, i == 0 ? 0xFFFF858C : 0xFFB7C4E1, true);
+            symbol.setGravity(Gravity.CENTER);
+            option.addView(symbol, new LinearLayout.LayoutParams(d(34), d(48)));
+            TextView text = label(options.get(i), 15, Color.WHITE, true);
+            text.setGravity(Gravity.CENTER_VERTICAL);
+            LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(0, d(52), 1);
+            textParams.leftMargin = d(8);
+            option.addView(text, textParams);
+            applyTvFocusStyle(option, false);
+            option.setOnClickListener(v -> { dialog.dismiss(); handler.run(index); });
+            LinearLayout.LayoutParams optionParams = new LinearLayout.LayoutParams(-1, -2);
+            optionParams.bottomMargin = d(8);
+            panel.addView(option, optionParams);
+        }
+        scroll.addView(panel);
+        dialog.setView(scroll);
+        dialog.show();
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setBackgroundDrawable(
+                    new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+            dialog.getWindow().setDimAmount(0.58f);
+        }
+        if (isTelevision() && panel.getChildCount() > 1) panel.getChildAt(1).requestFocus();
+    }
+
     void showActions(JSONObject node) {
         List<String> actions = new ArrayList<>();
         List<Runnable> handlers = new ArrayList<>();
@@ -2559,10 +2852,7 @@ public class MainActivity extends Activity {
         }
         actions.add("Metadata manual");
         handlers.add(() -> showMetadataEditor(node, new JSONArray()));
-        new AlertDialog.Builder(this)
-                .setTitle(t("Acciones"))
-                .setItems(localizedOptions(actions), (dialog, which) -> handlers.get(which).run())
-                .show();
+        showStyledActionDialog(t("Acciones"), actions, index -> handlers.get(index).run());
     }
 
     String[] localizedOptions(List<String> options) {
@@ -2602,6 +2892,12 @@ public class MainActivity extends Activity {
     }
 
     String watchKey(String stream) { return progressPrefix("watch") + stream; }
+    long mediaProgressPosition(JSONObject media) {
+        String stream = media.optString("stream_url", media.optString("stream", ""));
+        if (stream.isEmpty()) return 0L;
+        try { return new JSONObject(prefs.getString(watchKey(stream), "{}")).optLong("position"); }
+        catch (JSONException ignored) { return 0L; }
+    }
     String favoriteKey(String nodeId) { return progressPrefix("fav") + nodeId; }
     String nodeSeenKey(String nodeId) { return progressPrefix("seen") + "node:" + nodeId; }
     String mediaSeenKey(JSONObject media) {
@@ -2696,9 +2992,7 @@ public class MainActivity extends Activity {
         handlers.add(() -> setMediaWatched(media, owner, true));
         actions.add("Marcar como no visto");
         handlers.add(() -> setMediaWatched(media, owner, false));
-        new AlertDialog.Builder(this).setTitle(t("Acciones"))
-                .setItems(localizedOptions(actions), (dialog, which) -> handlers.get(which).run())
-                .show();
+        showStyledActionDialog(t("Acciones"), actions, index -> handlers.get(index).run());
     }
 
     void setMediaWatched(JSONObject media, JSONObject owner, boolean seen) {
@@ -2773,9 +3067,8 @@ public class MainActivity extends Activity {
     }
 
     void showResumeActions(JSONObject item) {
-        String[] actions = {"Marcar como visto", "Marcar como no visto", "Quitar de Seguir viendo"};
-        new AlertDialog.Builder(this).setTitle(t("Acciones"))
-                .setItems(localizedOptions(java.util.Arrays.asList(actions)), (dialog, which) -> {
+        List<String> actions = java.util.Arrays.asList("Marcar como visto", "Marcar como no visto", "Quitar de Seguir viendo");
+        showStyledActionDialog(t("Acciones"), actions, which -> {
                     if (which == 0) setResumeSeen(item, true);
                     else if (which == 1) setResumeSeen(item, false);
                     else {
@@ -2783,7 +3076,7 @@ public class MainActivity extends Activity {
                         scheduleProfileStateSync();
                     }
                     removeResumeCard(item);
-                }).show();
+                });
     }
 
     void removeResumeCard(JSONObject item) {
@@ -2877,7 +3170,7 @@ public class MainActivity extends Activity {
         field.setTextColor(Color.WHITE);
         field.setHintTextColor(MUTED);
         field.setHint(hint);
-        field.setText(value);
+        field.setText(cleanDisplayText(value));
         field.setSingleLine(!multiline);
         if (multiline) {
             field.setMinLines(3);
@@ -3311,6 +3604,9 @@ public class MainActivity extends Activity {
         showingDetail = true;
         detailNodeId = node.optString("id");
         if (backButton != null) backButton.setVisibility(View.VISIBLE);
+        if (alphabetToggleButton != null) alphabetToggleButton.setVisibility(View.GONE);
+        removeAlphabetRail();
+        content.setPadding(0, 0, 0, d(28));
         content.removeAllViews();
         FrameLayout banner = new FrameLayout(this);
         ImageView bgImage = new ImageView(this);
@@ -3338,22 +3634,28 @@ public class MainActivity extends Activity {
             info.addView(watched);
         }
         info.addView(labelRaw(displayTitle(node), 30, Color.WHITE, true));
-        String meta = node.optString("kind").equals("series")
-                ? cardSubtitle(node)
-                : node.optString("year", "") + (node.optJSONArray("genres") == null ? "" : "   •   " + join(node.optJSONArray("genres")));
-        TextView metadata = label(meta, 13, 0xFFD7D9DF, false);
-        LinearLayout.LayoutParams mp = new LinearLayout.LayoutParams(-1, -2);
-        mp.topMargin = d(5);
-        info.addView(metadata, mp);
-        TextView overview = labelRaw(node.optString("overview", ""), 14, 0xFFE0E1E6, false);
-        overview.setMaxLines(4);
-        LinearLayout.LayoutParams op = new LinearLayout.LayoutParams(-1, -2);
-        op.topMargin = d(10);
-        info.addView(overview, op);
+        String year = cleanDisplayText(node.optString("year", ""));
+        String genres = node.optJSONArray("genres") == null ? "" : cleanDisplayText(join(node.optJSONArray("genres")));
+        String meta = "series".equals(node.optString("kind")) ? cleanDisplayText(cardSubtitle(node))
+                : year + (year.isEmpty() || genres.isEmpty() ? "" : "   •   ") + genres;
+        if (!meta.isEmpty()) {
+            TextView metadata = label(meta, 13, 0xFFD7D9DF, false);
+            LinearLayout.LayoutParams mp = new LinearLayout.LayoutParams(-1, -2);
+            mp.topMargin = d(5);
+            info.addView(metadata, mp);
+        }
+        String overviewText = cleanDisplayText(node.optString("overview", ""));
+        if (!overviewText.isEmpty()) {
+            TextView overview = labelRaw(overviewText, 14, 0xFFE0E1E6, false);
+            overview.setMaxLines(4);
+            LinearLayout.LayoutParams op = new LinearLayout.LayoutParams(-1, -2);
+            op.topMargin = d(10);
+            info.addView(overview, op);
+        }
         JSONArray files = node.optJSONArray("files");
         LinearLayout controls = new LinearLayout(this);
         controls.setGravity(Gravity.CENTER_VERTICAL);
-        Button play = actionButton(node.optString("kind").equals("series") ? "Ver episodios" : "Reproducir", true);
+        Button play = actionButton("Reproducir", true);
         controls.addView(play, new LinearLayout.LayoutParams(-2, d(44)));
         if ("movie".equals(node.optString("kind")) && files != null && files.length() > 0) {
             Button details = actionButton("ⓘ  " + t("Details"), false);
@@ -3365,20 +3667,14 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams controlsP = new LinearLayout.LayoutParams(-1, -2);
         controlsP.topMargin = d(14);
         info.addView(controls, controlsP);
-        play.setOnClickListener(v -> playFirst(node));
+        play.setOnClickListener(v -> {
+            if ("series".equals(node.optString("kind"))) playNextSeriesEpisode(node);
+            else playFirst(node);
+        });
         banner.addView(info, new FrameLayout.LayoutParams(-1, -1));
-        TextView actions = label("⋮", 23, Color.WHITE, true);
-        actions.setGravity(Gravity.CENTER);
-        actions.setFocusable(true);
-        actions.setBackground(round(0xCC111318, d(18)));
-        actions.setElevation(d(5));
-        applyTvFocusStyle(actions, false);
-        FrameLayout.LayoutParams actionsParams = new FrameLayout.LayoutParams(d(42), d(42), Gravity.TOP | Gravity.RIGHT);
-        actionsParams.setMargins(0, d(14), d(14), 0);
-        banner.addView(actions, actionsParams);
-        actions.setOnClickListener(v -> showActions(node));
+        banner.setOnLongClickListener(v -> { showActions(node); return true; });
         LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(-1, d(390));
-        bp.setMargins(d(16), d(10), d(16), d(10));
+        bp.setMargins(0, d(10), 0, d(10));
         content.addView(banner, bp);
 
         if ("movie".equals(node.optString("kind")) || "series".equals(node.optString("kind"))) {
@@ -3733,20 +4029,28 @@ public class MainActivity extends Activity {
 
     void showVideoFileDetails(JSONObject file, String library) {
         if (file == null) return;
-        String filename = file.optString("filename", file.optString("title", "Vídeo"));
-        String extension = file.optString("extension", "");
+        String filename = cleanDisplayText(file.optString("filename", file.optString("title", "Vídeo")));
+        String title = cleanDisplayText(file.optString("title", ""));
+        String extension = cleanDisplayText(file.optString("extension", ""));
         long bytes = file.optLong("size_bytes", 0);
-        String modified = file.optString("modified_at", "");
+        String modified = cleanDisplayText(file.optString("modified_at", ""));
         StringBuilder message = new StringBuilder();
-        message.append(t("Nombre:")).append(" ").append(filename)
-                .append("\n").append(t("Título")).append(": ").append(file.optString("title", ""))
-                .append("\n").append(t("Extensión:")).append(" ").append(extension.isEmpty() ? "—" : extension)
-                .append("\n").append(t("Tamaño:")).append(" ").append(formatDetailedSize(bytes))
-                .append("\n").append(t("Ruta:")).append(" ").append(file.optString("relative_path", "—"))
-                .append("\n").append(t("Biblioteca:")).append(" ").append(library.isEmpty() ? "—" : library);
-        if (!modified.isEmpty()) message.append("\n").append(t("Modificado:")).append(" ").append(modified);
+        if (!filename.isEmpty()) message.append(t("Nombre:")).append(" ").append(filename);
+        if (!title.isEmpty()) appendDetailLine(message, t("Título"), title);
+        if (!extension.isEmpty()) appendDetailLine(message, t("Extensión:"), extension);
+        if (bytes > 0) appendDetailLine(message, t("Tamaño:"), formatDetailedSize(bytes));
+        String relativePath = cleanDisplayText(file.optString("relative_path", ""));
+        if (!relativePath.isEmpty()) appendDetailLine(message, t("Ruta:"), relativePath);
+        String libraryName = cleanDisplayText(library);
+        if (!libraryName.isEmpty()) appendDetailLine(message, t("Biblioteca:"), libraryName);
+        if (!modified.isEmpty()) appendDetailLine(message, t("Modificado:"), modified);
         new AlertDialog.Builder(this).setTitle(t("Detalles del archivo"))
                 .setMessage(message.toString()).setPositiveButton(t("Cerrar"), null).show();
+    }
+
+    void appendDetailLine(StringBuilder message, String label, String value) {
+        if (message.length() > 0) message.append("\n");
+        message.append(label).append(" ").append(cleanDisplayText(value));
     }
 
     String formatDetailedSize(long bytes) {
@@ -3770,33 +4074,46 @@ public class MainActivity extends Activity {
             item.setFocusable(true);
             item.setClickable(true);
             applyTvFocusStyle(item, true);
+            ImageView thumbnail = new ImageView(this);
+            thumbnail.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            thumbnail.setBackground(round(0xFF202534, d(8)));
+            String episodePoster = file.optString("poster_url", fallbackPoster);
+            loadImage(episodePoster, thumbnail, false);
+            LinearLayout.LayoutParams thumbParams = new LinearLayout.LayoutParams(d(128), d(72));
+            thumbParams.rightMargin = d(14);
+            item.addView(thumbnail, thumbParams);
             TextView play = label("▶", 20, Color.WHITE, true);
             play.setGravity(Gravity.CENTER);
-            item.addView(play, new LinearLayout.LayoutParams(d(48), d(48)));
+            play.setVisibility(View.GONE);
             LinearLayout texts = new LinearLayout(this);
             texts.setOrientation(LinearLayout.VERTICAL);
             TextView name = labelRaw(file.optString("title", "Vídeo"), 15, Color.WHITE, true);
-            String watched = isMediaSeen(file) ? "   ·   ✓ VISTO" : "";
-            TextView sub = label(file.optString("extension", "").replace(".", "").toUpperCase() + "   ·   " + formatSize(file.optLong("size_bytes")) + watched,
-                    12, isMediaSeen(file) ? 0xFF79E3B7 : MUTED, false);
+            boolean watchedEpisode = isMediaSeen(file);
+            long position = mediaProgressPosition(file);
+            boolean inProgress = !watchedEpisode && position > 10000L;
+            String watched = watchedEpisode ? "   ·   ✓ VISTO"
+                    : inProgress ? "   ·   EN CURSO ·   "
+                    + formatTime((int) Math.min(Integer.MAX_VALUE, position)) : "";
+            String extension = file.optString("extension", "").replace(".", "").toUpperCase();
+            String subText = extension.isEmpty() ? formatSize(file.optLong("size_bytes"))
+                    : extension + "   ·   " + formatSize(file.optLong("size_bytes"));
+            TextView sub = label(subText + watched,
+                    12, watchedEpisode ? 0xFF79E3B7 : inProgress ? 0xFFFFC078 : MUTED, false);
             texts.addView(name);
             LinearLayout.LayoutParams subP = new LinearLayout.LayoutParams(-1, -2);
             subP.topMargin = d(4);
             texts.addView(sub, subP);
             item.addView(texts, new LinearLayout.LayoutParams(0, -2, 1));
-            TextView actions = label("⋮", 22, Color.WHITE, true);
-            actions.setGravity(Gravity.CENTER);
-            actions.setFocusable(true);
-            actions.setMinWidth(d(36));
-            applyTvFocusStyle(actions, false);
-            item.addView(actions);
             LinearLayout.LayoutParams ip = new LinearLayout.LayoutParams(-1, -2);
             ip.setMargins(d(16), 0, d(16), d(8));
             content.addView(item, ip);
             item.setOnClickListener(v -> launchPlayer(file.optString("stream_url"),
                     file.optString("title", "Zinema"), file.optString("poster_url", fallbackPoster),
                     owner.optString("id", ""), file.optString("id", ""), owner.optString("kind", "")));
-            actions.setOnClickListener(v -> showMediaActions(file, owner));
+            item.setOnLongClickListener(v -> {
+                showMediaActions(file, owner);
+                return true;
+            });
         }
     }
 
@@ -3812,6 +4129,84 @@ public class MainActivity extends Activity {
         JSONArray children = node.optJSONArray("children");
         if (children != null && children.length() > 0) openNode(children.optJSONObject(0));
         else Toast.makeText(this, "No hay un vídeo disponible.", Toast.LENGTH_SHORT).show();
+    }
+
+    void playNextSeriesEpisode(JSONObject seriesNode) {
+        JSONArray seasonNodes = seriesNode.optJSONArray("children");
+        if (seasonNodes == null || seasonNodes.length() == 0) {
+            Toast.makeText(this, "No hay capítulos disponibles.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Toast.makeText(this, "Buscando el siguiente capítulo…", Toast.LENGTH_SHORT).show();
+        io.execute(() -> {
+            try {
+                List<JSONObject> seasons = toList(seasonNodes);
+                Collections.sort(seasons, Comparator.comparingInt(value -> value.optInt("season_number")));
+                List<JSONObject> episodes = new ArrayList<>();
+                for (JSONObject seasonStub : seasons) {
+                    String seasonId = seasonStub.optString("id", "");
+                    if (seasonId.isEmpty()) continue;
+                    JSONObject season = getJson("/api/v1/catalog/" + enc(seasonId));
+                    JSONArray files = season.optJSONArray("files");
+                    if (files == null) continue;
+                    for (int i = 0; i < files.length(); i++) {
+                        JSONObject file = files.optJSONObject(i);
+                        if (file == null) continue;
+                        JSONObject episode = new JSONObject(file.toString());
+                        episode.put("owner_node_id", seasonId);
+                        episode.put("owner_kind", "season");
+                        episodes.add(episode);
+                    }
+                }
+                int lastSeenIndex = -1;
+                JSONObject inProgressEpisode = null;
+                long newestProgress = Long.MIN_VALUE;
+                for (int i = 0; i < episodes.size(); i++) {
+                    JSONObject episode = episodes.get(i);
+                    if (isMediaSeen(episode)) {
+                        lastSeenIndex = i;
+                        continue;
+                    }
+                    if (mediaProgressPosition(episode) > 10000L) {
+                        long updated = 0L;
+                        String stream = episode.optString("stream_url", "");
+                        try {
+                            updated = new JSONObject(prefs.getString(watchKey(stream), "{}"))
+                                    .optLong("updated");
+                        } catch (JSONException ignored) { }
+                        if (updated >= newestProgress) {
+                            newestProgress = updated;
+                            inProgressEpisode = episode;
+                        }
+                    }
+                }
+                JSONObject selected = inProgressEpisode;
+                if (selected == null) {
+                    for (int i = lastSeenIndex + 1; i < episodes.size(); i++) {
+                        if (!isMediaSeen(episodes.get(i))) {
+                            selected = episodes.get(i);
+                            break;
+                        }
+                    }
+                }
+                JSONObject nextEpisode = selected;
+                runOnUiThread(() -> {
+                    if (nextEpisode == null) {
+                        Toast.makeText(this, "No hay capítulos pendientes.", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    launchPlayer(nextEpisode.optString("stream_url"),
+                            nextEpisode.optString("title", displayTitle(seriesNode)),
+                            nextEpisode.optString("poster_url", seriesNode.optString("poster_url", "")),
+                            nextEpisode.optString("owner_node_id", ""),
+                            nextEpisode.optString("id", ""), "season");
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(this,
+                        "No se pudo buscar el siguiente capítulo: " + e.getMessage(),
+                        Toast.LENGTH_LONG).show());
+            }
+        });
     }
 
     String formatSize(long bytes) {
@@ -5020,7 +5415,18 @@ public class MainActivity extends Activity {
         return list;
     }
 
+    String nextEpisodeKey() { return "next_episode:" + activeProfileId(); }
+
+    JSONObject readNextEpisode() {
+        try {
+            String raw = prefs.getString(nextEpisodeKey(), "");
+            if (!raw.isEmpty()) return new JSONObject(raw);
+        } catch (JSONException ignored) { }
+        return null;
+    }
+
     void addResumeRow(String title, List<JSONObject> items) {
+        boolean nextEpisodeRow = "Siguiente capítulo".equals(title);
         LinearLayout section = new LinearLayout(this);
         section.setOrientation(LinearLayout.VERTICAL);
         TextView heading = label(title, 22, Color.WHITE, true);
@@ -5029,8 +5435,10 @@ public class MainActivity extends Activity {
         HorizontalScrollView horizontal = new HorizontalScrollView(this);
         horizontal.setHorizontalScrollBarEnabled(false);
         horizontal.setClipToPadding(false);
+        horizontal.setClipChildren(false);
         horizontal.setTag("zinema-lazy-posters");
         LinearLayout cards = new LinearLayout(this);
+        cards.setClipChildren(false);
         cards.setPadding(d(16), 0, d(16), d(8));
         for (JSONObject item : items) {
             FrameLayout card = new FrameLayout(this);
@@ -5051,7 +5459,8 @@ public class MainActivity extends Activity {
             details.setOrientation(LinearLayout.VERTICAL);
             details.setGravity(Gravity.BOTTOM);
             details.setPadding(d(14), d(12), d(14), d(12));
-            details.addView(label("▶  " + t("CONTINUAR") + " · " + formatTime(item.optInt("position")),
+            details.addView(label(nextEpisodeRow ? "▶  " + t("SIGUIENTE CAPÍTULO")
+                            : "▶  " + t("CONTINUAR") + " · " + formatTime(item.optInt("position")),
                     10, 0xFFFF858A, true));
             TextView name = labelRaw(item.optString("title", "Vídeo"), 14, Color.WHITE, true);
             name.setMaxLines(2);
@@ -5063,19 +5472,18 @@ public class MainActivity extends Activity {
             if (cover.isEmpty()) cover = posterByStream.get(item.optString("stream", ""));
             String resumePoster = cover == null ? "" : cover;
             showPoster(resumePoster, poster, true);
-            card.setOnClickListener(v -> launchPlayer(item.optString("stream"),
+            card.setOnClickListener(v -> {
+                if (nextEpisodeRow) prefs.edit().remove(nextEpisodeKey())
+                        .remove(watchKey(item.optString("stream"))).apply();
+                launchPlayer(item.optString("stream"),
                     item.optString("title", "Zinema"), resumePoster,
                     item.optString("owner_node_id", item.optString("node_id", "")),
-                    item.optString("media_id", ""), item.optString("owner_kind", "")));
-            TextView actions = label("⋮", 20, Color.WHITE, true);
-            actions.setGravity(Gravity.CENTER);
-            actions.setFocusable(true);
-            actions.setBackground(round(0xCC111318, d(18)));
-            applyTvFocusStyle(actions, false);
-            FrameLayout.LayoutParams actionParams = new FrameLayout.LayoutParams(d(34), d(34), Gravity.TOP | Gravity.RIGHT);
-            actionParams.setMargins(0, d(6), d(6), 0);
-            card.addView(actions, actionParams);
-            actions.setOnClickListener(v -> showResumeActions(item));
+                    item.optString("media_id", ""), item.optString("owner_kind", ""));
+            });
+            card.setOnLongClickListener(v -> {
+                showResumeActions(item);
+                return true;
+            });
             LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(d(224), d(148));
             cardParams.setMargins(0, 0, d(10), 0);
             cards.addView(card, cardParams);
@@ -5125,12 +5533,18 @@ public class MainActivity extends Activity {
         io.execute(() -> {
             try {
                 JSONObject ticket = postJson("/api/v1/items/" + enc(resolvedItemId) + "/playback-ticket");
+                JSONObject nextEpisode = null;
+                if ("season".equals(ownerKind) && ownerNodeId != null && !ownerNodeId.isEmpty()) {
+                    try { nextEpisode = findNextEpisode(ownerNodeId, resolvedItemId); }
+                    catch (Exception ignored) { }
+                }
                 String ticketPath = ticket.optString("url", "");
                 if (ticketPath.isEmpty()) throw new Exception("El servidor no devolvió el acceso temporal al vídeo.");
                 String url = ticketPath.startsWith("http") ? ticketPath
                         : server + (ticketPath.startsWith("/") ? ticketPath : "/" + ticketPath);
+                String nextEpisodeJson = nextEpisode == null ? "" : nextEpisode.toString();
                 runOnUiThread(() -> startPlayerActivity(url, path, title, posterUrl, ownerNodeId,
-                        resolvedItemId, ownerKind, key, resumePosition));
+                        resolvedItemId, ownerKind, key, resumePosition, nextEpisodeJson));
             } catch (Exception e) {
                 runOnUiThread(() -> Toast.makeText(this,
                         "No se pudo preparar el vídeo: " + e.getMessage(), Toast.LENGTH_LONG).show());
@@ -5140,7 +5554,7 @@ public class MainActivity extends Activity {
 
     void startPlayerActivity(String url, String path, String title, String posterUrl,
                              String ownerNodeId, String mediaId, String ownerKind,
-                             String key, long position) {
+                             String key, long position, String nextEpisodeJson) {
         Intent intent = new Intent(this, PlayerActivity.class);
         intent.putExtra("url", url);
         intent.putExtra("path", path);
@@ -5152,7 +5566,53 @@ public class MainActivity extends Activity {
         intent.putExtra("owner_kind", ownerKind);
         intent.putExtra("progress_key", key);
         intent.putExtra("profile_id", activeProfileId());
+        intent.putExtra("next_episode_json", nextEpisodeJson);
+        playerLaunched = true;
         startActivity(intent);
+    }
+
+    JSONObject findNextEpisode(String seasonId, String mediaId) throws Exception {
+        JSONObject season = getJson("/api/v1/catalog/" + enc(seasonId));
+        JSONArray files = season.optJSONArray("files");
+        if (files != null) {
+            for (int i = 0; i < files.length(); i++) {
+                JSONObject file = files.optJSONObject(i);
+                if (file != null && mediaId.equals(file.optString("id")) && i + 1 < files.length())
+                    return nextEpisodePayload(files.optJSONObject(i + 1), season);
+            }
+        }
+        String seriesId = season.optString("parent_id", "");
+        if (seriesId.isEmpty() || "null".equals(seriesId)) return null;
+        JSONObject seriesNode = getJson("/api/v1/catalog/" + enc(seriesId));
+        List<JSONObject> seasons = toList(seriesNode.optJSONArray("children"));
+        Collections.sort(seasons, Comparator.comparingInt(value -> value.optInt("season_number")));
+        boolean afterCurrent = false;
+        for (JSONObject entry : seasons) {
+            if (seasonId.equals(entry.optString("id"))) { afterCurrent = true; continue; }
+            if (!afterCurrent) continue;
+            JSONObject followingSeason = getJson("/api/v1/catalog/" + enc(entry.optString("id")));
+            JSONArray followingFiles = followingSeason.optJSONArray("files");
+            if (followingFiles != null && followingFiles.length() > 0)
+                return nextEpisodePayload(followingFiles.optJSONObject(0), followingSeason);
+        }
+        return null;
+    }
+
+    JSONObject nextEpisodePayload(JSONObject file, JSONObject season) {
+        if (file == null || season == null) return null;
+        JSONObject next = new JSONObject();
+        String stream = file.optString("stream_url", "");
+        try {
+            next.put("id", file.optString("id", ""));
+            next.put("title", file.optString("title", "Siguiente capítulo"));
+            next.put("stream", stream);
+            next.put("stream_url", stream);
+            next.put("poster_url", file.optString("poster_url", season.optString("poster_url", "")));
+            next.put("media_id", file.optString("id", ""));
+            next.put("owner_node_id", season.optString("id", ""));
+            next.put("owner_kind", "season");
+        } catch (JSONException ignored) { return null; }
+        return next;
     }
 
     @Override protected void onResume() {
@@ -5164,6 +5624,10 @@ public class MainActivity extends Activity {
             if (apk.isFile()) startApkInstall(apk);
         }
         if (hasResumedOnce) {
+            boolean returnedFromPlayer = playerLaunched;
+            playerLaunched = false;
+            processPlayerReturn();
+            if (returnedFromPlayer && showingDetail) refreshCurrentScreen();
             String activeId = activeProfileId();
             if (!activeId.isEmpty() && prefs.getBoolean(profileStateDirtyKey(activeId), false)) {
                 scheduleProfileStateSync();
@@ -5181,6 +5645,45 @@ public class MainActivity extends Activity {
             if (breadcrumbs.isEmpty()) maybeRefreshCatalogListing(currentLibrary, null);
             else maybeRefreshCatalogListing(currentLibrary,
                     breadcrumbs.get(breadcrumbs.size() - 1).optString("id"));
+        }
+    }
+
+    void processPlayerReturn() {
+        String profileId = activeProfileId();
+        if (profileId.isEmpty() || advancingCompletedEpisode) return;
+        String completedMedia = prefs.getString("completed_media:" + profileId, "");
+        String completedOwner = prefs.getString("completed_owner:" + profileId, "");
+        String completedKind = prefs.getString("completed_kind:" + profileId, "");
+        String autoPlay = prefs.getString("auto_play_episode:" + profileId, "");
+        if (completedMedia.isEmpty() && autoPlay.isEmpty()) return;
+        prefs.edit().remove("completed_media:" + profileId).remove("completed_owner:" + profileId)
+                .remove("completed_kind:" + profileId).remove("auto_play_episode:" + profileId)
+                .apply();
+        refreshCurrentScreen();
+        if (!completedOwner.isEmpty() && "season".equals(completedKind)) {
+            advancingCompletedEpisode = true;
+            io.execute(() -> {
+                try {
+                    JSONObject season = getJson("/api/v1/catalog/" + enc(completedOwner));
+                    runOnUiThread(() -> {
+                        refreshSeasonSeen(season);
+                        advancingCompletedEpisode = false;
+                        refreshCurrentScreen();
+                    });
+                } catch (Exception ignored) {
+                    runOnUiThread(() -> advancingCompletedEpisode = false);
+                }
+            });
+        }
+        if (!autoPlay.isEmpty()) {
+            try {
+                JSONObject next = new JSONObject(autoPlay);
+                prefs.edit().remove(nextEpisodeKey()).apply();
+                launchPlayer(next.optString("stream", next.optString("stream_url", "")),
+                        next.optString("title", "Zinema"), next.optString("poster_url", ""),
+                        next.optString("owner_node_id", ""), next.optString("media_id", ""),
+                        next.optString("owner_kind", "season"));
+            } catch (JSONException ignored) { }
         }
     }
 

@@ -7,6 +7,8 @@ CLIENT_HOME=${HOME:-}
 SDK_ROOT=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$CLIENT_HOME/Android/Sdk}}
 BUILD_TOOLS_VERSION=${BUILD_TOOLS_VERSION:-36.0.0}
 ANDROID_API=${ANDROID_API:-35}
+LOCAL_VERSION_CODE=${LOCAL_VERSION_CODE:-$(date +%s)}
+LOCAL_VERSION_NAME=${LOCAL_VERSION_NAME:-1.0.local.$(date -u +%Y%m%d%H%M%S)}
 TOOLS="$SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION"
 ANDROID_JAR="$SDK_ROOT/platforms/android-$ANDROID_API/android.jar"
 BUILD_DIR="$CLIENT_DIR/build"
@@ -16,6 +18,12 @@ fail() {
     printf 'ERROR: %s\n' "$1" >&2
     exit 1
 }
+
+case "$LOCAL_VERSION_CODE" in
+    ''|*[!0-9]*) fail "LOCAL_VERSION_CODE debe ser un entero positivo." ;;
+esac
+[ "$LOCAL_VERSION_CODE" -gt 0 ] && [ "$LOCAL_VERSION_CODE" -le 2100000000 ] || \
+    fail "LOCAL_VERSION_CODE debe estar entre 1 y 2100000000."
 
 [ -x "$TOOLS/aapt2" ] || fail "No encuentro aapt2 en $TOOLS. Ajusta ANDROID_SDK_ROOT o BUILD_TOOLS_VERSION."
 [ -x "$TOOLS/d8" ] || fail "No encuentro d8 en $TOOLS."
@@ -46,8 +54,8 @@ python3 "$CLIENT_DIR/generate_server_config.py" "$REPO_DIR/.env" \
     --custom-package com.zinema.client \
     --min-sdk-version 23 \
     --target-sdk-version "$ANDROID_API" \
-    --version-code 31 \
-    --version-name 1.0.0 \
+    --version-code "$LOCAL_VERSION_CODE" \
+    --version-name "$LOCAL_VERSION_NAME" \
     --auto-add-overlay \
     "$BUILD_DIR/resources.zip"
 

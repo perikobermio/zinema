@@ -225,6 +225,29 @@ def _write_season_artwork(connection: sqlite3.Connection, node: sqlite3.Row, det
                          AND available=1""",
                     (episode_title, node["id"], season_number, int(episode_number)),
                 )
+            still_path = episode.get("still_path")
+            if episode_number is not None and still_path:
+                media_rows = connection.execute(
+                    """SELECT id, poster_file FROM library_items
+                       WHERE series_node_id=? AND season_number=? AND episode_number=?
+                         AND available=1""",
+                    (node["id"], season_number, int(episode_number)),
+                ).fetchall()
+                for media in media_rows:
+                    if media["poster_file"]:
+                        continue
+                    try:
+                        still_file = _save_image(
+                            client, image_base, backdrop_size, still_path,
+                            artwork_dir / f"{media['id']}-episode-still.jpg",
+                        )
+                    except Exception:
+                        still_file = None
+                    if still_file:
+                        connection.execute(
+                            "UPDATE library_items SET poster_file=? WHERE id=?",
+                            (still_file, media["id"]),
+                        )
 
         image_path = (tmdb_season.get("poster_path") or season_details.get("poster_path"))
         image_type = "poster"
@@ -443,6 +466,9 @@ def enrich_pending(connection: sqlite3.Connection, access_token: str, language: 
                         "UPDATE catalog_nodes SET cast_json=?, cast_version=1 WHERE id=?",
                         (json.dumps(_cast_payload(details), ensure_ascii=False), node["id"]),
                     )
+                    if node["kind"] == "series":
+                        _write_season_artwork(connection, node, details, artwork_dir, client,
+                                              config, language, api_key)
                     connection.commit()
                     continue
                 if node["tmdb_id"]:
