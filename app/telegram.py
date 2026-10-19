@@ -11,9 +11,10 @@ from telethon.sync import TelegramClient
 
 _SEND_LOCK = threading.Lock()
 DEFAULT_SESSION_PATH = "/data/telegram/zinema"
+DEFAULT_TELEGRAM_TARGET = 431465473
 
 
-def _configuration() -> tuple[int, str, str, str]:
+def _configuration() -> tuple[int, str, str, str | int]:
     raw_api_id = os.getenv("TELEGRAM_API_ID", "").strip()
     api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
     if not raw_api_id or not api_hash:
@@ -23,7 +24,10 @@ def _configuration() -> tuple[int, str, str, str]:
     except ValueError:
         raise RuntimeError("TELEGRAM_API_ID debe ser un entero") from None
     session_path = os.getenv("TELEGRAM_SESSION_PATH", DEFAULT_SESSION_PATH).strip()
-    target = os.getenv("TELEGRAM_TARGET", "me").strip() or "me"
+    raw_target = os.getenv("TELEGRAM_TARGET", str(DEFAULT_TELEGRAM_TARGET)).strip()
+    if not raw_target:
+        raw_target = str(DEFAULT_TELEGRAM_TARGET)
+    target: str | int = int(raw_target) if raw_target.lstrip("-").isdigit() else raw_target
     if not session_path:
         raise RuntimeError("TELEGRAM_SESSION_PATH no puede estar vacío")
     return api_id, api_hash, session_path, target
@@ -40,6 +44,24 @@ def _new_client() -> tuple[TelegramClient, str]:
     return TelegramClient(session_path, api_id, api_hash), session_path
 
 
+async def _resolve_target(client: TelegramClient, target: str | int):
+    if not isinstance(target, int):
+        return target
+    try:
+        return await client.get_input_entity(target)
+    except ValueError:
+        # Numeric IDs only work after Telethon has seen the peer. Loading the
+        # account's dialogs can populate its session cache before resolving it.
+        await client.get_dialogs(limit=None)
+        try:
+            return await client.get_input_entity(target)
+        except ValueError:
+            raise RuntimeError(
+                f"No se encontró el chat de Telegram {target}. Abre esa conversación "
+                "desde la cuenta del servidor y vuelve a intentarlo."
+            ) from None
+
+
 async def _send_message(caption: str, thumbnail: bytes | None) -> int:
     client, session_path = _new_client()
     _, _, _, target = _configuration()
@@ -47,12 +69,13 @@ async def _send_message(caption: str, thumbnail: bytes | None) -> int:
         await client.connect()
         if not await client.is_user_authorized():
             raise RuntimeError("La sesión de Telegram no está autorizada; ejecuta python -m app.telegram en el contenedor")
+        destination = await _resolve_target(client, target)
         if thumbnail:
             photo = io.BytesIO(thumbnail)
             photo.name = "zinema-request-poster.jpg"
-            message = await client.send_file(target, photo, caption=caption, force_document=False)
+            message = await client.send_file(destination, photo, caption=caption, force_document=False)
         else:
-            message = await client.send_message(target, caption)
+            message = await client.send_message(destination, caption)
         return int(message.id)
     finally:
         await client.disconnect()
