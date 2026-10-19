@@ -1556,30 +1556,91 @@ public class MainActivity extends Activity {
         resultsParams.topMargin = d(8);
         screen.addView(results, resultsParams);
 
-        LinearLayout selectedBox = new LinearLayout(this);
-        selectedBox.setOrientation(LinearLayout.VERTICAL);
-        selectedBox.setPadding(d(14), d(12), d(14), d(12));
-        selectedBox.setBackground(round(PANEL, d(12)));
-        LinearLayout.LayoutParams selectedBoxParams = new LinearLayout.LayoutParams(-1, -2);
-        selectedBoxParams.topMargin = d(14);
-        screen.addView(selectedBox, selectedBoxParams);
-        TextView selectedTitle = label(t("Selecciona un resultado para continuar."), 15, MUTED, false);
-        selectedBox.addView(selectedTitle);
+        TextView selectedHeading = label(t("Contenido seleccionado"), 17, Color.WHITE, true);
+        LinearLayout.LayoutParams selectedHeadingParams = new LinearLayout.LayoutParams(-1, -2);
+        selectedHeadingParams.topMargin = d(14);
+        screen.addView(selectedHeading, selectedHeadingParams);
+        TextView selectedTitle = label(t("Selecciona un resultado para continuar."), 14, MUTED, false);
+        LinearLayout.LayoutParams selectedTitleParams = new LinearLayout.LayoutParams(-1, -2);
+        selectedTitleParams.topMargin = d(6);
+        screen.addView(selectedTitle, selectedTitleParams);
         Button seasonChoice = actionButton(t("Serie completa"), false);
         seasonChoice.setVisibility(View.GONE);
         LinearLayout.LayoutParams seasonChoiceParams = new LinearLayout.LayoutParams(-1, d(44));
         seasonChoiceParams.topMargin = d(10);
-        selectedBox.addView(seasonChoice, seasonChoiceParams);
-        Button submit = actionButton(t("Enviar solicitud"), true);
+        screen.addView(seasonChoice, seasonChoiceParams);
+        Button addItem = actionButton(t("Añadir a la petición"), false);
+        addItem.setEnabled(false);
+        LinearLayout.LayoutParams addItemParams = new LinearLayout.LayoutParams(-1, d(44));
+        addItemParams.topMargin = d(8);
+        screen.addView(addItem, addItemParams);
+
+        TextView queueHeading = label(t("Elementos en la petición") + " · 0", 17, Color.WHITE, true);
+        LinearLayout.LayoutParams queueHeadingParams = new LinearLayout.LayoutParams(-1, -2);
+        queueHeadingParams.topMargin = d(18);
+        screen.addView(queueHeading, queueHeadingParams);
+        LinearLayout queue = new LinearLayout(this);
+        queue.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams queueParams = new LinearLayout.LayoutParams(-1, -2);
+        queueParams.topMargin = d(8);
+        screen.addView(queue, queueParams);
+        Button submit = actionButton(t("Enviar solicitudes") + " · 0", true);
         submit.setEnabled(false);
         LinearLayout.LayoutParams submitParams = new LinearLayout.LayoutParams(-1, d(46));
-        submitParams.topMargin = d(14);
+        submitParams.topMargin = d(12);
         screen.addView(submit, submitParams);
         content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
         if (isTelevision()) query.requestFocus();
 
+        ArrayList<JSONObject> requestItems = new ArrayList<>();
+        JSONObject[] selectedCandidate = {null};
         JSONObject[] selection = {null};
         int[] selectedSeason = {-1};
+        JSONArray[] searchResults = {new JSONArray()};
+        Runnable[] renderGrid = {null};
+        renderGrid[0] = () -> renderContentRequestGrid(results, searchResults[0],
+                selectedCandidate[0], candidate -> loadContentRequestSelection(candidate,
+                        selectedTitle, seasonChoice, addItem, selectedCandidate,
+                        selection, selectedSeason, renderGrid[0]));
+        Runnable[] renderQueue = {null};
+        renderQueue[0] = () -> {
+            queue.removeAllViews();
+            queueHeading.setText(t("Elementos en la petición") + " · " + requestItems.size());
+            submit.setText(t("Enviar solicitudes") + " · " + requestItems.size());
+            submit.setEnabled(!requestItems.isEmpty());
+            for (int i = 0; i < requestItems.size(); i++) {
+                JSONObject item = requestItems.get(i);
+                LinearLayout row = new LinearLayout(this);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(d(8), d(7), d(8), d(7));
+                row.setBackground(round(PANEL, d(9)));
+                ImageView poster = new ImageView(this);
+                poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                row.addView(poster, new LinearLayout.LayoutParams(d(48), d(68)));
+                loadImage(tmdbPosterUrl(item.optString("poster_path", "")), poster, false);
+                LinearLayout textBox = new LinearLayout(this);
+                textBox.setOrientation(LinearLayout.VERTICAL);
+                LinearLayout.LayoutParams textBoxParams = new LinearLayout.LayoutParams(0, -2, 1);
+                textBoxParams.leftMargin = d(10);
+                row.addView(textBox, textBoxParams);
+                textBox.addView(labelRaw(item.optString("title", ""), 14, Color.WHITE, true));
+                String subtitle = "movie".equals(item.optString("content_type"))
+                        ? t("Película") : t("Serie");
+                int season = item.optInt("season_number");
+                if (season > 0) subtitle += " · " + t("Temporada") + " " + season;
+                textBox.addView(label(subtitle, 12, MUTED, false));
+                Button remove = actionButton(t("Quitar"), false);
+                row.addView(remove, new LinearLayout.LayoutParams(-2, d(38)));
+                remove.setOnClickListener(v -> {
+                    requestItems.remove(item);
+                    renderQueue[0].run();
+                });
+                LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, -2);
+                rowParams.bottomMargin = d(6);
+                queue.addView(row, rowParams);
+            }
+        };
+
         seasonChoice.setOnClickListener(v -> {
             JSONObject details = selection[0];
             JSONArray seasons = details == null ? null : details.optJSONArray("seasons");
@@ -1603,15 +1664,60 @@ public class MainActivity extends Activity {
                     }).show();
         });
 
-        submit.setOnClickListener(v -> {
+        addItem.setOnClickListener(v -> {
             JSONObject current = selection[0];
             if (current == null) return;
+            String type = current.optString("content_type");
+            long tmdbId = current.optLong("tmdb_id");
+            int season = selectedSeason[0];
+            for (JSONObject item : requestItems) {
+                if (item.optString("content_type").equals(type)
+                        && item.optLong("tmdb_id") == tmdbId
+                        && item.optInt("season_number", -1) == season) {
+                    Toast.makeText(this, t("Ese contenido ya está en la petición."), Toast.LENGTH_SHORT).show();
+                    return;
+                }
+            }
+            if (requestItems.size() >= 20) {
+                Toast.makeText(this, t("Puedes añadir hasta 20 elementos."), Toast.LENGTH_SHORT).show();
+                return;
+            }
+            try {
+                JSONObject queued = new JSONObject();
+                queued.put("content_type", type);
+                queued.put("tmdb_id", tmdbId);
+                queued.put("title", current.optString("metadata_title", ""));
+                queued.put("year", current.opt("year"));
+                queued.put("poster_path", current.optString("poster_path", ""));
+                if (season > 0) queued.put("season_number", season);
+                else queued.put("season_number", -1);
+                requestItems.add(queued);
+            } catch (JSONException ignored) { return; }
+            selectedCandidate[0] = null;
+            selection[0] = null;
+            selectedSeason[0] = -1;
+            selectedTitle.setText(t("Selecciona un resultado para continuar."));
+            seasonChoice.setVisibility(View.GONE);
+            addItem.setEnabled(false);
+            renderGrid[0].run();
+            renderQueue[0].run();
+        });
+
+        submit.setOnClickListener(v -> {
+            if (requestItems.isEmpty()) return;
             JSONObject payload = new JSONObject();
             try {
                 payload.put("request_type", "new_content");
-                payload.put("content_type", current.optString("content_type"));
-                payload.put("tmdb_id", current.optLong("tmdb_id"));
-                if (selectedSeason[0] > 0) payload.put("season_number", selectedSeason[0]);
+                JSONArray items = new JSONArray();
+                for (JSONObject item : requestItems) {
+                    JSONObject entry = new JSONObject();
+                    entry.put("content_type", item.optString("content_type"));
+                    entry.put("tmdb_id", item.optLong("tmdb_id"));
+                    int season = item.optInt("season_number", -1);
+                    if (season > 0) entry.put("season_number", season);
+                    items.put(entry);
+                }
+                payload.put("items", items);
             } catch (JSONException ignored) { return; }
             submit.setEnabled(false);
             io.execute(() -> {
@@ -1619,16 +1725,20 @@ public class MainActivity extends Activity {
                     postJson("/api/v1/content-requests", payload);
                     runOnUiThread(() -> {
                         Toast.makeText(this, t("Solicitud enviada a administración."), Toast.LENGTH_LONG).show();
+                        requestItems.clear();
+                        selectedCandidate[0] = null;
                         selection[0] = null;
                         selectedSeason[0] = -1;
                         selectedTitle.setText(t("Selecciona un resultado para continuar."));
                         seasonChoice.setVisibility(View.GONE);
-                        results.removeAllViews();
+                        addItem.setEnabled(false);
+                        renderGrid[0].run();
+                        renderQueue[0].run();
                         query.setText("");
                     });
                 } catch (Exception e) {
                     runOnUiThread(() -> {
-                        submit.setEnabled(selection[0] != null);
+                        submit.setEnabled(!requestItems.isEmpty());
                         Toast.makeText(this, t("No se pudo enviar la solicitud: ") + e.getMessage(),
                                 Toast.LENGTH_LONG).show();
                     });
@@ -1643,12 +1753,13 @@ public class MainActivity extends Activity {
                 if (contentRequestSearchTask != null)
                     contentRequestSearchHandler.removeCallbacks(contentRequestSearchTask);
                 String searchTerm = editable.toString().trim();
+                selectedCandidate[0] = null;
                 selection[0] = null;
                 selectedSeason[0] = -1;
                 selectedTitle.setText(t("Selecciona un resultado para continuar."));
-                selectedTitle.setTag(null);
                 seasonChoice.setVisibility(View.GONE);
-                submit.setEnabled(false);
+                addItem.setEnabled(false);
+                searchResults[0] = new JSONArray();
                 results.removeAllViews();
                 if (searchTerm.length() < 2) return;
                 contentRequestSearchTask = () -> io.execute(() -> {
@@ -1658,35 +1769,13 @@ public class MainActivity extends Activity {
                         runOnUiThread(() -> {
                             if (!showingAdmin || results.getParent() == null
                                     || !searchTerm.equals(query.getText().toString().trim())) return;
-                            results.removeAllViews();
                             if (found == null || found.length() == 0) {
+                                results.removeAllViews();
                                 results.addView(label(t("No se encontraron resultados."), 13, MUTED, false));
                                 return;
                             }
-                            for (int i = 0; i < found.length(); i++) {
-                                JSONObject candidate = found.optJSONObject(i);
-                                if (candidate == null) continue;
-                                LinearLayout row = new LinearLayout(MainActivity.this);
-                                row.setOrientation(LinearLayout.VERTICAL);
-                                row.setPadding(d(12), d(9), d(12), d(9));
-                                row.setBackground(round(PANEL, d(8)));
-                                row.setFocusable(true);
-                                row.setClickable(true);
-                                TextView name = labelRaw(candidate.optString("title", ""), 15, Color.WHITE, true);
-                                row.addView(name);
-                                String type = "movie".equals(candidate.optString("content_type"))
-                                        ? t("Película") : t("Serie");
-                                String year = candidate.isNull("year") ? "" : candidate.optString("year");
-                                TextView subtitle = label(type + (year.isEmpty() ? "" : " · " + year),
-                                        12, MUTED, false);
-                                row.addView(subtitle);
-                                LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, -2);
-                                rowParams.bottomMargin = d(6);
-                                results.addView(row, rowParams);
-                                row.setOnClickListener(v -> loadContentRequestSelection(candidate,
-                                        selectedTitle, seasonChoice, submit, selection, selectedSeason));
-                                applyTvFocusStyle(row, false);
-                            }
+                            searchResults[0] = found;
+                            renderGrid[0].run();
                         });
                     } catch (Exception e) {
                         runOnUiThread(() -> {
@@ -1703,23 +1792,97 @@ public class MainActivity extends Activity {
         });
     }
 
+    interface ContentRequestCandidateHandler { void onSelected(JSONObject candidate); }
+
+    String tmdbPosterUrl(String posterPath) {
+        if (posterPath == null || posterPath.trim().isEmpty() || "null".equalsIgnoreCase(posterPath)) return "";
+        if (posterPath.startsWith("http")) return posterPath;
+        return "https://image.tmdb.org/t/p/w342" + (posterPath.startsWith("/") ? posterPath : "/" + posterPath);
+    }
+
+    void renderContentRequestGrid(LinearLayout results, JSONArray candidates, JSONObject selected,
+                                  ContentRequestCandidateHandler handler) {
+        results.removeAllViews();
+        int columns = Math.max(2, Math.min(5,
+                (getResources().getDisplayMetrics().widthPixels - d(48)) / d(158)));
+        LinearLayout gridRow = null;
+        int inRow = 0;
+        for (int i = 0; i < candidates.length(); i++) {
+            JSONObject candidate = candidates.optJSONObject(i);
+            if (candidate == null) continue;
+            if (gridRow == null || inRow == columns) {
+                gridRow = new LinearLayout(this);
+                gridRow.setGravity(Gravity.TOP);
+                LinearLayout.LayoutParams gridRowParams = new LinearLayout.LayoutParams(-1, -2);
+                gridRowParams.topMargin = d(8);
+                results.addView(gridRow, gridRowParams);
+                inRow = 0;
+            }
+            LinearLayout tile = new LinearLayout(this);
+            tile.setOrientation(LinearLayout.VERTICAL);
+            tile.setPadding(d(5), d(5), d(5), d(7));
+            tile.setFocusable(true);
+            tile.setClickable(true);
+            String tag = candidate.optString("content_type") + ":" + candidate.optLong("tmdb_id");
+            String selectedTag = selected == null ? "" : selected.optString("content_type")
+                    + ":" + selected.optLong("tmdb_id");
+            GradientDrawable tileBackground = round(tag.equals(selectedTag) ? 0xFF393147 : PANEL, d(10));
+            if (tag.equals(selectedTag)) tileBackground.setStroke(d(2), 0xFFFFC857);
+            tile.setBackground(tileBackground);
+            ImageView poster = new ImageView(this);
+            poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            poster.setBackground(round(PANEL, d(8)));
+            tile.addView(poster, new LinearLayout.LayoutParams(-1, d(174)));
+            loadImage(tmdbPosterUrl(candidate.optString("poster_path", "")), poster, false);
+            TextView name = labelRaw(candidate.optString("title", ""), 13, Color.WHITE, true);
+            name.setMaxLines(2);
+            LinearLayout.LayoutParams nameParams = new LinearLayout.LayoutParams(-1, -2);
+            nameParams.topMargin = d(6);
+            tile.addView(name, nameParams);
+            String type = "movie".equals(candidate.optString("content_type")) ? t("Película") : t("Serie");
+            String year = candidate.isNull("year") ? "" : candidate.optString("year");
+            tile.addView(label(type + (year.isEmpty() ? "" : " · " + year), 11, MUTED, false));
+            tile.setOnClickListener(v -> handler.onSelected(candidate));
+            applyTvFocusStyle(tile, false);
+            LinearLayout.LayoutParams tileParams = new LinearLayout.LayoutParams(0, -2, 1);
+            tileParams.setMargins(d(3), 0, d(3), d(5));
+            gridRow.addView(tile, tileParams);
+            inRow++;
+        }
+        if (gridRow != null) {
+            while (inRow++ < columns) gridRow.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+        }
+    }
+
     void loadContentRequestSelection(JSONObject candidate, TextView selectedTitle,
-                                     Button seasonChoice, Button submit, JSONObject[] selection,
-                                     int[] selectedSeason) {
+                                     Button seasonChoice, Button addItem,
+                                     JSONObject[] selectedCandidate, JSONObject[] selection,
+                                     int[] selectedSeason, Runnable rerenderGrid) {
         String type = candidate.optString("content_type", "");
         long tmdbId = candidate.optLong("tmdb_id");
         if (tmdbId <= 0 || (!"movie".equals(type) && !"tv".equals(type))) return;
         String selectionTag = type + ":" + tmdbId;
-        selectedTitle.setTag(selectionTag);
+        selectedCandidate[0] = candidate;
+        selection[0] = null;
+        selectedSeason[0] = -1;
         selectedTitle.setText(t("Cargando selección…"));
         seasonChoice.setVisibility(View.GONE);
-        submit.setEnabled(false);
+        addItem.setEnabled(false);
+        rerenderGrid.run();
         io.execute(() -> {
             try {
                 JSONObject details = getJson("/api/v1/content-requests/tmdb/" + type + "/" + tmdbId);
                 details.put("content_type", type);
                 runOnUiThread(() -> {
-                    if (!selectionTag.equals(selectedTitle.getTag())) return;
+                    if (selectedCandidate[0] == null
+                            || !selectionTag.equals(selectedCandidate[0].optString("content_type")
+                            + ":" + selectedCandidate[0].optLong("tmdb_id"))) return;
+                    if (details.optString("poster_path").isEmpty())
+                        details.remove("poster_path");
+                    if (!details.has("poster_path")) {
+                        try { details.put("poster_path", candidate.optString("poster_path", "")); }
+                        catch (JSONException ignored) { }
+                    }
                     selection[0] = details;
                     selectedSeason[0] = -1;
                     String title = details.optString("metadata_title", candidate.optString("title", ""));
@@ -1730,14 +1893,16 @@ public class MainActivity extends Activity {
                         seasonChoice.setText(t("Serie completa"));
                         seasonChoice.setVisibility(View.VISIBLE);
                     }
-                    submit.setEnabled(true);
+                    addItem.setEnabled(true);
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
-                    if (!selectionTag.equals(selectedTitle.getTag())) return;
+                    if (selectedCandidate[0] == null
+                            || !selectionTag.equals(selectedCandidate[0].optString("content_type")
+                            + ":" + selectedCandidate[0].optLong("tmdb_id"))) return;
                     selection[0] = null;
                     selectedTitle.setText(t("No se pudo cargar la selección: ") + e.getMessage());
-                    submit.setEnabled(false);
+                    addItem.setEnabled(false);
                 });
             }
         });
@@ -4657,6 +4822,7 @@ public class MainActivity extends Activity {
             case "Busca una película o serie en TMDb y envía la solicitud a administración.":
                 return "Bilatu film edo telesail bat TMDb-n eta bidali eskaera administraziora.";
             case "Título de película o serie": return "Filmaren edo telesailaren izenburua";
+            case "Contenido seleccionado": return "Hautatutako edukia";
             case "Selecciona un resultado para continuar.": return "Hautatu emaitza bat jarraitzeko.";
             case "No se encontraron resultados.": return "Ez da emaitzarik aurkitu.";
             case "No se pudo buscar en TMDb: ": return "Ezin izan da TMDb-n bilatu: ";
@@ -4665,6 +4831,12 @@ public class MainActivity extends Activity {
             case "Serie completa": return "Telesail osoa";
             case "Selecciona una temporada": return "Hautatu denboraldi bat";
             case "Enviar solicitud": return "Eskaera bidali";
+            case "Añadir a la petición": return "Gehitu eskaerara";
+            case "Elementos en la petición": return "Eskaerako elementuak";
+            case "Enviar solicitudes": return "Eskaerak bidali";
+            case "Quitar": return "Kendu";
+            case "Ese contenido ya está en la petición.": return "Eduki hori dagoeneko eskaeran dago.";
+            case "Puedes añadir hasta 20 elementos.": return "Gehienez 20 elementu gehi ditzakezu.";
             case "Solicitud enviada a administración.": return "Eskaera administraziora bidali da.";
             case "No se pudo enviar la solicitud: ": return "Ezin izan da eskaera bidali: ";
             case "Enviar una solicitud para las temporadas o capítulos que faltan de ":
@@ -5889,12 +6061,22 @@ public class MainActivity extends Activity {
                         JSONObject request = requests.optJSONObject(i);
                         if (request == null) continue;
                         LinearLayout row = new LinearLayout(this);
-                        row.setOrientation(LinearLayout.VERTICAL);
+                        row.setGravity(Gravity.CENTER_VERTICAL);
                         LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, -2);
                         rowParams.topMargin = d(14);
                         card.addView(row, rowParams);
+                        ImageView poster = new ImageView(this);
+                        poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                        poster.setBackground(round(PANEL, d(7)));
+                        row.addView(poster, new LinearLayout.LayoutParams(d(68), d(100)));
+                        loadContentRequestPoster(request, poster);
+                        LinearLayout detailsColumn = new LinearLayout(this);
+                        detailsColumn.setOrientation(LinearLayout.VERTICAL);
+                        LinearLayout.LayoutParams detailsColumnParams = new LinearLayout.LayoutParams(0, -2, 1);
+                        detailsColumnParams.leftMargin = d(10);
+                        row.addView(detailsColumn, detailsColumnParams);
                         TextView title = labelRaw(request.optString("title", ""), 16, Color.WHITE, true);
-                        row.addView(title);
+                        detailsColumn.addView(title);
                         String typeLabel;
                         if ("remaining_seasons".equals(request.optString("request_type"))) {
                             typeLabel = t("Temporadas restantes");
@@ -5922,12 +6104,12 @@ public class MainActivity extends Activity {
                         TextView info = label(typeLabel, 12, MUTED, false);
                         LinearLayout.LayoutParams infoParams = new LinearLayout.LayoutParams(-1, -2);
                         infoParams.topMargin = d(4);
-                        row.addView(info, infoParams);
+                        detailsColumn.addView(info, infoParams);
                         LinearLayout actions = new LinearLayout(this);
                         actions.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
                         LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(-1, -2);
                         actionsParams.topMargin = d(7);
-                        row.addView(actions, actionsParams);
+                        detailsColumn.addView(actions, actionsParams);
                         if ("pending".equals(request.optString("status"))) {
                             Button approve = actionButton(t("Aceptar"), true);
                             actions.addView(approve, new LinearLayout.LayoutParams(-2, d(40)));
@@ -5950,6 +6132,37 @@ public class MainActivity extends Activity {
             } catch (Exception ignored) {
                 // The protected endpoint stays hidden for non-administrator accounts.
             }
+        });
+    }
+
+    void loadContentRequestPoster(JSONObject request, ImageView target) {
+        String posterUrl = request.optString("poster_url", "");
+        if (posterUrl.isEmpty() || "null".equals(posterUrl))
+            posterUrl = tmdbPosterUrl(request.optString("poster_path", ""));
+        if (!posterUrl.isEmpty()) {
+            loadImage(posterUrl, target, false);
+            return;
+        }
+        io.execute(() -> {
+            String resolved = "";
+            try {
+                if ("remaining_seasons".equals(request.optString("request_type"))) {
+                    String nodeId = request.optString("catalog_node_id", "");
+                    if (!nodeId.isEmpty() && !"null".equals(nodeId))
+                        resolved = getJson("/api/v1/catalog/" + enc(nodeId)).optString("poster_url", "");
+                } else {
+                    String type = request.optString("content_type", "");
+                    long tmdbId = request.optLong("tmdb_id");
+                    if (tmdbId > 0 && ("movie".equals(type) || "tv".equals(type))) {
+                        JSONObject details = getJson("/api/v1/content-requests/tmdb/" + type + "/" + tmdbId);
+                        resolved = tmdbPosterUrl(details.optString("poster_path", ""));
+                    }
+                }
+            } catch (Exception ignored) { }
+            String finalResolved = resolved;
+            if (!finalResolved.isEmpty()) runOnUiThread(() -> {
+                if (target.getParent() != null) loadImage(finalResolved, target, false);
+            });
         });
     }
 

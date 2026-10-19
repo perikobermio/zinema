@@ -109,12 +109,19 @@ class ManualMetadataRequest(BaseModel):
     tmdb_id: int | None = Field(default=None, gt=0)
 
 
+class ContentRequestItem(BaseModel):
+    content_type: str = Field(pattern="^(movie|tv)$")
+    tmdb_id: int = Field(gt=0)
+    season_number: int | None = Field(default=None, ge=1)
+
+
 class ContentRequestCreate(BaseModel):
     request_type: str = Field(pattern="^(new_content|remaining_seasons)$")
     content_type: str | None = Field(default=None, pattern="^(movie|tv)$")
     tmdb_id: int | None = Field(default=None, gt=0)
     season_number: int | None = Field(default=None, ge=1)
     catalog_node_id: str | None = Field(default=None, max_length=100)
+    items: list[ContentRequestItem] = Field(default_factory=list, max_length=20)
 
 
 class UserProfileRequest(BaseModel):
@@ -1798,6 +1805,8 @@ def get_content_request_title(content_type: str, tmdb_id: int) -> dict[str, obje
 def create_content_request(request: ContentRequestCreate,
                            device_id: Annotated[str, Depends(require_client)]) -> dict[str, object]:
     requester_id = account_for_device(device_id)
+    now = datetime.now(timezone.utc).isoformat()
+    records: list[dict[str, object]] = []
     with closing(database()) as connection:
         account = connection.execute(
             "SELECT COALESCE(NULLIF(username, ''), email) AS name FROM accounts WHERE id=?",
@@ -1806,12 +1815,13 @@ def create_content_request(request: ContentRequestCreate,
         if account is None:
             raise HTTPException(status_code=401, detail="Account not found")
 
-        details: dict[str, object] = {}
         if request.request_type == "remaining_seasons":
-            if not request.catalog_node_id or request.tmdb_id is not None or request.season_number is not None:
+            if (not request.catalog_node_id or request.tmdb_id is not None
+                    or request.season_number is not None or request.items or request.content_type is not None):
                 raise HTTPException(status_code=422, detail="A series catalog item is required")
             series = connection.execute(
-                """SELECT id, kind, title, metadata_title, year, tmdb_id, tmdb_episodes_json
+                """SELECT id, kind, title, metadata_title, year, tmdb_id, tmdb_episodes_json,
+                          poster_file
                    FROM catalog_nodes WHERE id=? AND available=1""",
                 (request.catalog_node_id,),
             ).fetchone()
@@ -1820,59 +1830,93 @@ def create_content_request(request: ContentRequestCreate,
             completion = _series_completion(connection, series["id"], series["tmdb_episodes_json"])
             if not completion["incomplete"]:
                 raise HTTPException(status_code=409, detail="This series has no known missing seasons or episodes")
+            poster_url = (_artwork_url(series["id"], "poster", series["poster_file"])
+                          if series["poster_file"] else None)
+            if not poster_url:
+                fallback_poster = _series_fallback_poster(connection, series["id"])
+                if fallback_poster:
+                    poster_url = _artwork_url(
+                        fallback_poster[0], "poster", fallback_poster[1],
+                        fallback_version=fallback_poster[2],
+                    )
             details = {
                 "missing_seasons": completion["missing_seasons"],
                 "missing_episode_count": completion["missing_episode_count"],
+                "poster_url": poster_url,
             }
-            content_type = "tv"
-            tmdb_id = series["tmdb_id"]
-            title = series["metadata_title"] or series["title"]
-            year = series["year"]
-            season_number = None
-            catalog_node_id = series["id"]
+            records.append({
+                "request_type": request.request_type,
+                "content_type": "tv",
+                "tmdb_id": series["tmdb_id"],
+                "title": series["metadata_title"] or series["title"],
+                "year": series["year"],
+                "season_number": None,
+                "catalog_node_id": series["id"],
+                "details": details,
+            })
         else:
-            if request.content_type not in {"movie", "tv"} or request.tmdb_id is None:
-                raise HTTPException(status_code=422, detail="Select a movie or series from TMDb")
-            if request.content_type == "movie" and request.season_number is not None:
-                raise HTTPException(status_code=422, detail="Movies do not have seasons")
-            if request.season_number is not None and request.content_type != "tv":
-                raise HTTPException(status_code=422, detail="Only series can include a season")
+            if request.items:
+                if request.content_type is not None or request.tmdb_id is not None or request.season_number is not None:
+                    raise HTTPException(status_code=422, detail="Use either items or a single content selection")
+                selected_items = request.items
+            else:
+                if request.content_type not in {"movie", "tv"} or request.tmdb_id is None:
+                    raise HTTPException(status_code=422, detail="Select a movie or series from TMDb")
+                selected_items = [ContentRequestItem(
+                    content_type=request.content_type,
+                    tmdb_id=request.tmdb_id,
+                    season_number=request.season_number,
+                )]
             if not TMDB_CONFIGURED:
                 raise HTTPException(status_code=503, detail="TMDb credentials are not configured")
-            try:
-                details = get_candidate_details(
-                    request.content_type, request.tmdb_id,
-                    TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, TMDB_KEY,
-                )
-            except Exception as exc:
-                raise HTTPException(status_code=502,
-                                    detail=f"Could not load TMDb title: {str(exc)[:300]}") from None
-            if request.season_number is not None and request.season_number not in {
-                    int(item["season_number"]) for item in details.get("seasons", [])}:
-                raise HTTPException(status_code=422, detail="Selected season was not found on TMDb")
-            content_type = request.content_type
-            tmdb_id = request.tmdb_id
-            title = str(details.get("metadata_title") or "").strip()
-            year = details.get("year")
-            season_number = request.season_number
-            catalog_node_id = None
-            details = {"overview": details.get("overview", ""),
-                       "season_count": len(details.get("seasons", []))}
+            for item in selected_items:
+                if item.content_type == "movie" and item.season_number is not None:
+                    raise HTTPException(status_code=422, detail="Movies do not have seasons")
+                try:
+                    candidate = get_candidate_details(
+                        item.content_type, item.tmdb_id,
+                        TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, TMDB_KEY,
+                    )
+                except Exception as exc:
+                    raise HTTPException(status_code=502,
+                                        detail=f"Could not load TMDb title: {str(exc)[:300]}") from None
+                if item.season_number is not None and item.season_number not in {
+                        int(season["season_number"]) for season in candidate.get("seasons", [])}:
+                    raise HTTPException(status_code=422, detail="Selected season was not found on TMDb")
+                details = {
+                    "overview": candidate.get("overview", ""),
+                    "season_count": len(candidate.get("seasons", [])),
+                    "poster_path": candidate.get("poster_path"),
+                }
+                records.append({
+                    "request_type": request.request_type,
+                    "content_type": item.content_type,
+                    "tmdb_id": item.tmdb_id,
+                    "title": str(candidate.get("metadata_title") or "").strip(),
+                    "year": candidate.get("year"),
+                    "season_number": item.season_number,
+                    "catalog_node_id": None,
+                    "details": details,
+                })
 
-        request_id = uuid4().hex
-        now = datetime.now(timezone.utc).isoformat()
-        connection.execute(
-            """INSERT INTO content_requests(
-                   id, requester_account_id, requester_name, request_type, content_type,
-                   tmdb_id, title, year, season_number, catalog_node_id, details_json,
-                   status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
-            (request_id, requester_id, account["name"], request.request_type,
-             content_type, tmdb_id, title, year, season_number, catalog_node_id,
-             json.dumps(details, ensure_ascii=False), now),
-        )
+        request_ids = []
+        for record in records:
+            request_id = uuid4().hex
+            request_ids.append(request_id)
+            connection.execute(
+                """INSERT INTO content_requests(
+                       id, requester_account_id, requester_name, request_type, content_type,
+                       tmdb_id, title, year, season_number, catalog_node_id, details_json,
+                       status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                (request_id, requester_id, account["name"], record["request_type"],
+                 record["content_type"], record["tmdb_id"], record["title"], record["year"],
+                 record["season_number"], record["catalog_node_id"],
+                 json.dumps(record["details"], ensure_ascii=False), now),
+            )
         connection.commit()
-    return {"id": request_id, "status": "pending", "created_at": now}
+    return {"id": request_ids[0], "ids": request_ids, "count": len(request_ids),
+            "status": "pending", "created_at": now}
 
 
 @app.get("/api/v1/admin/content-requests", dependencies=[Depends(require_admin)])
@@ -1882,10 +1926,16 @@ def list_content_requests() -> list[dict[str, object]]:
             """SELECT * FROM content_requests
                ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, created_at DESC"""
         ).fetchall()
-    return [{**{key: row[key] for key in (
+    results = []
+    for row in rows:
+        details = json.loads(row["details_json"] or "{}")
+        results.append({**{key: row[key] for key in (
         "id", "requester_name", "request_type", "content_type", "tmdb_id",
         "title", "year", "season_number", "catalog_node_id", "status", "created_at",
-    )}, "details": json.loads(row["details_json"] or "{}")} for row in rows]
+        )}, "details": details,
+        "poster_path": details.get("poster_path"),
+        "poster_url": details.get("poster_url")})
+    return results
 
 
 @app.post("/api/v1/admin/content-requests/{request_id}/approve",
