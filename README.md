@@ -129,6 +129,8 @@ Al reintentar metadata desde el cliente, `POST /api/v1/catalog/ID_DEL_NODO/metad
 
 Las rutas de reintento, búsqueda y edición de metadata también requieren `Authorization: Bearer $DEVICE_TOKEN`. Las ediciones manuales permanecen guardadas y no las reemplaza la sincronización diaria. Se pueden volver a solicitar coincidencias después de un minuto por elemento.
 
+Las solicitudes de contenido usan `GET /api/v1/content-requests/search?q=TITULO` para buscar películas y series en TMDb, `GET /api/v1/content-requests/tmdb/{tipo}/{tmdb_id}` para cargar sus temporadas (`tipo` es `movie` o `tv`) y `POST /api/v1/content-requests` para enviarlas. Cualquier cuenta autenticada puede pedir contenido nuevo o solicitar las temporadas y capítulos que faltan de una serie incompleta. `GET /api/v1/admin/content-requests`, `POST /api/v1/admin/content-requests/{id}/approve` y `DELETE /api/v1/admin/content-requests/{id}` requieren una cuenta administradora. Aceptar una solicitud solo cambia su estado a aprobada; todavía no modifica el catálogo.
+
 Al asociar una serie con TMDb, el servidor consulta también los episodios para guardar sus títulos. Si TMDb no tiene un título para el episodio, el cliente muestra el nombre del archivo. En temporadas intenta usar el póster de temporada, una imagen del primer episodio y, como último recurso, el póster de la serie.
 
 Los nodos y archivos heredan los géneros y el póster de la colección ancestro más cercana cuando no tienen esos datos propios. Un póster o género asignado al nodo prevalece sobre el heredado. `GET /api/v1/genres` devuelve la lista sin duplicados de los géneros que ya aparecen en el catálogo; al importar metadata nueva, sus géneros pasan a estar disponibles automáticamente.

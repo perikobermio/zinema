@@ -396,6 +396,34 @@ def search_metadata_candidates(node: sqlite3.Row, access_token: str, language: s
     return candidates[:10]
 
 
+def search_content_requests(query: str, access_token: str, language: str,
+                            api_key: str = "") -> list[dict]:
+    """Search movies and series for user content requests."""
+    title = query.strip()
+    if not title:
+        return []
+    headers = {"accept": "application/json"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    results: list[dict] = []
+    with httpx.Client(headers=headers, timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
+        for kind in ("movie", "tv"):
+            for result in _search_titles(client, kind, title, None, language, api_key):
+                candidate_title = result.get("title") or result.get("name") or ""
+                original = result.get("original_title") or result.get("original_name") or ""
+                date = result.get("release_date") or result.get("first_air_date")
+                results.append({
+                    "tmdb_id": int(result["id"]), "content_type": kind,
+                    "title": candidate_title, "original_title": original,
+                    "year": int(date[:4]) if date and len(date) >= 4 and date[:4].isdigit() else None,
+                    "overview": result.get("overview") or "",
+                    "poster_path": result.get("poster_path"),
+                    "score": round(_match_score(title, candidate_title, original, None, date), 4),
+                })
+    results.sort(key=lambda item: item["score"], reverse=True)
+    return results[:12]
+
+
 def get_candidate_details(kind: str, tmdb_id: int, access_token: str,
                           language: str, api_key: str = "") -> dict:
     entity_kind = "movie" if kind == "movie" else "tv"
@@ -416,6 +444,12 @@ def get_candidate_details(kind: str, tmdb_id: int, access_token: str,
         "age_rating": age_rating,
         "poster_path": details.get("poster_path"),
         "backdrop_path": details.get("backdrop_path"),
+        "seasons": ([{"season_number": int(item["season_number"]),
+                      "name": item.get("name") or f"Season {item['season_number']}",
+                      "episode_count": int(item.get("episode_count") or 0)}
+                     for item in details.get("seasons", [])
+                     if item.get("season_number") is not None and int(item["season_number"]) > 0]
+                    if entity_kind == "tv" else []),
     }
 
 

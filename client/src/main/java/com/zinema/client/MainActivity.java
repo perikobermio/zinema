@@ -110,6 +110,8 @@ public class MainActivity extends Activity {
     static final long IMAGE_DISK_CACHE_MAX_BYTES = 160L * 1024L * 1024L;
     final ExecutorService io = Executors.newFixedThreadPool(4);
     final Handler adminSyncHandler = new Handler(Looper.getMainLooper());
+    final Handler contentRequestSearchHandler = new Handler(Looper.getMainLooper());
+    Runnable contentRequestSearchTask;
     Runnable adminSyncPollTask;
     final LruCache<String, Bitmap> imageCache = new LruCache<String, Bitmap>(bitmapCacheBytes()) {
         @Override protected int sizeOf(String key, Bitmap value) {
@@ -1486,6 +1488,7 @@ public class MainActivity extends Activity {
                 List<Integer> actions = new ArrayList<>();
                 choices.add(t("Cambiar perfil")); actions.add(1);
                 choices.add(t("Administración")); actions.add(2);
+                choices.add(t("Pedir contenido")); actions.add(6);
                 if (prefs.getBoolean("account_is_admin", false)) {
                     choices.add(t("Gestión de cuentas")); actions.add(5);
                 }
@@ -1498,11 +1501,12 @@ public class MainActivity extends Activity {
             PopupMenu menu = new PopupMenu(MainActivity.this, chip);
             addAvatarMenuItem(menu, 1, 1, t("Cambiar perfil"), MenuIconDrawable.PROFILE);
             addAvatarMenuItem(menu, 2, 2, t("Administración"), MenuIconDrawable.SETTINGS);
+            addAvatarMenuItem(menu, 6, 3, t("Pedir contenido"), MenuIconDrawable.SEARCH);
             if (prefs.getBoolean("account_is_admin", false)) {
-                addAvatarMenuItem(menu, 5, 3, "Gestión de cuentas", MenuIconDrawable.ACCOUNTS);
+                addAvatarMenuItem(menu, 5, 4, t("Gestión de cuentas"), MenuIconDrawable.ACCOUNTS);
             }
-            addAvatarMenuItem(menu, 3, 4, t("Cerrar sesión"), MenuIconDrawable.LOGOUT);
-            addAvatarMenuItem(menu, 4, 5, t("Salir"), MenuIconDrawable.EXIT);
+            addAvatarMenuItem(menu, 3, 5, t("Cerrar sesión"), MenuIconDrawable.LOGOUT);
+            addAvatarMenuItem(menu, 4, 6, t("Salir"), MenuIconDrawable.EXIT);
             menu.setOnMenuItemClickListener(item -> {
                 runAvatarMenuAction(item.getItemId());
                 return true;
@@ -1516,8 +1520,227 @@ public class MainActivity extends Activity {
         if (id == 1) openProfileManager();
         else if (id == 2) showSettings();
         else if (id == 5) showAccountManagement();
+        else if (id == 6) showContentRequestScreen();
         else if (id == 3) logoutAccount();
         else if (id == 4) finishAndRemoveTask();
+    }
+
+    void showContentRequestScreen() {
+        if (clientApiToken().isEmpty()) {
+            showLoginScreen();
+            return;
+        }
+        leaveStartupHomeWait();
+        if (!showingAdmin) adminReturnDetailId = showingDetail ? detailNodeId : "";
+        showingAdmin = true;
+        showingDetail = false;
+        buildShell(t("Pedir contenido"));
+        content.removeAllViews();
+
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setPadding(d(20), d(14), d(20), d(28));
+        screen.addView(label(t("Pedir contenido"), 26, Color.WHITE, true));
+        TextView explanation = label(t("Busca una película o serie en TMDb y envía la solicitud a administración."),
+                14, MUTED, false);
+        LinearLayout.LayoutParams explanationParams = new LinearLayout.LayoutParams(-1, -2);
+        explanationParams.topMargin = d(6);
+        explanationParams.bottomMargin = d(14);
+        screen.addView(explanation, explanationParams);
+
+        EditText query = settingsField("", t("Título de película o serie"), false);
+        screen.addView(query, new LinearLayout.LayoutParams(-1, d(48)));
+        LinearLayout results = new LinearLayout(this);
+        results.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams resultsParams = new LinearLayout.LayoutParams(-1, -2);
+        resultsParams.topMargin = d(8);
+        screen.addView(results, resultsParams);
+
+        LinearLayout selectedBox = new LinearLayout(this);
+        selectedBox.setOrientation(LinearLayout.VERTICAL);
+        selectedBox.setPadding(d(14), d(12), d(14), d(12));
+        selectedBox.setBackground(round(PANEL, d(12)));
+        LinearLayout.LayoutParams selectedBoxParams = new LinearLayout.LayoutParams(-1, -2);
+        selectedBoxParams.topMargin = d(14);
+        screen.addView(selectedBox, selectedBoxParams);
+        TextView selectedTitle = label(t("Selecciona un resultado para continuar."), 15, MUTED, false);
+        selectedBox.addView(selectedTitle);
+        Button seasonChoice = actionButton(t("Serie completa"), false);
+        seasonChoice.setVisibility(View.GONE);
+        LinearLayout.LayoutParams seasonChoiceParams = new LinearLayout.LayoutParams(-1, d(44));
+        seasonChoiceParams.topMargin = d(10);
+        selectedBox.addView(seasonChoice, seasonChoiceParams);
+        Button submit = actionButton(t("Enviar solicitud"), true);
+        submit.setEnabled(false);
+        LinearLayout.LayoutParams submitParams = new LinearLayout.LayoutParams(-1, d(46));
+        submitParams.topMargin = d(14);
+        screen.addView(submit, submitParams);
+        content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
+        if (isTelevision()) query.requestFocus();
+
+        JSONObject[] selection = {null};
+        int[] selectedSeason = {-1};
+        seasonChoice.setOnClickListener(v -> {
+            JSONObject details = selection[0];
+            JSONArray seasons = details == null ? null : details.optJSONArray("seasons");
+            if (seasons == null || seasons.length() == 0) return;
+            String[] labels = new String[seasons.length() + 1];
+            int[] seasonNumbers = new int[labels.length];
+            labels[0] = t("Serie completa");
+            seasonNumbers[0] = -1;
+            for (int i = 0; i < seasons.length(); i++) {
+                JSONObject season = seasons.optJSONObject(i);
+                int number = season == null ? i + 1 : season.optInt("season_number", i + 1);
+                int episodes = season == null ? 0 : season.optInt("episode_count");
+                labels[i + 1] = t("Temporada") + " " + number
+                        + (episodes > 0 ? " · " + episodes + " " + t(episodes == 1 ? "capítulo" : "capítulos") : "");
+                seasonNumbers[i + 1] = number;
+            }
+            new AlertDialog.Builder(this).setTitle(t("Selecciona una temporada"))
+                    .setItems(labels, (dialog, which) -> {
+                        selectedSeason[0] = seasonNumbers[which];
+                        seasonChoice.setText(labels[which]);
+                    }).show();
+        });
+
+        submit.setOnClickListener(v -> {
+            JSONObject current = selection[0];
+            if (current == null) return;
+            JSONObject payload = new JSONObject();
+            try {
+                payload.put("request_type", "new_content");
+                payload.put("content_type", current.optString("content_type"));
+                payload.put("tmdb_id", current.optLong("tmdb_id"));
+                if (selectedSeason[0] > 0) payload.put("season_number", selectedSeason[0]);
+            } catch (JSONException ignored) { return; }
+            submit.setEnabled(false);
+            io.execute(() -> {
+                try {
+                    postJson("/api/v1/content-requests", payload);
+                    runOnUiThread(() -> {
+                        Toast.makeText(this, t("Solicitud enviada a administración."), Toast.LENGTH_LONG).show();
+                        selection[0] = null;
+                        selectedSeason[0] = -1;
+                        selectedTitle.setText(t("Selecciona un resultado para continuar."));
+                        seasonChoice.setVisibility(View.GONE);
+                        results.removeAllViews();
+                        query.setText("");
+                    });
+                } catch (Exception e) {
+                    runOnUiThread(() -> {
+                        submit.setEnabled(selection[0] != null);
+                        Toast.makeText(this, t("No se pudo enviar la solicitud: ") + e.getMessage(),
+                                Toast.LENGTH_LONG).show();
+                    });
+                }
+            });
+        });
+
+        query.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) { }
+            @Override public void afterTextChanged(Editable editable) {
+                if (contentRequestSearchTask != null)
+                    contentRequestSearchHandler.removeCallbacks(contentRequestSearchTask);
+                String searchTerm = editable.toString().trim();
+                selection[0] = null;
+                selectedSeason[0] = -1;
+                selectedTitle.setText(t("Selecciona un resultado para continuar."));
+                selectedTitle.setTag(null);
+                seasonChoice.setVisibility(View.GONE);
+                submit.setEnabled(false);
+                results.removeAllViews();
+                if (searchTerm.length() < 2) return;
+                contentRequestSearchTask = () -> io.execute(() -> {
+                    try {
+                        JSONArray found = getJson("/api/v1/content-requests/search?q=" + enc(searchTerm))
+                                .optJSONArray("results");
+                        runOnUiThread(() -> {
+                            if (!showingAdmin || results.getParent() == null
+                                    || !searchTerm.equals(query.getText().toString().trim())) return;
+                            results.removeAllViews();
+                            if (found == null || found.length() == 0) {
+                                results.addView(label(t("No se encontraron resultados."), 13, MUTED, false));
+                                return;
+                            }
+                            for (int i = 0; i < found.length(); i++) {
+                                JSONObject candidate = found.optJSONObject(i);
+                                if (candidate == null) continue;
+                                LinearLayout row = new LinearLayout(MainActivity.this);
+                                row.setOrientation(LinearLayout.VERTICAL);
+                                row.setPadding(d(12), d(9), d(12), d(9));
+                                row.setBackground(round(PANEL, d(8)));
+                                row.setFocusable(true);
+                                row.setClickable(true);
+                                TextView name = labelRaw(candidate.optString("title", ""), 15, Color.WHITE, true);
+                                row.addView(name);
+                                String type = "movie".equals(candidate.optString("content_type"))
+                                        ? t("Película") : t("Serie");
+                                String year = candidate.isNull("year") ? "" : candidate.optString("year");
+                                TextView subtitle = label(type + (year.isEmpty() ? "" : " · " + year),
+                                        12, MUTED, false);
+                                row.addView(subtitle);
+                                LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, -2);
+                                rowParams.bottomMargin = d(6);
+                                results.addView(row, rowParams);
+                                row.setOnClickListener(v -> loadContentRequestSelection(candidate,
+                                        selectedTitle, seasonChoice, submit, selection, selectedSeason));
+                                applyTvFocusStyle(row, false);
+                            }
+                        });
+                    } catch (Exception e) {
+                        runOnUiThread(() -> {
+                            if (!showingAdmin || results.getParent() == null
+                                    || !searchTerm.equals(query.getText().toString().trim())) return;
+                            results.removeAllViews();
+                            results.addView(label(t("No se pudo buscar en TMDb: ") + e.getMessage(),
+                                    13, MUTED, false));
+                        });
+                    }
+                });
+                contentRequestSearchHandler.postDelayed(contentRequestSearchTask, 350L);
+            }
+        });
+    }
+
+    void loadContentRequestSelection(JSONObject candidate, TextView selectedTitle,
+                                     Button seasonChoice, Button submit, JSONObject[] selection,
+                                     int[] selectedSeason) {
+        String type = candidate.optString("content_type", "");
+        long tmdbId = candidate.optLong("tmdb_id");
+        if (tmdbId <= 0 || (!"movie".equals(type) && !"tv".equals(type))) return;
+        String selectionTag = type + ":" + tmdbId;
+        selectedTitle.setTag(selectionTag);
+        selectedTitle.setText(t("Cargando selección…"));
+        seasonChoice.setVisibility(View.GONE);
+        submit.setEnabled(false);
+        io.execute(() -> {
+            try {
+                JSONObject details = getJson("/api/v1/content-requests/tmdb/" + type + "/" + tmdbId);
+                details.put("content_type", type);
+                runOnUiThread(() -> {
+                    if (!selectionTag.equals(selectedTitle.getTag())) return;
+                    selection[0] = details;
+                    selectedSeason[0] = -1;
+                    String title = details.optString("metadata_title", candidate.optString("title", ""));
+                    String year = details.isNull("year") ? "" : details.optString("year");
+                    selectedTitle.setText(title + (year.isEmpty() ? "" : " · " + year));
+                    JSONArray seasons = details.optJSONArray("seasons");
+                    if ("tv".equals(type) && seasons != null && seasons.length() > 0) {
+                        seasonChoice.setText(t("Serie completa"));
+                        seasonChoice.setVisibility(View.VISIBLE);
+                    }
+                    submit.setEnabled(true);
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (!selectionTag.equals(selectedTitle.getTag())) return;
+                    selection[0] = null;
+                    selectedTitle.setText(t("No se pudo cargar la selección: ") + e.getMessage());
+                    submit.setEnabled(false);
+                });
+            }
+        });
     }
 
     void addAvatarMenuItem(PopupMenu menu, int id, int order, String title, int iconKind) {
@@ -1533,6 +1756,7 @@ public class MainActivity extends Activity {
     static class MenuIconDrawable extends Drawable {
         static final int PROFILE = 1;
         static final int SETTINGS = 2;
+        static final int SEARCH = 6;
         static final int ACCOUNTS = 3;
         static final int LOGOUT = 4;
         static final int EXIT = 5;
@@ -1577,6 +1801,9 @@ public class MainActivity extends Activity {
                     float y2 = 50 + (float) Math.sin(angle) * 40;
                     canvas.drawLine(x1, y1, x2, y2, paint);
                 }
+            } else if (kind == SEARCH) {
+                canvas.drawCircle(43, 43, 24, paint);
+                canvas.drawLine(61, 61, 87, 87, paint);
             } else if (kind == ACCOUNTS) {
                 canvas.drawCircle(36, 32, 11, paint);
                 canvas.drawCircle(67, 35, 9, paint);
@@ -3301,6 +3528,10 @@ public class MainActivity extends Activity {
             handlers.add(() -> setNodeWatched(node, true));
             actions.add("Marcar como no visto");
             handlers.add(() -> setNodeWatched(node, false));
+            if (kind.equals("series") && node.optBoolean("incomplete")) {
+                actions.add(t("Pedir temporadas restantes"));
+                handlers.add(() -> requestRemainingSeasons(node));
+            }
             if (isAccountAdmin()) {
                 actions.add("Reintentar metadata (TMDb)");
                 handlers.add(() -> retryMetadata(node));
@@ -3320,6 +3551,34 @@ public class MainActivity extends Activity {
         }
         if (actions.isEmpty()) return;
         showStyledActionDialog(t("Acciones"), actions, index -> handlers.get(index).run());
+    }
+
+    void requestRemainingSeasons(JSONObject seriesNode) {
+        String seriesId = seriesNode.optString("id", "");
+        if (seriesId.isEmpty() || !"series".equals(seriesNode.optString("kind"))) return;
+        new AlertDialog.Builder(this)
+                .setTitle(t("Pedir temporadas restantes"))
+                .setMessage(t("Enviar una solicitud para las temporadas o capítulos que faltan de ")
+                        + displayTitle(seriesNode) + "?")
+                .setNegativeButton(t("Cancelar"), null)
+                .setPositiveButton(t("Enviar solicitud"), (dialog, which) -> {
+                    JSONObject payload = new JSONObject();
+                    try {
+                        payload.put("request_type", "remaining_seasons");
+                        payload.put("catalog_node_id", seriesId);
+                    } catch (JSONException ignored) { return; }
+                    io.execute(() -> {
+                        try {
+                            postJson("/api/v1/content-requests", payload);
+                            runOnUiThread(() -> Toast.makeText(this,
+                                    t("Solicitud enviada a administración."), Toast.LENGTH_LONG).show());
+                        } catch (Exception e) {
+                            runOnUiThread(() -> Toast.makeText(this,
+                                    t("No se pudo enviar la solicitud: ") + e.getMessage(),
+                                    Toast.LENGTH_LONG).show());
+                        }
+                    });
+                }).show();
     }
 
     String[] localizedOptions(List<String> options) {
@@ -3683,7 +3942,7 @@ public class MainActivity extends Activity {
         String nodeId = node.optString("id");
         if (nodeId.isEmpty()) return;
         captureMetadataEditorReturnState();
-        showLoading("Buscando coincidencias en TMDb…");
+        showLoading(t("Buscando coincidencias en TMDb…"));
         io.execute(() -> {
             try {
                 JSONObject result = postJson("/api/v1/catalog/" + enc(nodeId) + "/metadata/candidates");
@@ -3693,11 +3952,11 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 runOnUiThread(() -> {
                     showMetadataEditor(node, new JSONArray());
-                    String message = e.getMessage() == null ? "Error desconocido" : e.getMessage();
+                    String message = e.getMessage() == null ? t("Error desconocido") : e.getMessage();
                     if (message.contains("Metadata was recently requested")) {
-                        message = "Ya se buscó hace poco. Espera un minuto antes de volver a intentarlo.";
+                        message = t("Ya se buscó hace poco. Espera un minuto antes de volver a intentarlo.");
                     }
-                    Toast.makeText(this, "No se pudieron buscar coincidencias: " + message,
+                    Toast.makeText(this, t("No se pudieron buscar coincidencias: ") + message,
                             Toast.LENGTH_LONG).show();
                 });
             }
@@ -3736,14 +3995,14 @@ public class MainActivity extends Activity {
         form.setPadding(d(18), d(8), d(18), d(30));
         scroll.addView(form);
         content.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
-        form.addView(label("Metadata manual", 23, Color.WHITE, true));
+        form.addView(label(t("Metadata manual"), 23, Color.WHITE, true));
         TextView subtitle = labelRaw(displayTitle(node) + " · " + kindLabel(node.optString("kind")), 13, MUTED, false);
         subtitle.setPadding(0, d(4), 0, d(14));
         form.addView(subtitle);
 
-        EditText title = metadataField(node.optString("display_title", node.optString("title", "")), "Título", false);
-        EditText year = metadataField(node.isNull("year") ? "" : node.optString("year"), "Año", false);
-        EditText overview = metadataField(node.optString("overview", ""), "Sinopsis", true);
+        EditText title = metadataField(node.optString("display_title", node.optString("title", "")), t("Título"), false);
+        EditText year = metadataField(node.isNull("year") ? "" : node.optString("year"), t("Año"), false);
+        EditText overview = metadataField(node.optString("overview", ""), t("Sinopsis"), true);
         ArrayList<String> genreOptions = new ArrayList<>();
         ArrayList<String> selectedGenres = new ArrayList<>();
         addGenreValues(genreOptions, node.optJSONArray("genres"));
@@ -3766,16 +4025,16 @@ public class MainActivity extends Activity {
         HorizontalScrollView imageScroller = new HorizontalScrollView(this);
         imageScroller.setHorizontalScrollBarEnabled(false);
         imageScroller.addView(imageGallery);
-        form.addView(label("Coincidencias TMDb · selecciona para validar", 16, Color.WHITE, true), fieldMargins());
+        form.addView(label(t("Coincidencias TMDb · selecciona para validar"), 16, Color.WHITE, true), fieldMargins());
         form.addView(candidateScroller, new LinearLayout.LayoutParams(-1, d(195)));
-        form.addView(label("Imágenes online · selecciona una miniatura", 16, Color.WHITE, true), fieldMargins());
+        form.addView(label(t("Imágenes online · selecciona una miniatura"), 16, Color.WHITE, true), fieldMargins());
         form.addView(imageScroller, new LinearLayout.LayoutParams(-1, d(174)));
 
-        Button searchImages = actionButton("Buscar imágenes", false);
+        Button searchImages = actionButton(t("Buscar imágenes"), false);
         form.addView(searchImages, fieldMargins());
         searchImages.setOnClickListener(v -> searchMetadataImages(node, title.getText().toString(),
                 selectedTmdbId[0], imageGallery, selectedImagePath, selectedImageType));
-        Button save = actionButton("Guardar metadata", true);
+        Button save = actionButton(t("Guardar metadata"), true);
         LinearLayout.LayoutParams saveParams = fieldMargins();
         saveParams.topMargin = d(14);
         form.addView(save, saveParams);
@@ -3792,7 +4051,7 @@ public class MainActivity extends Activity {
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> Toast.makeText(this,
-                        "No se pudo cargar la lista de géneros: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                        t("No se pudo cargar la lista de géneros: ") + e.getMessage(), Toast.LENGTH_LONG).show());
             }
         });
 
@@ -3810,7 +4069,7 @@ public class MainActivity extends Activity {
             card.addView(poster, new LinearLayout.LayoutParams(d(102), d(142)));
             String path = candidate.optString("poster_path", "");
             if (!path.isEmpty()) loadImage("https://image.tmdb.org/t/p/w342" + path, poster, false);
-            String candidateLabel = candidate.optString("title", "Título") +
+            String candidateLabel = candidate.optString("title", t("Título")) +
                     (candidate.isNull("year") ? "" : " (" + candidate.optString("year") + ")");
             TextView candidateName = labelRaw(candidateLabel, 11, Color.WHITE, false);
             candidateName.setMaxLines(2);
@@ -3821,7 +4080,7 @@ public class MainActivity extends Activity {
             candidateGallery.addView(card);
         }
         if (candidates.length() == 0) {
-            candidateGallery.addView(label("No se encontraron coincidencias. Puedes completar los campos manualmente.",
+            candidateGallery.addView(label(t("No se encontraron coincidencias. Puedes completar los campos manualmente."),
                     13, MUTED, false));
         }
         searchMetadataImages(node, title.getText().toString(), selectedTmdbId[0],
@@ -3881,7 +4140,7 @@ public class MainActivity extends Activity {
     }
 
     void promptNewGenre(Button button, List<String> options, List<String> selected) {
-        EditText input = metadataField("", "Nombre del género", false);
+        EditText input = metadataField("", t("Nombre del género"), false);
         new AlertDialog.Builder(this)
                 .setTitle(t("Añadir género"))
                 .setView(input)
@@ -3926,7 +4185,7 @@ public class MainActivity extends Activity {
                                  String[] selectedImageType, LinearLayout imageGallery) {
         long tmdbId = candidate.optLong("tmdb_id", 0);
         if (tmdbId <= 0) return;
-        Toast.makeText(this, "Cargando coincidencia…", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, t("Cargando coincidencia…"), Toast.LENGTH_SHORT).show();
         io.execute(() -> {
             try {
                 JSONObject detail = getJson("/api/v1/catalog/" + enc(node.optString("id")) +
@@ -3948,7 +4207,7 @@ public class MainActivity extends Activity {
                             selectedImagePath, selectedImageType, imageGallery);
                 });
             } catch (Exception e) {
-                runOnUiThread(() -> Toast.makeText(this, "No se pudo cargar la coincidencia: " + e.getMessage(),
+                runOnUiThread(() -> Toast.makeText(this, t("No se pudo cargar la coincidencia: ") + e.getMessage(),
                         Toast.LENGTH_LONG).show());
             }
         });
@@ -3970,7 +4229,7 @@ public class MainActivity extends Activity {
         String nodeId = node.optString("id");
         if (nodeId.isEmpty() || query.trim().isEmpty()) return;
         gallery.removeAllViews();
-        gallery.addView(label("Buscando imágenes…", 13, MUTED, false));
+        gallery.addView(label(t("Buscando imágenes…"), 13, MUTED, false));
         io.execute(() -> {
             try {
                 String path = "/api/v1/catalog/" + enc(nodeId) + "/metadata/images?q=" + enc(query.trim());
@@ -3979,7 +4238,7 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     gallery.removeAllViews();
                     if (images == null || images.length() == 0) {
-                        gallery.addView(label("No hay imágenes disponibles para esta búsqueda.", 13, MUTED, false));
+                        gallery.addView(label(t("No hay imágenes disponibles para esta búsqueda."), 13, MUTED, false));
                         return;
                     }
                     for (int i = 0; i < images.length(); i++) {
@@ -3997,13 +4256,13 @@ public class MainActivity extends Activity {
                         card.setTag(new String[]{option.optString("path", ""),
                                 option.optString("type", "poster")});
                         TextView kind = label(option.optString("type", "poster").equals("backdrop")
-                                ? "Horizontal" : "Póster", 10, MUTED, false);
+                                ? t("Horizontal") : t("Póster"), 10, MUTED, false);
                         card.addView(kind);
                         card.setOnClickListener(v -> {
                             selectedPath[0] = option.optString("path", null);
                             selectedType[0] = option.optString("type", "poster");
                             highlightImageSelection(gallery, selectedPath[0], selectedType[0]);
-                            Toast.makeText(this, "Miniatura seleccionada.", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, t("Miniatura seleccionada."), Toast.LENGTH_SHORT).show();
                         });
                         gallery.addView(card);
                     }
@@ -4012,14 +4271,14 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 runOnUiThread(() -> {
                     gallery.removeAllViews();
-                    String error = e.getMessage() == null ? "Error desconocido" : e.getMessage();
+                    String error = e.getMessage() == null ? t("Error desconocido") : e.getMessage();
                     if (error.contains("HTTP 404") && error.contains("Not Found")) {
-                        error = "El servidor del NAS aún no tiene la ruta de búsqueda de imágenes. " +
-                                "Actualiza el contenedor con: docker compose up --build -d";
+                        error = t("El servidor del NAS aún no tiene la ruta de búsqueda de imágenes. " +
+                                "Actualiza el contenedor con: docker compose up --build -d");
                     } else if (error.contains("Catalog node not found")) {
-                        error = "El elemento ya no existe en el catálogo. Resincroniza el catálogo e inténtalo de nuevo.";
+                        error = t("El elemento ya no existe en el catálogo. Resincroniza el catálogo e inténtalo de nuevo.");
                     }
-                    gallery.addView(label("No se pudieron buscar imágenes: " + error, 12, MUTED, false));
+                    gallery.addView(label(t("No se pudieron buscar imágenes: ") + error, 12, MUTED, false));
                 });
             }
         });
@@ -4046,9 +4305,13 @@ public class MainActivity extends Activity {
     void saveMetadata(JSONObject node, EditText title, EditText year, List<String> selectedGenres,
                       EditText overview, long tmdbId, String imagePath, String imageType,
                       Button saveButton) {
+        if (!isAccountAdmin()) {
+            Toast.makeText(this, t("Solo los administradores pueden modificar los metadatos."), Toast.LENGTH_LONG).show();
+            return;
+        }
         String itemTitle = title.getText().toString().trim();
         if (itemTitle.isEmpty()) {
-            Toast.makeText(this, "El título no puede estar vacío.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, t("El título no puede estar vacío."), Toast.LENGTH_SHORT).show();
             return;
         }
         JSONObject payload = new JSONObject();
@@ -4064,7 +4327,7 @@ public class MainActivity extends Activity {
             payload.put("image_type", imageType == null ? "poster" : imageType);
             if (tmdbId > 0) payload.put("tmdb_id", tmdbId);
         } catch (JSONException | NumberFormatException e) {
-            Toast.makeText(this, "Revisa el año introducido.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, t("Revisa el año introducido."), Toast.LENGTH_SHORT).show();
             return;
         }
         String nodeId = node.optString("id");
@@ -4074,12 +4337,12 @@ public class MainActivity extends Activity {
             try {
                 postJson("/api/v1/catalog/" + enc(nodeId) + "/metadata/manual", payload);
                 imageCache.evictAll();
-                runOnUiThread(() -> finishMetadataRetry("Metadata guardada y cliente actualizado."));
+                runOnUiThread(() -> finishMetadataRetry(t("Metadata guardada y cliente actualizado.")));
             } catch (Exception e) {
                 runOnUiThread(() -> {
                     saveButton.setEnabled(true);
                     saveButton.setText(t("Guardar metadata"));
-                    Toast.makeText(this, "No se pudo guardar: " + e.getMessage(),
+                    Toast.makeText(this, t("No se pudo guardar: ") + e.getMessage(),
                             Toast.LENGTH_LONG).show();
                 });
             }
@@ -4248,6 +4511,7 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(-1, heroHeight);
         bp.setMargins(0, 0, 0, d(10));
         content.addView(banner, bp);
+        if (isTelevision()) play.post(() -> play.requestFocus());
 
         JSONArray children = node.optJSONArray("children");
         if ("series".equals(node.optString("kind")) && children != null && children.length() > 0) {
@@ -4387,6 +4651,38 @@ public class MainActivity extends Activity {
             case "Temporadas": return "Denboraldiak";
             case "Explorar": return "Arakatu";
             case "Acciones": return "Ekintzak";
+            case "Pedir contenido": return "Edukia eskatu";
+            case "Pedir temporadas restantes": return "Gainerako denboraldiak eskatu";
+            case "Gestión de cuentas": return "Kontuen kudeaketa";
+            case "Busca una película o serie en TMDb y envía la solicitud a administración.":
+                return "Bilatu film edo telesail bat TMDb-n eta bidali eskaera administraziora.";
+            case "Título de película o serie": return "Filmaren edo telesailaren izenburua";
+            case "Selecciona un resultado para continuar.": return "Hautatu emaitza bat jarraitzeko.";
+            case "No se encontraron resultados.": return "Ez da emaitzarik aurkitu.";
+            case "No se pudo buscar en TMDb: ": return "Ezin izan da TMDb-n bilatu: ";
+            case "Cargando selección…": return "Hautapena kargatzen…";
+            case "No se pudo cargar la selección: ": return "Ezin izan da hautapena kargatu: ";
+            case "Serie completa": return "Telesail osoa";
+            case "Selecciona una temporada": return "Hautatu denboraldi bat";
+            case "Enviar solicitud": return "Eskaera bidali";
+            case "Solicitud enviada a administración.": return "Eskaera administraziora bidali da.";
+            case "No se pudo enviar la solicitud: ": return "Ezin izan da eskaera bidali: ";
+            case "Enviar una solicitud para las temporadas o capítulos que faltan de ":
+                return "Bidali falta diren denboraldiak edo atalak eskatzeko eskaera: ";
+            case "Película": return "Filma";
+            case "Serie": return "Telesaila";
+            case "Solicitudes de contenido": return "Eduki-eskaerak";
+            case "pendientes": return "zain";
+            case "No hay solicitudes de contenido.": return "Ez dago eduki-eskaerarik.";
+            case "Temporadas restantes": return "Gainerako denboraldiak";
+            case "Solicitó": return "Eskatzailea";
+            case "Aprobada": return "Onartuta";
+            case "Pendiente": return "Zain";
+            case "Aceptar": return "Onartu";
+            case "Borrar": return "Ezabatu";
+            case "Borrar solicitud": return "Eskaera ezabatu";
+            case "¿Borrar la solicitud de ": return "Ezabatu nahi duzu honen eskaera: ";
+            case "No se pudo actualizar la solicitud: ": return "Ezin izan da eskaera eguneratu: ";
             case "Marcar como visto": return "Ikusitzat markatu";
             case "Marcar como no visto": return "Ikusi gabe markatu";
             case "Reintentar metadata (TMDb)": return "Metadatuak berriro bilatu (TMDb)";
@@ -4536,16 +4832,26 @@ public class MainActivity extends Activity {
             case "No se encontraron coincidencias. Puedes completar los campos manualmente.":
                 return "Ez da bat-etortzerik aurkitu. Eremuak eskuz bete ditzakezu.";
             case "Buscando coincidencias en TMDb…": return "TMDb-n bat-etortzeak bilatzen…";
+            case "Ya se buscó hace poco. Espera un minuto antes de volver a intentarlo.":
+                return "Duela gutxi bilatu da. Itxaron minutu bat berriro saiatu aurretik.";
+            case "No se pudieron buscar coincidencias: ": return "Ezin izan dira bat-etortzeak bilatu: ";
+            case "No se pudo cargar la lista de géneros: ": return "Ezin izan da generoen zerrenda kargatu: ";
             case "No encontramos resultados para": return "Ez dugu emaitzarik aurkitu honentzat";
             case "No se encontraron coincidencias.": return "Ez da bat-etortzerik aurkitu.";
             case "No pudimos cargar la lista de géneros.": return "Ezin izan da generoen zerrenda kargatu.";
             case "Cargando coincidencia…": return "Bat-etortzea kargatzen…";
             case "Buscando imágenes…": return "Irudiak bilatzen…";
             case "No se pudo cargar la coincidencia": return "Ezin izan da bat-etortzea kargatu";
+            case "No se pudo cargar la coincidencia: ": return "Ezin izan da bat-etortzea kargatu: ";
             case "No se pudieron buscar imágenes": return "Ezin izan dira irudiak bilatu";
+            case "No se pudieron buscar imágenes: ": return "Ezin izan dira irudiak bilatu: ";
+            case "El servidor del NAS aún no tiene la ruta de búsqueda de imágenes. Actualiza el contenedor con: docker compose up --build -d":
+                return "NASeko zerbitzariak oraindik ez du irudiak bilatzeko biderik. Eguneratu edukiontzia komando honekin: docker compose up --build -d";
             case "El elemento ya no existe en el catálogo. Resincroniza el catálogo e inténtalo de nuevo.":
                 return "Elementua ez dago katalogoan. Sinkronizatu katalogoa berriro eta saiatu.";
             case "No se pudo guardar": return "Ezin izan da gorde";
+            case "No se pudo guardar: ": return "Ezin izan da gorde: ";
+            case "Error desconocido": return "Errore ezezaguna";
             case "Metadata guardada y cliente actualizado.": return "Metadatuak gorde dira eta bezeroa eguneratu da.";
             case "Añadido a Mi lista": return "Nire zerrendara gehituta";
             case "Eliminado de Mi lista": return "Nire zerrendatik kenduta";
@@ -5521,6 +5827,13 @@ public class MainActivity extends Activity {
         syncSlotParams.topMargin = d(14);
         screen.addView(syncSlot, syncSlotParams);
 
+        LinearLayout requestsSlot = new LinearLayout(this);
+        requestsSlot.setOrientation(LinearLayout.VERTICAL);
+        requestsSlot.setVisibility(View.GONE);
+        LinearLayout.LayoutParams requestsSlotParams = new LinearLayout.LayoutParams(-1, -2);
+        requestsSlotParams.topMargin = d(14);
+        screen.addView(requestsSlot, requestsSlotParams);
+
         LinearLayout languageCard = settingsCard();
         LinearLayout.LayoutParams languageP = new LinearLayout.LayoutParams(-1, -2);
         languageP.topMargin = d(14);
@@ -5546,6 +5859,115 @@ public class MainActivity extends Activity {
         screen.addView(attribution);
         content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
         loadAdminSyncControls(syncSlot);
+        loadContentRequestControls(requestsSlot);
+    }
+
+    void loadContentRequestControls(LinearLayout slot) {
+        io.execute(() -> {
+            try {
+                JSONArray requests = getArray("/api/v1/admin/content-requests");
+                runOnUiThread(() -> {
+                    if (!showingAdmin || slot.getParent() == null) return;
+                    slot.removeAllViews();
+                    slot.setVisibility(View.VISIBLE);
+                    LinearLayout card = settingsCard();
+                    slot.addView(card);
+                    int pending = 0;
+                    for (int i = 0; i < requests.length(); i++) {
+                        JSONObject request = requests.optJSONObject(i);
+                        if (request != null && "pending".equals(request.optString("status"))) pending++;
+                    }
+                    card.addView(label(t("Solicitudes de contenido") + " · " + pending
+                            + " " + t("pendientes"), 16, Color.WHITE, true));
+                    if (requests.length() == 0) {
+                        TextView empty = label(t("No hay solicitudes de contenido."), 13, MUTED, false);
+                        empty.setPadding(0, d(8), 0, 0);
+                        card.addView(empty);
+                        return;
+                    }
+                    for (int i = 0; i < requests.length(); i++) {
+                        JSONObject request = requests.optJSONObject(i);
+                        if (request == null) continue;
+                        LinearLayout row = new LinearLayout(this);
+                        row.setOrientation(LinearLayout.VERTICAL);
+                        LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, -2);
+                        rowParams.topMargin = d(14);
+                        card.addView(row, rowParams);
+                        TextView title = labelRaw(request.optString("title", ""), 16, Color.WHITE, true);
+                        row.addView(title);
+                        String typeLabel;
+                        if ("remaining_seasons".equals(request.optString("request_type"))) {
+                            typeLabel = t("Temporadas restantes");
+                            JSONObject details = request.optJSONObject("details");
+                            JSONArray missing = details == null ? null : details.optJSONArray("missing_seasons");
+                            if (missing != null && missing.length() > 0) {
+                                ArrayList<String> numbers = new ArrayList<>();
+                                for (int j = 0; j < missing.length(); j++) numbers.add("T" + missing.optInt(j));
+                                typeLabel += " · " + t("Faltan") + " " + android.text.TextUtils.join(", ", numbers);
+                            } else if (details != null && details.optInt("missing_episode_count") > 0) {
+                                typeLabel += " · " + details.optInt("missing_episode_count") + " "
+                                        + t("capítulos");
+                            }
+                        } else {
+                            typeLabel = "movie".equals(request.optString("content_type"))
+                                    ? t("Película") : t("Serie");
+                            int season = request.optInt("season_number");
+                            if (season > 0) typeLabel += " · " + t("Temporada") + " " + season;
+                        }
+                        String year = request.isNull("year") ? "" : request.optString("year");
+                        if (!year.isEmpty()) typeLabel += " · " + year;
+                        typeLabel += " · " + t("Solicitó") + ": " + request.optString("requester_name", "");
+                        typeLabel += " · " + ("approved".equals(request.optString("status"))
+                                ? t("Aprobada") : t("Pendiente"));
+                        TextView info = label(typeLabel, 12, MUTED, false);
+                        LinearLayout.LayoutParams infoParams = new LinearLayout.LayoutParams(-1, -2);
+                        infoParams.topMargin = d(4);
+                        row.addView(info, infoParams);
+                        LinearLayout actions = new LinearLayout(this);
+                        actions.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+                        LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(-1, -2);
+                        actionsParams.topMargin = d(7);
+                        row.addView(actions, actionsParams);
+                        if ("pending".equals(request.optString("status"))) {
+                            Button approve = actionButton(t("Aceptar"), true);
+                            actions.addView(approve, new LinearLayout.LayoutParams(-2, d(40)));
+                            approve.setOnClickListener(v -> updateContentRequest(
+                                    request.optString("id"), true, approve, slot));
+                        }
+                        Button delete = actionButton(t("Borrar"), false);
+                        LinearLayout.LayoutParams deleteParams = new LinearLayout.LayoutParams(-2, d(40));
+                        deleteParams.leftMargin = d(8);
+                        actions.addView(delete, deleteParams);
+                        delete.setOnClickListener(v -> new AlertDialog.Builder(this)
+                                .setTitle(t("Borrar solicitud"))
+                                .setMessage(t("¿Borrar la solicitud de ") + request.optString("title", "") + "?")
+                                .setNegativeButton(t("Cancelar"), null)
+                                .setPositiveButton(t("Borrar"), (dialog, which) ->
+                                        updateContentRequest(request.optString("id"), false, delete, slot))
+                                .show());
+                    }
+                });
+            } catch (Exception ignored) {
+                // The protected endpoint stays hidden for non-administrator accounts.
+            }
+        });
+    }
+
+    void updateContentRequest(String requestId, boolean approve, Button button, LinearLayout slot) {
+        button.setEnabled(false);
+        io.execute(() -> {
+            try {
+                if (approve) postJson("/api/v1/admin/content-requests/" + enc(requestId) + "/approve");
+                else authorizedProfileRequest("DELETE", "/api/v1/admin/content-requests/" + enc(requestId), null);
+                runOnUiThread(() -> loadContentRequestControls(slot));
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    button.setEnabled(true);
+                    Toast.makeText(this, t("No se pudo actualizar la solicitud: ") + e.getMessage(),
+                            Toast.LENGTH_LONG).show();
+                });
+            }
+        });
     }
 
     void showAccountManagement() {

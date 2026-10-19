@@ -167,7 +167,9 @@ public class PlayerActivity extends Activity {
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode != VLC_REQUEST) return;
-        if (resultCode == RESULT_OK && data != null) {
+        // VLC can return the playback extras with RESULT_CANCELED when the user
+        // leaves the player with Back. Keep the last position in either case.
+        if (data != null) {
             long position = data.getLongExtra("extra_position", -1L);
             long duration = data.getLongExtra("extra_duration", -1L);
             if (isComplete(position, duration)) {

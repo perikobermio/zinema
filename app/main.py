@@ -23,7 +23,7 @@ from starlette.responses import FileResponse, Response, StreamingResponse
 
 from app.catalog import scan_catalog
 from app.tmdb import (apply_tmdb_id, enrich_pending, get_candidate_details,
-                      search_image_options, search_metadata_candidates,
+                      search_content_requests, search_image_options, search_metadata_candidates,
                       _image_config, _save_image, normalize_genres)
 from app.video_thumbnails import extract_episode_thumbnails
 
@@ -107,6 +107,14 @@ class ManualMetadataRequest(BaseModel):
     image_path: str | None = Field(default=None, max_length=500)
     image_type: str = Field(default="poster", pattern="^(poster|backdrop)$")
     tmdb_id: int | None = Field(default=None, gt=0)
+
+
+class ContentRequestCreate(BaseModel):
+    request_type: str = Field(pattern="^(new_content|remaining_seasons)$")
+    content_type: str | None = Field(default=None, pattern="^(movie|tv)$")
+    tmdb_id: int | None = Field(default=None, gt=0)
+    season_number: int | None = Field(default=None, ge=1)
+    catalog_node_id: str | None = Field(default=None, max_length=100)
 
 
 class UserProfileRequest(BaseModel):
@@ -278,6 +286,29 @@ def database() -> sqlite3.Connection:
                disabled INTEGER NOT NULL DEFAULT 0,
                approved INTEGER NOT NULL DEFAULT 0
            )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS content_requests (
+               id TEXT PRIMARY KEY,
+               requester_account_id TEXT NOT NULL,
+               requester_name TEXT NOT NULL,
+               request_type TEXT NOT NULL,
+               content_type TEXT NOT NULL,
+               tmdb_id INTEGER,
+               title TEXT NOT NULL,
+               year INTEGER,
+               season_number INTEGER,
+               catalog_node_id TEXT,
+               details_json TEXT NOT NULL DEFAULT '{}',
+               status TEXT NOT NULL DEFAULT 'pending',
+               created_at TEXT NOT NULL,
+               reviewed_at TEXT,
+               reviewed_by_account_id TEXT
+           )"""
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_content_requests_status_created "
+        "ON content_requests(status, created_at)"
     )
     account_columns = {row["name"] for row in connection.execute("PRAGMA table_info(accounts)")}
     if "approved" not in account_columns:
@@ -1735,6 +1766,154 @@ def catalog_metadata_images(node_id: str, q: str | None = None,
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Image search failed: {str(exc)[:300]}") from None
     return {"images": images[:10]}
+
+
+@app.get("/api/v1/content-requests/search", dependencies=[Depends(require_client)])
+def search_content_request_titles(q: str = Query(min_length=2, max_length=100)) -> dict[str, object]:
+    if not TMDB_CONFIGURED:
+        raise HTTPException(status_code=503, detail="TMDb credentials are not configured")
+    try:
+        results = search_content_requests(q, TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, TMDB_KEY)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"TMDb search failed: {str(exc)[:300]}") from None
+    return {"results": results}
+
+
+@app.get("/api/v1/content-requests/tmdb/{content_type}/{tmdb_id}",
+         dependencies=[Depends(require_client)])
+def get_content_request_title(content_type: str, tmdb_id: int) -> dict[str, object]:
+    if content_type not in {"movie", "tv"}:
+        raise HTTPException(status_code=422, detail="Content type must be movie or tv")
+    if not TMDB_CONFIGURED:
+        raise HTTPException(status_code=503, detail="TMDb credentials are not configured")
+    try:
+        return get_candidate_details(content_type, tmdb_id, TMDB_ACCESS_TOKEN,
+                                     TMDB_LANGUAGE, TMDB_KEY)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not load TMDb title: {str(exc)[:300]}") from None
+
+
+@app.post("/api/v1/content-requests", status_code=201,
+          dependencies=[Depends(require_client)])
+def create_content_request(request: ContentRequestCreate,
+                           device_id: Annotated[str, Depends(require_client)]) -> dict[str, object]:
+    requester_id = account_for_device(device_id)
+    with closing(database()) as connection:
+        account = connection.execute(
+            "SELECT COALESCE(NULLIF(username, ''), email) AS name FROM accounts WHERE id=?",
+            (requester_id,),
+        ).fetchone()
+        if account is None:
+            raise HTTPException(status_code=401, detail="Account not found")
+
+        details: dict[str, object] = {}
+        if request.request_type == "remaining_seasons":
+            if not request.catalog_node_id or request.tmdb_id is not None or request.season_number is not None:
+                raise HTTPException(status_code=422, detail="A series catalog item is required")
+            series = connection.execute(
+                """SELECT id, kind, title, metadata_title, year, tmdb_id, tmdb_episodes_json
+                   FROM catalog_nodes WHERE id=? AND available=1""",
+                (request.catalog_node_id,),
+            ).fetchone()
+            if series is None or series["kind"] != "series":
+                raise HTTPException(status_code=404, detail="Series not found")
+            completion = _series_completion(connection, series["id"], series["tmdb_episodes_json"])
+            if not completion["incomplete"]:
+                raise HTTPException(status_code=409, detail="This series has no known missing seasons or episodes")
+            details = {
+                "missing_seasons": completion["missing_seasons"],
+                "missing_episode_count": completion["missing_episode_count"],
+            }
+            content_type = "tv"
+            tmdb_id = series["tmdb_id"]
+            title = series["metadata_title"] or series["title"]
+            year = series["year"]
+            season_number = None
+            catalog_node_id = series["id"]
+        else:
+            if request.content_type not in {"movie", "tv"} or request.tmdb_id is None:
+                raise HTTPException(status_code=422, detail="Select a movie or series from TMDb")
+            if request.content_type == "movie" and request.season_number is not None:
+                raise HTTPException(status_code=422, detail="Movies do not have seasons")
+            if request.season_number is not None and request.content_type != "tv":
+                raise HTTPException(status_code=422, detail="Only series can include a season")
+            if not TMDB_CONFIGURED:
+                raise HTTPException(status_code=503, detail="TMDb credentials are not configured")
+            try:
+                details = get_candidate_details(
+                    request.content_type, request.tmdb_id,
+                    TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, TMDB_KEY,
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=502,
+                                    detail=f"Could not load TMDb title: {str(exc)[:300]}") from None
+            if request.season_number is not None and request.season_number not in {
+                    int(item["season_number"]) for item in details.get("seasons", [])}:
+                raise HTTPException(status_code=422, detail="Selected season was not found on TMDb")
+            content_type = request.content_type
+            tmdb_id = request.tmdb_id
+            title = str(details.get("metadata_title") or "").strip()
+            year = details.get("year")
+            season_number = request.season_number
+            catalog_node_id = None
+            details = {"overview": details.get("overview", ""),
+                       "season_count": len(details.get("seasons", []))}
+
+        request_id = uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
+        connection.execute(
+            """INSERT INTO content_requests(
+                   id, requester_account_id, requester_name, request_type, content_type,
+                   tmdb_id, title, year, season_number, catalog_node_id, details_json,
+                   status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+            (request_id, requester_id, account["name"], request.request_type,
+             content_type, tmdb_id, title, year, season_number, catalog_node_id,
+             json.dumps(details, ensure_ascii=False), now),
+        )
+        connection.commit()
+    return {"id": request_id, "status": "pending", "created_at": now}
+
+
+@app.get("/api/v1/admin/content-requests", dependencies=[Depends(require_admin)])
+def list_content_requests() -> list[dict[str, object]]:
+    with closing(database()) as connection:
+        rows = connection.execute(
+            """SELECT * FROM content_requests
+               ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, created_at DESC"""
+        ).fetchall()
+    return [{**{key: row[key] for key in (
+        "id", "requester_name", "request_type", "content_type", "tmdb_id",
+        "title", "year", "season_number", "catalog_node_id", "status", "created_at",
+    )}, "details": json.loads(row["details_json"] or "{}")} for row in rows]
+
+
+@app.post("/api/v1/admin/content-requests/{request_id}/approve",
+          dependencies=[Depends(require_admin)])
+def approve_content_request(request_id: str,
+                            device_id: Annotated[str, Depends(require_admin)]) -> dict[str, bool]:
+    reviewer_id = account_for_device(device_id)
+    with closing(database()) as connection:
+        cursor = connection.execute(
+            """UPDATE content_requests SET status='approved', reviewed_at=?,
+                   reviewed_by_account_id=? WHERE id=? AND status='pending'""",
+            (datetime.now(timezone.utc).isoformat(), reviewer_id, request_id),
+        )
+        connection.commit()
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Pending content request not found")
+    return {"approved": True}
+
+
+@app.delete("/api/v1/admin/content-requests/{request_id}",
+            dependencies=[Depends(require_admin)])
+def delete_content_request(request_id: str) -> dict[str, bool]:
+    with closing(database()) as connection:
+        cursor = connection.execute("DELETE FROM content_requests WHERE id=?", (request_id,))
+        connection.commit()
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Content request not found")
+    return {"deleted": True}
 
 
 @app.post("/api/v1/catalog/{node_id}/metadata/manual", dependencies=[Depends(require_admin)])
