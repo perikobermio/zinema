@@ -1541,7 +1541,7 @@ public class MainActivity extends Activity {
         screen.setOrientation(LinearLayout.VERTICAL);
         screen.setPadding(d(20), d(14), d(20), d(28));
         screen.addView(label(t("Pedir contenido"), 26, Color.WHITE, true));
-        TextView explanation = label(t("Busca una película o serie en TMDb y envía la solicitud a administración."),
+        TextView explanation = label(t("Toca un resultado para añadirlo a la petición. Puedes elegir la temporada de cada serie y enviar varios títulos juntos."),
                 14, MUTED, false);
         LinearLayout.LayoutParams explanationParams = new LinearLayout.LayoutParams(-1, -2);
         explanationParams.topMargin = d(6);
@@ -1555,25 +1555,6 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams resultsParams = new LinearLayout.LayoutParams(-1, -2);
         resultsParams.topMargin = d(8);
         screen.addView(results, resultsParams);
-
-        TextView selectedHeading = label(t("Contenido seleccionado"), 17, Color.WHITE, true);
-        LinearLayout.LayoutParams selectedHeadingParams = new LinearLayout.LayoutParams(-1, -2);
-        selectedHeadingParams.topMargin = d(14);
-        screen.addView(selectedHeading, selectedHeadingParams);
-        TextView selectedTitle = label(t("Selecciona un resultado para continuar."), 14, MUTED, false);
-        LinearLayout.LayoutParams selectedTitleParams = new LinearLayout.LayoutParams(-1, -2);
-        selectedTitleParams.topMargin = d(6);
-        screen.addView(selectedTitle, selectedTitleParams);
-        Button seasonChoice = actionButton(t("Serie completa"), false);
-        seasonChoice.setVisibility(View.GONE);
-        LinearLayout.LayoutParams seasonChoiceParams = new LinearLayout.LayoutParams(-1, d(44));
-        seasonChoiceParams.topMargin = d(10);
-        screen.addView(seasonChoice, seasonChoiceParams);
-        Button addItem = actionButton(t("Añadir a la petición"), false);
-        addItem.setEnabled(false);
-        LinearLayout.LayoutParams addItemParams = new LinearLayout.LayoutParams(-1, d(44));
-        addItemParams.topMargin = d(8);
-        screen.addView(addItem, addItemParams);
 
         TextView queueHeading = label(t("Elementos en la petición") + " · 0", 17, Color.WHITE, true);
         LinearLayout.LayoutParams queueHeadingParams = new LinearLayout.LayoutParams(-1, -2);
@@ -1593,16 +1574,39 @@ public class MainActivity extends Activity {
         if (isTelevision()) query.requestFocus();
 
         ArrayList<JSONObject> requestItems = new ArrayList<>();
-        JSONObject[] selectedCandidate = {null};
-        JSONObject[] selection = {null};
-        int[] selectedSeason = {-1};
         JSONArray[] searchResults = {new JSONArray()};
         Runnable[] renderGrid = {null};
-        renderGrid[0] = () -> renderContentRequestGrid(results, searchResults[0],
-                selectedCandidate[0], candidate -> loadContentRequestSelection(candidate,
-                        selectedTitle, seasonChoice, addItem, selectedCandidate,
-                        selection, selectedSeason, renderGrid[0]));
         Runnable[] renderQueue = {null};
+        renderGrid[0] = () -> renderContentRequestGrid(results, searchResults[0],
+                null, candidate -> {
+                    String type = candidate.optString("content_type");
+                    long tmdbId = candidate.optLong("tmdb_id");
+                    for (JSONObject item : requestItems) {
+                        if (item.optString("content_type").equals(type)
+                                && item.optLong("tmdb_id") == tmdbId) {
+                            Toast.makeText(this, t("Ese contenido ya está en la petición."), Toast.LENGTH_SHORT).show();
+                            return;
+                        }
+                    }
+                    if (requestItems.size() >= 20) {
+                        Toast.makeText(this, t("Puedes añadir hasta 20 elementos."), Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    try {
+                        JSONObject queued = new JSONObject();
+                        queued.put("content_type", type);
+                        queued.put("tmdb_id", tmdbId);
+                        queued.put("title", candidate.optString("title", ""));
+                        queued.put("year", candidate.opt("year"));
+                        queued.put("poster_path", candidate.optString("poster_path", ""));
+                        queued.put("season_number", -1);
+                        requestItems.add(queued);
+                    } catch (JSONException ignored) { return; }
+                    searchResults[0] = new JSONArray();
+                    query.setText("");
+                    renderGrid[0].run();
+                    renderQueue[0].run();
+                });
         renderQueue[0] = () -> {
             queue.removeAllViews();
             queueHeading.setText(t("Elementos en la petición") + " · " + requestItems.size());
@@ -1626,9 +1630,16 @@ public class MainActivity extends Activity {
                 textBox.addView(labelRaw(item.optString("title", ""), 14, Color.WHITE, true));
                 String subtitle = "movie".equals(item.optString("content_type"))
                         ? t("Película") : t("Serie");
-                int season = item.optInt("season_number");
-                if (season > 0) subtitle += " · " + t("Temporada") + " " + season;
                 textBox.addView(label(subtitle, 12, MUTED, false));
+                if ("tv".equals(item.optString("content_type"))) {
+                    int season = item.optInt("season_number", -1);
+                    String seasonLabel = season > 0 ? t("Temporada") + " " + season : t("Serie completa");
+                    Button seasonButton = actionButton(seasonLabel, false);
+                    LinearLayout.LayoutParams seasonButtonParams = new LinearLayout.LayoutParams(-2, d(34));
+                    seasonButtonParams.topMargin = d(4);
+                    textBox.addView(seasonButton, seasonButtonParams);
+                    seasonButton.setOnClickListener(v -> chooseContentRequestSeason(item, renderQueue[0]));
+                }
                 Button remove = actionButton(t("Quitar"), false);
                 row.addView(remove, new LinearLayout.LayoutParams(-2, d(38)));
                 remove.setOnClickListener(v -> {
@@ -1640,68 +1651,6 @@ public class MainActivity extends Activity {
                 queue.addView(row, rowParams);
             }
         };
-
-        seasonChoice.setOnClickListener(v -> {
-            JSONObject details = selection[0];
-            JSONArray seasons = details == null ? null : details.optJSONArray("seasons");
-            if (seasons == null || seasons.length() == 0) return;
-            String[] labels = new String[seasons.length() + 1];
-            int[] seasonNumbers = new int[labels.length];
-            labels[0] = t("Serie completa");
-            seasonNumbers[0] = -1;
-            for (int i = 0; i < seasons.length(); i++) {
-                JSONObject season = seasons.optJSONObject(i);
-                int number = season == null ? i + 1 : season.optInt("season_number", i + 1);
-                int episodes = season == null ? 0 : season.optInt("episode_count");
-                labels[i + 1] = t("Temporada") + " " + number
-                        + (episodes > 0 ? " · " + episodes + " " + t(episodes == 1 ? "capítulo" : "capítulos") : "");
-                seasonNumbers[i + 1] = number;
-            }
-            new AlertDialog.Builder(this).setTitle(t("Selecciona una temporada"))
-                    .setItems(labels, (dialog, which) -> {
-                        selectedSeason[0] = seasonNumbers[which];
-                        seasonChoice.setText(labels[which]);
-                    }).show();
-        });
-
-        addItem.setOnClickListener(v -> {
-            JSONObject current = selection[0];
-            if (current == null) return;
-            String type = current.optString("content_type");
-            long tmdbId = current.optLong("tmdb_id");
-            int season = selectedSeason[0];
-            for (JSONObject item : requestItems) {
-                if (item.optString("content_type").equals(type)
-                        && item.optLong("tmdb_id") == tmdbId
-                        && item.optInt("season_number", -1) == season) {
-                    Toast.makeText(this, t("Ese contenido ya está en la petición."), Toast.LENGTH_SHORT).show();
-                    return;
-                }
-            }
-            if (requestItems.size() >= 20) {
-                Toast.makeText(this, t("Puedes añadir hasta 20 elementos."), Toast.LENGTH_SHORT).show();
-                return;
-            }
-            try {
-                JSONObject queued = new JSONObject();
-                queued.put("content_type", type);
-                queued.put("tmdb_id", tmdbId);
-                queued.put("title", current.optString("metadata_title", ""));
-                queued.put("year", current.opt("year"));
-                queued.put("poster_path", current.optString("poster_path", ""));
-                if (season > 0) queued.put("season_number", season);
-                else queued.put("season_number", -1);
-                requestItems.add(queued);
-            } catch (JSONException ignored) { return; }
-            selectedCandidate[0] = null;
-            selection[0] = null;
-            selectedSeason[0] = -1;
-            selectedTitle.setText(t("Selecciona un resultado para continuar."));
-            seasonChoice.setVisibility(View.GONE);
-            addItem.setEnabled(false);
-            renderGrid[0].run();
-            renderQueue[0].run();
-        });
 
         submit.setOnClickListener(v -> {
             if (requestItems.isEmpty()) return;
@@ -1726,12 +1675,6 @@ public class MainActivity extends Activity {
                     runOnUiThread(() -> {
                         Toast.makeText(this, t("Solicitud enviada a administración."), Toast.LENGTH_LONG).show();
                         requestItems.clear();
-                        selectedCandidate[0] = null;
-                        selection[0] = null;
-                        selectedSeason[0] = -1;
-                        selectedTitle.setText(t("Selecciona un resultado para continuar."));
-                        seasonChoice.setVisibility(View.GONE);
-                        addItem.setEnabled(false);
                         renderGrid[0].run();
                         renderQueue[0].run();
                         query.setText("");
@@ -1753,12 +1696,6 @@ public class MainActivity extends Activity {
                 if (contentRequestSearchTask != null)
                     contentRequestSearchHandler.removeCallbacks(contentRequestSearchTask);
                 String searchTerm = editable.toString().trim();
-                selectedCandidate[0] = null;
-                selection[0] = null;
-                selectedSeason[0] = -1;
-                selectedTitle.setText(t("Selecciona un resultado para continuar."));
-                seasonChoice.setVisibility(View.GONE);
-                addItem.setEnabled(false);
                 searchResults[0] = new JSONArray();
                 results.removeAllViews();
                 if (searchTerm.length() < 2) return;
@@ -1854,56 +1791,40 @@ public class MainActivity extends Activity {
         }
     }
 
-    void loadContentRequestSelection(JSONObject candidate, TextView selectedTitle,
-                                     Button seasonChoice, Button addItem,
-                                     JSONObject[] selectedCandidate, JSONObject[] selection,
-                                     int[] selectedSeason, Runnable rerenderGrid) {
-        String type = candidate.optString("content_type", "");
-        long tmdbId = candidate.optLong("tmdb_id");
-        if (tmdbId <= 0 || (!"movie".equals(type) && !"tv".equals(type))) return;
-        String selectionTag = type + ":" + tmdbId;
-        selectedCandidate[0] = candidate;
-        selection[0] = null;
-        selectedSeason[0] = -1;
-        selectedTitle.setText(t("Cargando selección…"));
-        seasonChoice.setVisibility(View.GONE);
-        addItem.setEnabled(false);
-        rerenderGrid.run();
+    void chooseContentRequestSeason(JSONObject item, Runnable rerenderQueue) {
+        String type = item.optString("content_type", "");
+        long tmdbId = item.optLong("tmdb_id");
+        if (!"tv".equals(type) || tmdbId <= 0) return;
         io.execute(() -> {
             try {
                 JSONObject details = getJson("/api/v1/content-requests/tmdb/" + type + "/" + tmdbId);
-                details.put("content_type", type);
                 runOnUiThread(() -> {
-                    if (selectedCandidate[0] == null
-                            || !selectionTag.equals(selectedCandidate[0].optString("content_type")
-                            + ":" + selectedCandidate[0].optLong("tmdb_id"))) return;
-                    if (details.optString("poster_path").isEmpty())
-                        details.remove("poster_path");
-                    if (!details.has("poster_path")) {
-                        try { details.put("poster_path", candidate.optString("poster_path", "")); }
-                        catch (JSONException ignored) { }
-                    }
-                    selection[0] = details;
-                    selectedSeason[0] = -1;
-                    String title = details.optString("metadata_title", candidate.optString("title", ""));
-                    String year = details.isNull("year") ? "" : details.optString("year");
-                    selectedTitle.setText(title + (year.isEmpty() ? "" : " · " + year));
                     JSONArray seasons = details.optJSONArray("seasons");
-                    if ("tv".equals(type) && seasons != null && seasons.length() > 0) {
-                        seasonChoice.setText(t("Serie completa"));
-                        seasonChoice.setVisibility(View.VISIBLE);
+                    int count = seasons == null ? 0 : seasons.length();
+                    String[] labels = new String[count + 1];
+                    int[] numbers = new int[count + 1];
+                    labels[0] = t("Serie completa");
+                    numbers[0] = -1;
+                    for (int i = 0; i < count; i++) {
+                        JSONObject season = seasons.optJSONObject(i);
+                        int number = season == null ? i + 1 : season.optInt("season_number", i + 1);
+                        int episodes = season == null ? 0 : season.optInt("episode_count");
+                        labels[i + 1] = t("Temporada") + " " + number
+                                + (episodes > 0 ? " · " + episodes + " "
+                                + t(episodes == 1 ? "capítulo" : "capítulos") : "");
+                        numbers[i + 1] = number;
                     }
-                    addItem.setEnabled(true);
+                    new AlertDialog.Builder(this).setTitle(t("Selecciona una temporada"))
+                            .setItems(labels, (dialog, which) -> {
+                                try {
+                                    item.put("season_number", numbers[which]);
+                                    rerenderQueue.run();
+                                } catch (JSONException ignored) { }
+                            }).show();
                 });
             } catch (Exception e) {
-                runOnUiThread(() -> {
-                    if (selectedCandidate[0] == null
-                            || !selectionTag.equals(selectedCandidate[0].optString("content_type")
-                            + ":" + selectedCandidate[0].optLong("tmdb_id"))) return;
-                    selection[0] = null;
-                    selectedTitle.setText(t("No se pudo cargar la selección: ") + e.getMessage());
-                    addItem.setEnabled(false);
-                });
+                runOnUiThread(() -> Toast.makeText(this,
+                        t("No se pudo cargar la selección: ") + e.getMessage(), Toast.LENGTH_LONG).show());
             }
         });
     }
@@ -4819,8 +4740,8 @@ public class MainActivity extends Activity {
             case "Pedir contenido": return "Edukia eskatu";
             case "Pedir temporadas restantes": return "Gainerako denboraldiak eskatu";
             case "Gestión de cuentas": return "Kontuen kudeaketa";
-            case "Busca una película o serie en TMDb y envía la solicitud a administración.":
-                return "Bilatu film edo telesail bat TMDb-n eta bidali eskaera administraziora.";
+            case "Toca un resultado para añadirlo a la petición. Puedes elegir la temporada de cada serie y enviar varios títulos juntos.":
+                return "Ukitu emaitza bat eskaerara gehitzeko. Telesail bakoitzaren denboraldia aukeratu eta hainbat titulu batera bidal ditzakezu.";
             case "Título de película o serie": return "Filmaren edo telesailaren izenburua";
             case "Contenido seleccionado": return "Hautatutako edukia";
             case "Selecciona un resultado para continuar.": return "Hautatu emaitza bat jarraitzeko.";
@@ -4849,8 +4770,12 @@ public class MainActivity extends Activity {
             case "Temporadas restantes": return "Gainerako denboraldiak";
             case "Solicitó": return "Eskatzailea";
             case "Aprobada": return "Onartuta";
+            case "Validada": return "Balioztatuta";
             case "Pendiente": return "Zain";
-            case "Aceptar": return "Onartu";
+            case "Validar": return "Balioztatu";
+            case "Enviando a Telegram…": return "Telegramera bidaltzen…";
+            case "Reenviar a Telegram": return "Telegramera berriro bidali";
+            case "Telegram enviado": return "Telegramera bidali da";
             case "Borrar": return "Ezabatu";
             case "Borrar solicitud": return "Eskaera ezabatu";
             case "¿Borrar la solicitud de ": return "Ezabatu nahi duzu honen eskaera: ";
@@ -6099,8 +6024,10 @@ public class MainActivity extends Activity {
                         String year = request.isNull("year") ? "" : request.optString("year");
                         if (!year.isEmpty()) typeLabel += " · " + year;
                         typeLabel += " · " + t("Solicitó") + ": " + request.optString("requester_name", "");
-                        typeLabel += " · " + ("approved".equals(request.optString("status"))
-                                ? t("Aprobada") : t("Pendiente"));
+                        String requestStatus = request.optString("status");
+                        typeLabel += " · " + ("approved".equals(requestStatus)
+                                ? t("Validada") : ("sending".equals(requestStatus)
+                                ? t("Enviando a Telegram…") : t("Pendiente")));
                         TextView info = label(typeLabel, 12, MUTED, false);
                         LinearLayout.LayoutParams infoParams = new LinearLayout.LayoutParams(-1, -2);
                         infoParams.topMargin = d(4);
@@ -6110,11 +6037,16 @@ public class MainActivity extends Activity {
                         LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(-1, -2);
                         actionsParams.topMargin = d(7);
                         detailsColumn.addView(actions, actionsParams);
-                        if ("pending".equals(request.optString("status"))) {
-                            Button approve = actionButton(t("Aceptar"), true);
+                        if ("pending".equals(requestStatus)) {
+                            Button approve = actionButton(t("Validar"), true);
                             actions.addView(approve, new LinearLayout.LayoutParams(-2, d(40)));
                             approve.setOnClickListener(v -> updateContentRequest(
-                                    request.optString("id"), true, approve, slot));
+                                    request.optString("id"), "approve", approve, slot));
+                        } else if ("approved".equals(requestStatus)) {
+                            Button resend = actionButton(t("Reenviar a Telegram"), true);
+                            actions.addView(resend, new LinearLayout.LayoutParams(-2, d(40)));
+                            resend.setOnClickListener(v -> updateContentRequest(
+                                    request.optString("id"), "resend", resend, slot));
                         }
                         Button delete = actionButton(t("Borrar"), false);
                         LinearLayout.LayoutParams deleteParams = new LinearLayout.LayoutParams(-2, d(40));
@@ -6125,7 +6057,7 @@ public class MainActivity extends Activity {
                                 .setMessage(t("¿Borrar la solicitud de ") + request.optString("title", "") + "?")
                                 .setNegativeButton(t("Cancelar"), null)
                                 .setPositiveButton(t("Borrar"), (dialog, which) ->
-                                        updateContentRequest(request.optString("id"), false, delete, slot))
+                                        updateContentRequest(request.optString("id"), "delete", delete, slot))
                                 .show());
                     }
                 });
@@ -6166,13 +6098,22 @@ public class MainActivity extends Activity {
         });
     }
 
-    void updateContentRequest(String requestId, boolean approve, Button button, LinearLayout slot) {
+    void updateContentRequest(String requestId, String action, Button button, LinearLayout slot) {
         button.setEnabled(false);
         io.execute(() -> {
             try {
-                if (approve) postJson("/api/v1/admin/content-requests/" + enc(requestId) + "/approve");
-                else authorizedProfileRequest("DELETE", "/api/v1/admin/content-requests/" + enc(requestId), null);
-                runOnUiThread(() -> loadContentRequestControls(slot));
+                if ("approve".equals(action)) {
+                    postJson("/api/v1/admin/content-requests/" + enc(requestId) + "/approve");
+                } else if ("resend".equals(action)) {
+                    postJson("/api/v1/admin/content-requests/" + enc(requestId) + "/resend");
+                } else {
+                    authorizedProfileRequest("DELETE", "/api/v1/admin/content-requests/" + enc(requestId), null);
+                }
+                runOnUiThread(() -> {
+                    if ("resend".equals(action))
+                        Toast.makeText(this, t("Telegram enviado"), Toast.LENGTH_SHORT).show();
+                    loadContentRequestControls(slot);
+                });
             } catch (Exception e) {
                 runOnUiThread(() -> {
                     button.setEnabled(true);

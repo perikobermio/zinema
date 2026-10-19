@@ -22,6 +22,7 @@ from pwdlib import PasswordHash
 from starlette.responses import FileResponse, Response, StreamingResponse
 
 from app.catalog import scan_catalog
+from app.telegram import send_telegram_message
 from app.tmdb import (apply_tmdb_id, enrich_pending, get_candidate_details,
                       search_content_requests, search_image_options, search_metadata_candidates,
                       _image_config, _save_image, normalize_genres)
@@ -310,9 +311,17 @@ def database() -> sqlite3.Connection:
                status TEXT NOT NULL DEFAULT 'pending',
                created_at TEXT NOT NULL,
                reviewed_at TEXT,
-               reviewed_by_account_id TEXT
+               reviewed_by_account_id TEXT,
+               telegram_sent_at TEXT,
+               telegram_message_id INTEGER,
+               telegram_error TEXT
            )"""
     )
+    request_columns = {row["name"] for row in connection.execute("PRAGMA table_info(content_requests)")}
+    for name in ("telegram_sent_at", "telegram_message_id", "telegram_error"):
+        if name not in request_columns:
+            column_type = "INTEGER" if name == "telegram_message_id" else "TEXT"
+            connection.execute(f"ALTER TABLE content_requests ADD COLUMN {name} {column_type}")
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_content_requests_status_created "
         "ON content_requests(status, created_at)"
@@ -1924,7 +1933,8 @@ def list_content_requests() -> list[dict[str, object]]:
     with closing(database()) as connection:
         rows = connection.execute(
             """SELECT * FROM content_requests
-               ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, created_at DESC"""
+               ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'sending' THEN 1 ELSE 2 END,
+                        created_at DESC"""
         ).fetchall()
     results = []
     for row in rows:
@@ -1932,10 +1942,67 @@ def list_content_requests() -> list[dict[str, object]]:
         results.append({**{key: row[key] for key in (
         "id", "requester_name", "request_type", "content_type", "tmdb_id",
         "title", "year", "season_number", "catalog_node_id", "status", "created_at",
+        "telegram_sent_at",
         )}, "details": details,
         "poster_path": details.get("poster_path"),
         "poster_url": details.get("poster_url")})
     return results
+
+
+def content_request_thumbnail(connection: sqlite3.Connection, request: sqlite3.Row,
+                               details: dict[str, object]) -> bytes | None:
+    poster_path = details.get("poster_path")
+    if isinstance(poster_path, str) and poster_path.startswith("/"):
+        response = httpx.get(f"https://image.tmdb.org/t/p/w500{poster_path}", timeout=15.0)
+        response.raise_for_status()
+        if len(response.content) > 10 * 1024 * 1024:
+            raise RuntimeError("La miniatura supera el tamaño permitido para Telegram")
+        return response.content
+
+    node_id = request["catalog_node_id"]
+    if node_id:
+        node = connection.execute(
+            "SELECT id, poster_file FROM catalog_nodes WHERE id=?", (node_id,),
+        ).fetchone()
+        poster_file = node["poster_file"] if node else None
+        if not poster_file and node:
+            fallback = _series_fallback_poster(connection, node["id"])
+            if fallback:
+                poster_file = fallback[1]
+        if poster_file:
+            artwork_root = ARTWORK_DIR.resolve()
+            artwork_path = (artwork_root / poster_file).resolve()
+            if artwork_root not in artwork_path.parents:
+                raise RuntimeError("La ruta de la miniatura no es válida")
+            image = artwork_path.read_bytes()
+            if len(image) > 10 * 1024 * 1024:
+                raise RuntimeError("La miniatura supera el tamaño permitido para Telegram")
+            return image
+    return None
+
+
+def content_request_telegram_caption(request: sqlite3.Row,
+                                     details: dict[str, object]) -> str:
+    title = str(request["title"] or "(sin título)").strip()
+    if request["request_type"] == "remaining_seasons":
+        lines = ["Solicitud de contenido para Zinema", f"Serie: {title}"]
+        lines.append(f"Año: {request['year']}" if request["year"] else "Año: desconocido")
+        missing = details.get("missing_seasons") or []
+        if missing:
+            lines.append("Solicita temporadas restantes: " + ", ".join(f"T{int(number)}" for number in missing))
+        elif details.get("missing_episode_count"):
+            lines.append(f"Solicita capítulos restantes: {int(details['missing_episode_count'])}")
+    else:
+        content_type = "Película" if request["content_type"] == "movie" else "Serie"
+        lines = ["Solicitud de contenido para Zinema", f"Título: {title}", f"Tipo: {content_type}"]
+        lines.append(f"Año: {request['year']}" if request["year"] else "Año: desconocido")
+        if request["content_type"] == "tv":
+            season_number = request["season_number"]
+            lines.append(f"Temporada solicitada: {season_number}" if season_number
+                         else "Solicitud: serie completa")
+    lines.append(f"Solicitante: {request['requester_name']}")
+    lines.append(f"Solicitud ID: {request['id']}")
+    return "\n".join(lines)[:950]
 
 
 @app.post("/api/v1/admin/content-requests/{request_id}/approve",
@@ -1944,15 +2011,87 @@ def approve_content_request(request_id: str,
                             device_id: Annotated[str, Depends(require_admin)]) -> dict[str, bool]:
     reviewer_id = account_for_device(device_id)
     with closing(database()) as connection:
+        request = connection.execute(
+            "SELECT * FROM content_requests WHERE id=?", (request_id,),
+        ).fetchone()
+        if request is None:
+            raise HTTPException(status_code=404, detail="Content request not found")
+        if request["status"] != "pending":
+            raise HTTPException(status_code=409, detail="Content request is not pending")
+        now = datetime.now(timezone.utc).isoformat()
         cursor = connection.execute(
-            """UPDATE content_requests SET status='approved', reviewed_at=?,
-                   reviewed_by_account_id=? WHERE id=? AND status='pending'""",
-            (datetime.now(timezone.utc).isoformat(), reviewer_id, request_id),
+            """UPDATE content_requests SET status='sending', reviewed_at=?,
+                   reviewed_by_account_id=?, telegram_error=NULL
+               WHERE id=? AND status='pending'""",
+            (now, reviewer_id, request_id),
         )
         connection.commit()
-    if cursor.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Pending content request not found")
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=409, detail="Content request is already being reviewed")
+        request_data = dict(request)
+        details = json.loads(request_data["details_json"] or "{}")
+
+    try:
+        with closing(database()) as connection:
+            thumbnail = content_request_thumbnail(connection, request_data, details)
+        message_id = send_telegram_message(content_request_telegram_caption(request_data, details), thumbnail)
+    except Exception as exc:
+        error = str(exc)[:500]
+        with closing(database()) as connection:
+            connection.execute(
+                """UPDATE content_requests SET status='pending', reviewed_at=NULL,
+                       reviewed_by_account_id=NULL, telegram_error=?
+                   WHERE id=? AND status='sending'""",
+                (error, request_id),
+            )
+            connection.commit()
+        raise HTTPException(status_code=502, detail=f"Telegram send failed: {error}") from None
+
+    sent_at = datetime.now(timezone.utc).isoformat()
+    with closing(database()) as connection:
+        connection.execute(
+            """UPDATE content_requests SET status='approved', reviewed_at=?,
+                   reviewed_by_account_id=?, telegram_sent_at=?, telegram_message_id=?,
+                   telegram_error=NULL WHERE id=? AND status='sending'""",
+            (sent_at, reviewer_id, sent_at, message_id, request_id),
+        )
+        connection.commit()
     return {"approved": True}
+
+
+@app.post("/api/v1/admin/content-requests/{request_id}/resend",
+          dependencies=[Depends(require_admin)])
+def resend_content_request(request_id: str) -> dict[str, bool]:
+    with closing(database()) as connection:
+        request = connection.execute(
+            "SELECT * FROM content_requests WHERE id=? AND status='approved'", (request_id,),
+        ).fetchone()
+        if request is None:
+            raise HTTPException(status_code=404, detail="Validated content request not found")
+        request_data = dict(request)
+        details = json.loads(request_data["details_json"] or "{}")
+
+    try:
+        with closing(database()) as connection:
+            thumbnail = content_request_thumbnail(connection, request_data, details)
+        message_id = send_telegram_message(content_request_telegram_caption(request_data, details), thumbnail)
+    except Exception as exc:
+        error = str(exc)[:500]
+        with closing(database()) as connection:
+            connection.execute("UPDATE content_requests SET telegram_error=? WHERE id=?",
+                               (error, request_id))
+            connection.commit()
+        raise HTTPException(status_code=502, detail=f"Telegram resend failed: {error}") from None
+
+    sent_at = datetime.now(timezone.utc).isoformat()
+    with closing(database()) as connection:
+        connection.execute(
+            """UPDATE content_requests SET telegram_sent_at=?, telegram_message_id=?,
+                   telegram_error=NULL WHERE id=? AND status='approved'""",
+            (sent_at, message_id, request_id),
+        )
+        connection.commit()
+    return {"resent": True}
 
 
 @app.delete("/api/v1/admin/content-requests/{request_id}",
