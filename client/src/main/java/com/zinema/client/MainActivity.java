@@ -2819,6 +2819,9 @@ public class MainActivity extends Activity {
         boolean placeholder = node.optBoolean("is_placeholder");
         card.setFocusable(!placeholder);
         card.setClickable(!placeholder);
+        card.setLongClickable(!placeholder);
+        card.setEnabled(!placeholder);
+        if (placeholder) card.setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
         if (!placeholder) applyTvFocusStyle(card, true);
         int width = d(142);
         FrameLayout art = new FrameLayout(this);
@@ -2858,15 +2861,28 @@ public class MainActivity extends Activity {
             View shade = new View(this);
             shade.setBackgroundColor(0x99090A0D);
             art.addView(shade, new FrameLayout.LayoutParams(-1, -1));
-            TextView pending = label(t("Pendiente de añadir"), 10, Color.WHITE, true);
+            LinearLayout stamp = new LinearLayout(this);
+            stamp.setOrientation(LinearLayout.VERTICAL);
+            stamp.setGravity(Gravity.CENTER);
+            stamp.setPadding(d(8), d(10), d(8), d(10));
+            GradientDrawable stampBackground = new GradientDrawable();
+            stampBackground.setColor(0xE625171B);
+            stampBackground.setCornerRadius(d(9));
+            stampBackground.setStroke(d(2), 0xFFFF646B);
+            stamp.setBackground(stampBackground);
+            TextView requestType = label(t("SOLICITUD VALIDADA"), 9, 0xFFFFC857, true);
+            requestType.setGravity(Gravity.CENTER);
+            stamp.addView(requestType, new LinearLayout.LayoutParams(-1, -2));
+            TextView pending = label(t("Pendiente de añadir"), 13, Color.WHITE, true);
             pending.setGravity(Gravity.CENTER);
             pending.setMaxLines(2);
-            pending.setPadding(d(8), d(7), d(8), d(7));
-            pending.setBackground(round(0xCC222834, d(8)));
-            FrameLayout.LayoutParams pendingParams = new FrameLayout.LayoutParams(
+            LinearLayout.LayoutParams pendingTextParams = new LinearLayout.LayoutParams(-1, -2);
+            pendingTextParams.topMargin = d(5);
+            stamp.addView(pending, pendingTextParams);
+            FrameLayout.LayoutParams stampParams = new FrameLayout.LayoutParams(
                     -1, -2, Gravity.CENTER);
-            pendingParams.setMargins(d(10), 0, d(10), 0);
-            art.addView(pending, pendingParams);
+            stampParams.setMargins(d(8), 0, d(8), 0);
+            art.addView(stamp, stampParams);
         }
         if (isCollection) {
             TextView collectionIcon = label("▦", 17, Color.WHITE, true);
@@ -3487,6 +3503,7 @@ public class MainActivity extends Activity {
     }
 
     void openNode(JSONObject node) {
+        if (node == null || node.optBoolean("is_placeholder")) return;
         leaveStartupHomeWait();
         if (!isKidAllowedNode(node)) {
             Toast.makeText(this, t("Este contenido no está disponible en un perfil infantil."), Toast.LENGTH_LONG).show();
@@ -3645,6 +3662,7 @@ public class MainActivity extends Activity {
     }
 
     void showActions(JSONObject node) {
+        if (node == null || node.optBoolean("is_placeholder")) return;
         List<String> actions = new ArrayList<>();
         List<Runnable> handlers = new ArrayList<>();
         String kind = node.optString("kind");
@@ -4813,10 +4831,11 @@ public class MainActivity extends Activity {
             case "Pendiente de añadir": return "Gehitzeko zain";
             case "A la espera de ser añadido": return "Gehitzeko zain";
             case "Capítulos pendientes": return "Atalak gehitzeko zain";
+            case "SOLICITUD VALIDADA": return "ESKAERA BALIOZTATUTA";
             case "Pendiente": return "Zain";
             case "Validar": return "Balioztatu";
             case "Enviando a Telegram…": return "Telegramera bidaltzen…";
-            case "Reenviar a Telegram": return "Telegramera berriro bidali";
+            case "Reenviar a Telegram": return "Birbidali";
             case "Telegram enviado": return "Telegramera bidali da";
             case "Borrar": return "Ezabatu";
             case "Borrar solicitud": return "Eskaera ezabatu";
