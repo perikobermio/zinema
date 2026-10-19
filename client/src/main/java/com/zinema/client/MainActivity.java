@@ -119,6 +119,8 @@ public class MainActivity extends Activity {
         }
     };
     final Map<String, List<ImageView>> pendingImageTargets = new HashMap<>();
+    final Map<ImageView, String[]> deferredImageRequests = new WeakHashMap<>();
+    final Set<ImageView> lazyImageScrollWatchers = Collections.newSetFromMap(new WeakHashMap<>());
     final Map<String, List<JSONObject>> catalogCache = new HashMap<>();
     final Map<String, Long> catalogCacheUpdatedAt = new HashMap<>();
     SharedPreferences prefs;
@@ -584,6 +586,7 @@ public class MainActivity extends Activity {
         page.addView(contentScroller, new LinearLayout.LayoutParams(-1, 0, 1));
         setContentView(frame);
         frame.post(() -> {
+            loadVisibleLazyRows();
             if (showingAdmin) {
                 backButton.requestFocus();
                 return;
@@ -1295,18 +1298,22 @@ public class MainActivity extends Activity {
         boolean hasBlockedGenre = false;
         for (int i = 0; i < genres.length(); i++) {
             String genre = normalizeGenre(genres.optString(i, ""));
-            String[] terms = genre.split("[^a-z0-9]+");
-            for (String term : terms) {
-                if (term.equals("familia") || term.equals("family")) hasFamily = true;
-                if (term.equals("guerra") || term.equals("gerra") || term.equals("war")
-                        || term.equals("belica") || term.equals("crimen") || term.equals("crime")
-                        || term.equals("krimena") || term.equals("drama") || term.equals("terror")
-                        || term.equals("horror") || term.equals("beldurrezkoa") || term.equals("western")) {
-                    hasBlockedGenre = true;
-                }
-            }
+            if ("familia".equals(genre) || "family".equals(genre)) hasFamily = true;
+            if (isKidBlockedGenre(genre)) hasBlockedGenre = true;
         }
         return !hasBlockedGenre || hasFamily;
+    }
+
+    boolean isKidBlockedGenre(String genre) {
+        String[] terms = normalizeGenre(genre).split("[^a-z0-9]+");
+        for (String term : terms) {
+            if (term.equals("guerra") || term.equals("gerra") || term.equals("war")
+                    || term.equals("belica") || term.equals("crimen") || term.equals("crime")
+                    || term.equals("krimena") || term.equals("drama") || term.equals("terror")
+                    || term.equals("horror") || term.equals("beldurrezkoa") || term.equals("western"))
+                return true;
+        }
+        return false;
     }
 
     List<JSONObject> filterKidCatalog(List<JSONObject> nodes) {
@@ -2555,8 +2562,37 @@ public class MainActivity extends Activity {
         List<JSONObject> visibleMovies = filterKidCatalog(movies);
         List<JSONObject> visibleSeries = filterKidCatalog(series);
         if (!favorites.isEmpty()) addRow("Mi lista", favorites);
-        addRow("Películas", visibleMovies);
-        addRow("Series", visibleSeries);
+        List<JSONObject> pendingItems = new ArrayList<>();
+        Set<String> pendingIds = new HashSet<>();
+        for (JSONObject node : visibleMovies)
+            collectPendingHomeItems(node, "", pendingItems, pendingIds);
+        for (JSONObject node : visibleSeries)
+            collectPendingHomeItems(node, "", pendingItems, pendingIds);
+        List<JSONObject> catalogItems = new ArrayList<>();
+        for (JSONObject node : visibleMovies)
+            if (!node.optBoolean("is_placeholder") && "movie".equals(node.optString("kind")))
+                catalogItems.add(node);
+        for (JSONObject node : visibleSeries)
+            if (!node.optBoolean("is_placeholder") && "series".equals(node.optString("kind")))
+                catalogItems.add(node);
+        sortNewestFirst(catalogItems);
+        addRow("Lo más nuevo", catalogItems);
+        sortPendingHomeItems(pendingItems);
+        addRow("Pendientes de añadir", pendingItems);
+        for (String genre : homeGenres(catalogItems)) {
+            List<JSONObject> genreItems = new ArrayList<>();
+            for (JSONObject node : catalogItems) {
+                JSONArray genres = node.optJSONArray("genres");
+                if (genres == null) continue;
+                for (int i = 0; i < genres.length(); i++) {
+                    if (normalizeGenre(genre).equals(normalizeGenre(genres.optString(i, "")))) {
+                        genreItems.add(node);
+                        break;
+                    }
+                }
+            }
+            addRow(genreLabel(genre), genreItems);
+        }
         if (visibleMovies.isEmpty() && visibleSeries.isEmpty()) {
             TextView empty = label("Tu biblioteca está vacía. Sincroniza el catálogo en el servidor.", 16, MUTED, false);
             empty.setPadding(d(24), d(36), d(24), d(32));
@@ -2564,6 +2600,63 @@ public class MainActivity extends Activity {
         }
         restoreListingScrollIfPending();
         backfillMissingSeriesSuggestions();
+    }
+
+    void collectPendingHomeItems(JSONObject node, String parentSeriesTitle,
+                                 List<JSONObject> output, Set<String> includedIds) {
+        if (node == null) return;
+        if (node.optBoolean("is_placeholder")) {
+            String id = node.optString("id", "");
+            if (!id.isEmpty() && includedIds.add(id)) {
+                JSONObject card;
+                try { card = new JSONObject(node.toString()); }
+                catch (JSONException ignored) { card = node; }
+                if ("season".equals(card.optString("kind")) && !parentSeriesTitle.isEmpty()) {
+                    try { card.put("series_title", parentSeriesTitle); }
+                    catch (JSONException ignored) { }
+                }
+                output.add(card);
+            }
+            return;
+        }
+        String seriesTitle = "series".equals(node.optString("kind"))
+                ? displayTitle(node) : parentSeriesTitle;
+        JSONArray children = node.optJSONArray("children");
+        if (children == null) return;
+        for (int i = 0; i < children.length(); i++)
+            collectPendingHomeItems(children.optJSONObject(i), seriesTitle, output, includedIds);
+    }
+
+    void sortPendingHomeItems(List<JSONObject> nodes) {
+        java.text.Collator collator = java.text.Collator.getInstance(
+                java.util.Locale.forLanguageTag("eu".equals(prefs.getString("language", "es")) ? "eu" : "es"));
+        collator.setStrength(java.text.Collator.PRIMARY);
+        Collections.sort(nodes, (left, right) -> {
+            String leftTitle = left.optString("series_title", "") + " " + displayTitle(left);
+            String rightTitle = right.optString("series_title", "") + " " + displayTitle(right);
+            return collator.compare(leftTitle.trim(), rightTitle.trim());
+        });
+    }
+
+    List<String> homeGenres(List<JSONObject> nodes) {
+        Map<String, String> unique = new HashMap<>();
+        for (JSONObject node : nodes) {
+            JSONArray genres = node.optJSONArray("genres");
+            if (genres == null) continue;
+            for (int i = 0; i < genres.length(); i++) {
+                String genre = genres.optString(i, "").trim();
+                String normalized = normalizeGenre(genre);
+                if (genre.isEmpty() || normalized.isEmpty()
+                        || (isActiveKidProfile() && isKidBlockedGenre(normalized))) continue;
+                if (!unique.containsKey(normalized)) unique.put(normalized, genre);
+            }
+        }
+        List<String> result = new ArrayList<>(unique.values());
+        java.text.Collator collator = java.text.Collator.getInstance(
+                java.util.Locale.forLanguageTag("eu".equals(prefs.getString("language", "es")) ? "eu" : "es"));
+        collator.setStrength(java.text.Collator.PRIMARY);
+        Collections.sort(result, (left, right) -> collator.compare(genreLabel(left), genreLabel(right)));
+        return result;
     }
 
     long resumeItemUpdated(JSONObject item) {
@@ -2810,10 +2903,51 @@ public class MainActivity extends Activity {
     }
 
     View posterCard(JSONObject node) {
-        return posterCard(node, false);
+        return posterCard(node, false, shouldShowSeriesFlag());
     }
 
     View posterCard(JSONObject node, boolean lazyPosters) {
+        return posterCard(node, lazyPosters, shouldShowSeriesFlag());
+    }
+
+    boolean shouldShowSeriesFlag() {
+        return !(libraryMode && !showingDetail && "series".equals(selectedSection)
+                && breadcrumbs.isEmpty());
+    }
+
+    View seriesCornerMarker() {
+        return new View(this) {
+            final Paint flagPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            @Override protected void onDraw(Canvas canvas) {
+                super.onDraw(canvas);
+                float w = getWidth();
+                float h = getHeight();
+                flagPaint.setColor(0xFF8067D5);
+                flagPaint.setStyle(Paint.Style.FILL);
+                Path corner = new Path();
+                corner.moveTo(0, 0);
+                corner.lineTo(w, 0);
+                corner.lineTo(0, h);
+                corner.close();
+                canvas.drawPath(corner, flagPaint);
+                flagPaint.setColor(Color.WHITE);
+                flagPaint.setStyle(Paint.Style.STROKE);
+                flagPaint.setStrokeWidth(d(1.5f));
+                flagPaint.setStrokeCap(Paint.Cap.ROUND);
+                float left = d(7);
+                float top = d(8);
+                float right = d(19);
+                float bottom = d(16);
+                canvas.drawRoundRect(left, top, right, bottom, d(1.5f), d(1.5f), flagPaint);
+                canvas.drawLine(left + d(3), top - d(3), left + d(5), top, flagPaint);
+                canvas.drawLine(right - d(3), top - d(3), right - d(5), top, flagPaint);
+                canvas.drawLine(left + d(6), bottom + d(1), right - d(6), bottom + d(1), flagPaint);
+                flagPaint.setStyle(Paint.Style.FILL);
+            }
+        };
+    }
+
+    View posterCard(JSONObject node, boolean lazyPosters, boolean showSeriesFlag) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         boolean placeholder = node.optBoolean("is_placeholder");
@@ -2861,28 +2995,16 @@ public class MainActivity extends Activity {
             View shade = new View(this);
             shade.setBackgroundColor(0x99090A0D);
             art.addView(shade, new FrameLayout.LayoutParams(-1, -1));
-            LinearLayout stamp = new LinearLayout(this);
-            stamp.setOrientation(LinearLayout.VERTICAL);
-            stamp.setGravity(Gravity.CENTER);
-            stamp.setPadding(d(8), d(10), d(8), d(10));
-            GradientDrawable stampBackground = new GradientDrawable();
-            stampBackground.setColor(0xE625171B);
-            stampBackground.setCornerRadius(d(9));
-            stampBackground.setStroke(d(2), 0xFFFF646B);
-            stamp.setBackground(stampBackground);
-            TextView requestType = label(t("SOLICITUD VALIDADA"), 9, 0xFFFFC857, true);
-            requestType.setGravity(Gravity.CENTER);
-            stamp.addView(requestType, new LinearLayout.LayoutParams(-1, -2));
-            TextView pending = label(t("Pendiente de añadir"), 13, Color.WHITE, true);
-            pending.setGravity(Gravity.CENTER);
-            pending.setMaxLines(2);
-            LinearLayout.LayoutParams pendingTextParams = new LinearLayout.LayoutParams(-1, -2);
-            pendingTextParams.topMargin = d(5);
-            stamp.addView(pending, pendingTextParams);
+            ImageView stampImage = new ImageView(this);
+            stampImage.setImageResource(R.drawable.pending_request_stamp);
+            stampImage.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            stampImage.setAlpha(0.32f);
+            stampImage.setRotation(-5f);
             FrameLayout.LayoutParams stampParams = new FrameLayout.LayoutParams(
-                    -1, -2, Gravity.CENTER);
-            stampParams.setMargins(d(8), 0, d(8), 0);
-            art.addView(stamp, stampParams);
+                    d(180), d(180), Gravity.RIGHT | Gravity.BOTTOM);
+            art.addView(stampImage, stampParams);
+            stampImage.setTranslationX(d(58));
+            stampImage.setTranslationY(d(48));
         }
         if (isCollection) {
             TextView collectionIcon = label("▦", 17, Color.WHITE, true);
@@ -2901,6 +3023,13 @@ public class MainActivity extends Activity {
                     -2, -2, Gravity.TOP | Gravity.RIGHT);
             incompleteParams.setMargins(0, d(7), d(7), 0);
             art.addView(incomplete, incompleteParams);
+        }
+        if (showSeriesFlag && "series".equals(node.optString("kind"))) {
+            View seriesMarker = seriesCornerMarker();
+            seriesMarker.setContentDescription(t("Serie"));
+            FrameLayout.LayoutParams seriesParams = new FrameLayout.LayoutParams(d(36), d(36),
+                    Gravity.TOP | Gravity.LEFT);
+            art.addView(seriesMarker, seriesParams);
         }
         LinearLayout.LayoutParams ap = new LinearLayout.LayoutParams(width, d(204));
         card.addView(art, ap);
@@ -2938,7 +3067,11 @@ public class MainActivity extends Activity {
 
     String cardSubtitle(JSONObject node) {
         if (node.optBoolean("is_placeholder")) {
-            if ("season".equals(node.optString("kind"))) return t("A la espera de ser añadido");
+            if ("season".equals(node.optString("kind"))) {
+                String seriesTitle = node.optString("series_title", "");
+                String waiting = t("A la espera de ser añadido");
+                return seriesTitle.isEmpty() ? waiting : seriesTitle + " · " + waiting;
+            }
             String kind = "movie".equals(node.optString("kind")) ? t("Película") : t("Serie");
             String year = node.isNull("year") ? "" : node.optString("year", "");
             String subtitle = kind + (year.isEmpty() ? "" : " · " + year);
@@ -3087,6 +3220,9 @@ public class MainActivity extends Activity {
 
     void loadImage(String path, ImageView target, boolean backdrop, String fallbackPath) {
         if (path == null || path.trim().isEmpty() || "null".equalsIgnoreCase(path.trim())) {
+            deferredImageRequests.remove(target);
+            requestedImages.remove(target);
+            target.setTag(null);
             if (fallbackPath != null && !fallbackPath.trim().isEmpty()
                     && !"null".equalsIgnoreCase(fallbackPath.trim()))
                 loadImage(fallbackPath, target, backdrop, "");
@@ -3095,6 +3231,17 @@ public class MainActivity extends Activity {
         }
         String url = path.startsWith("http") ? path : server + (path.startsWith("/") ? path : "/" + path);
         if (url.equals(requestedImages.get(target))) return;
+        if (!isImageVisible(target)) {
+            requestedImages.remove(target);
+            target.setImageDrawable(null);
+            target.setTag(url);
+            deferredImageRequests.put(target, new String[]{path, Boolean.toString(backdrop),
+                    fallbackPath == null ? "" : fallbackPath});
+            watchDeferredImageScroll(target);
+            target.post(() -> loadDeferredImageIfVisible(target));
+            return;
+        }
+        deferredImageRequests.remove(target);
         target.setTag(url);
         requestedImages.put(target, url);
         Bitmap cached = imageCache.get(url);
@@ -3135,6 +3282,39 @@ public class MainActivity extends Activity {
         });
     }
 
+    boolean isImageVisible(ImageView target) {
+        if (target == null || target.getVisibility() != View.VISIBLE || target.getAlpha() <= 0f) return false;
+        Rect visible = new Rect();
+        return target.getGlobalVisibleRect(visible) && visible.width() > 0 && visible.height() > 0;
+    }
+
+    void watchDeferredImageScroll(ImageView target) {
+        if (target == null || !lazyImageScrollWatchers.add(target)) return;
+        android.view.ViewTreeObserver.OnScrollChangedListener scrollListener =
+                () -> loadDeferredImageIfVisible(target);
+        target.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View view) {
+                if (target.getViewTreeObserver().isAlive())
+                    target.getViewTreeObserver().addOnScrollChangedListener(scrollListener);
+                loadDeferredImageIfVisible(target);
+            }
+            @Override public void onViewDetachedFromWindow(View view) {
+                if (scrollListener != null && target.getViewTreeObserver().isAlive())
+                    target.getViewTreeObserver().removeOnScrollChangedListener(scrollListener);
+            }
+        });
+        if (target.isAttachedToWindow()) {
+            if (target.getViewTreeObserver().isAlive())
+                target.getViewTreeObserver().addOnScrollChangedListener(scrollListener);
+        }
+    }
+
+    void loadDeferredImageIfVisible(ImageView target) {
+        String[] request = deferredImageRequests.get(target);
+        if (request == null || !isImageVisible(target)) return;
+        loadImage(request[0], target, Boolean.parseBoolean(request[1]), request[2]);
+    }
+
     void showPoster(String path, ImageView target, boolean lazy) {
         if (!lazy) {
             loadImage(path, target, false);
@@ -3160,14 +3340,26 @@ public class MainActivity extends Activity {
     }
 
     void loadVisibleLazyRows() {
-        if (content == null) return;
-        loadVisibleLazyRowsIn(content);
+        View root = page == null ? content : page;
+        if (root != null) loadVisibleLazyRowsIn(root);
     }
 
     void loadVisibleLazyRowsIn(View view) {
         if (view instanceof HorizontalScrollView &&
                 ("zinema-lazy-posters".equals(view.getTag()) || "zinema-lazy-cast".equals(view.getTag()))) {
             loadLazyRow((HorizontalScrollView) view);
+            return;
+        }
+        if (view instanceof ImageView) {
+            ImageView image = (ImageView) view;
+            if (deferredImageRequests.containsKey(image)) {
+                loadDeferredImageIfVisible(image);
+            } else if (!requestedImages.containsKey(image)) {
+                Object value = image.getTag();
+                if (value instanceof String && ((String) value).startsWith("http")) {
+                    if (isImageVisible(image)) loadImage((String) value, image, false);
+                }
+            }
             return;
         }
         if (view instanceof ViewGroup) {
@@ -4741,6 +4933,7 @@ public class MainActivity extends Activity {
             case "capítulo": return "atal";
             case "capítulos": return "atal";
             case "Inicio": return "Hasiera";
+            case "Lo más nuevo": return "Eduki berrienak";
             case "Perfiles": return "Profilak";
             case "Perfil": return "Profila";
             case "Cambiar perfil": return "Profila aldatu";
@@ -4829,6 +5022,7 @@ public class MainActivity extends Activity {
             case "Aprobada": return "Onartuta";
             case "Validada": return "Balioztatuta";
             case "Pendiente de añadir": return "Gehitzeko zain";
+            case "Pendientes de añadir": return "Gehitzeko zain";
             case "A la espera de ser añadido": return "Gehitzeko zain";
             case "Capítulos pendientes": return "Atalak gehitzeko zain";
             case "SOLICITUD VALIDADA": return "ESKAERA BALIOZTATUTA";
