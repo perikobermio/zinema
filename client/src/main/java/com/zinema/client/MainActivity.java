@@ -2777,7 +2777,11 @@ public class MainActivity extends Activity {
     String displayTitle(JSONObject node) {
         String title = cleanDisplayText(node.optString("display_title", node.optString("title", "Zinema")));
         if (title.isEmpty()) title = cleanDisplayText(node.optString("title", "Zinema"));
-        if (node.optString("kind").equals("season")) return t("Temporada") + " " + String.format("%02d", node.optInt("season_number"));
+        if (node.optString("kind").equals("season")) {
+            if (node.optBoolean("is_placeholder") && node.optInt("season_number") <= 0)
+                return t("Capítulos pendientes");
+            return t("Temporada") + " " + String.format("%02d", node.optInt("season_number"));
+        }
         return title;
     }
 
@@ -2812,9 +2816,10 @@ public class MainActivity extends Activity {
     View posterCard(JSONObject node, boolean lazyPosters) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setFocusable(true);
-        card.setClickable(true);
-        applyTvFocusStyle(card, true);
+        boolean placeholder = node.optBoolean("is_placeholder");
+        card.setFocusable(!placeholder);
+        card.setClickable(!placeholder);
+        if (!placeholder) applyTvFocusStyle(card, true);
         int width = d(142);
         FrameLayout art = new FrameLayout(this);
         art.setBackground(round(PANEL, d(10)));
@@ -2849,6 +2854,20 @@ public class MainActivity extends Activity {
             art.addView(poster, new FrameLayout.LayoutParams(-1, -1));
             showPoster(node.optString("poster_url", ""), poster, lazyPosters);
         }
+        if (placeholder) {
+            View shade = new View(this);
+            shade.setBackgroundColor(0x99090A0D);
+            art.addView(shade, new FrameLayout.LayoutParams(-1, -1));
+            TextView pending = label(t("Pendiente de añadir"), 10, Color.WHITE, true);
+            pending.setGravity(Gravity.CENTER);
+            pending.setMaxLines(2);
+            pending.setPadding(d(8), d(7), d(8), d(7));
+            pending.setBackground(round(0xCC222834, d(8)));
+            FrameLayout.LayoutParams pendingParams = new FrameLayout.LayoutParams(
+                    -1, -2, Gravity.CENTER);
+            pendingParams.setMargins(d(10), 0, d(10), 0);
+            art.addView(pending, pendingParams);
+        }
         if (isCollection) {
             TextView collectionIcon = label("▦", 17, Color.WHITE, true);
             collectionIcon.setGravity(Gravity.CENTER);
@@ -2876,7 +2895,7 @@ public class MainActivity extends Activity {
         TextView meta = label(cardSubtitle(node), 11, MUTED, false);
         meta.setPadding(d(2), d(3), d(2), 0);
         card.addView(meta);
-        card.setOnLongClickListener(v -> { showActions(node); return true; });
+        if (!placeholder) card.setOnLongClickListener(v -> { showActions(node); return true; });
         boolean seenNode = "episode".equals(node.optString("kind"))
                 ? isMediaSeen(node) : isNodeSeen(node);
         if (seenNode) {
@@ -2890,7 +2909,7 @@ public class MainActivity extends Activity {
         }
         LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(width, -2);
         cp.setMargins(0, 0, d(12), 0);
-        card.setOnClickListener(v -> openNode(node));
+        if (!placeholder) card.setOnClickListener(v -> openNode(node));
         View wrapped = wrap(card, cp);
         wrapped.setTag("catalog-node:" + node.optString("id", ""));
         return wrapped;
@@ -2902,17 +2921,33 @@ public class MainActivity extends Activity {
     }
 
     String cardSubtitle(JSONObject node) {
+        if (node.optBoolean("is_placeholder")) {
+            if ("season".equals(node.optString("kind"))) return t("A la espera de ser añadido");
+            String kind = "movie".equals(node.optString("kind")) ? t("Película") : t("Serie");
+            String year = node.isNull("year") ? "" : node.optString("year", "");
+            String subtitle = kind + (year.isEmpty() ? "" : " · " + year);
+            int season = node.optInt("season_number");
+            if (season > 0) subtitle += " · " + t("Temporada") + " " + season;
+            return subtitle;
+        }
         String kind = node.optString("kind");
         if (kind.equals("series")) {
             JSONArray children = node.optJSONArray("children");
             int seasons = 0;
+            int pendingSeasons = 0;
             if (children != null) {
                 for (int i = 0; i < children.length(); i++) {
                     JSONObject child = children.optJSONObject(i);
-                    if (child != null && "season".equals(child.optString("kind"))) seasons++;
+                    if (child != null && "season".equals(child.optString("kind"))) {
+                        if (child.optBoolean("is_placeholder")) pendingSeasons++;
+                        else seasons++;
+                    }
                 }
             }
-            return seasons + (seasons == 1 ? " " + t("temporada") : " " + t("temporadas"));
+            String summary = seasons + (seasons == 1 ? " " + t("temporada") : " " + t("temporadas"));
+            if (pendingSeasons > 0)
+                summary += " · " + pendingSeasons + " " + t("Pendiente de añadir").toLowerCase();
+            return summary;
         }
         if (kind.equals("season")) return t("Temporada") + " " + String.format("%02d", node.optInt("season_number"));
         JSONArray genres = node.optJSONArray("genres");
@@ -3356,6 +3391,10 @@ public class MainActivity extends Activity {
         if (selected.isEmpty()) return nodes;
         List<JSONObject> filtered = new ArrayList<>();
         for (JSONObject node : nodes) {
+            if (node.optBoolean("is_placeholder")) {
+                filtered.add(node);
+                continue;
+            }
             JSONArray genres = node.optJSONArray("genres");
             if (genres == null) continue;
             boolean matches = false;
@@ -4771,6 +4810,9 @@ public class MainActivity extends Activity {
             case "Solicitó": return "Eskatzailea";
             case "Aprobada": return "Onartuta";
             case "Validada": return "Balioztatuta";
+            case "Pendiente de añadir": return "Gehitzeko zain";
+            case "A la espera de ser añadido": return "Gehitzeko zain";
+            case "Capítulos pendientes": return "Atalak gehitzeko zain";
             case "Pendiente": return "Zain";
             case "Validar": return "Balioztatu";
             case "Enviando a Telegram…": return "Telegramera bidaltzen…";

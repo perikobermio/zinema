@@ -459,6 +459,79 @@ def _episode_poster_url(item_id: str, poster_file: str, modified_at: str = "") -
     return f"/api/v1/items/{item_id}/poster?v={version}"
 
 
+def _catalog_request_placeholder(request: sqlite3.Row | dict, kind: str,
+                                 season_number: int | None = None,
+                                 parent_id: str | None = None) -> dict[str, object]:
+    details = json.loads(request["details_json"] or "{}")
+    title = str(request["title"] or "").strip()
+    if kind == "season":
+        title = f"Temporada {season_number:02d}" if season_number else "Capítulos pendientes"
+    poster_path = details.get("poster_path")
+    poster_url = details.get("poster_url")
+    if not poster_url and isinstance(poster_path, str) and poster_path.startswith("/"):
+        poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}"
+    return {
+        "id": f"request:{request['id']}:{season_number or ''}",
+        "kind": kind,
+        "library": "movies" if request["content_type"] == "movie" else "series",
+        "parent_id": parent_id,
+        "title": title,
+        "display_title": title,
+        "year": request["year"],
+        "tmdb_id": request["tmdb_id"],
+        "season_number": season_number,
+        "request_type": request["request_type"],
+        "is_placeholder": True,
+        "poster_url": poster_url,
+        "poster_available": bool(poster_url),
+        "genres": [],
+        "children": [],
+        "files": [],
+    }
+
+
+def _pending_season_placeholders(connection: sqlite3.Connection,
+                                 series_id: str) -> list[dict[str, object]]:
+    series = connection.execute(
+        "SELECT tmdb_id FROM catalog_nodes WHERE id=? AND kind='series' AND available=1",
+        (series_id,),
+    ).fetchone()
+    if series is None:
+        return []
+    requests = connection.execute(
+        """SELECT * FROM content_requests WHERE status='approved' AND (
+               (request_type='remaining_seasons' AND catalog_node_id=?) OR
+               (request_type='new_content' AND content_type='tv' AND tmdb_id=?
+                AND season_number IS NOT NULL))
+           ORDER BY created_at, id""",
+        (series_id, series["tmdb_id"]),
+    ).fetchall()
+    if not requests:
+        return []
+    existing = {row["season_number"] for row in connection.execute(
+        "SELECT season_number FROM catalog_nodes WHERE parent_id=? AND kind='season' AND available=1",
+        (series_id,),
+    ).fetchall()}
+    placeholders: dict[int | None, dict[str, object]] = {}
+    for request in requests:
+        details = json.loads(request["details_json"] or "{}")
+        if request["request_type"] == "remaining_seasons":
+            missing = details.get("missing_seasons") or []
+            requested_seasons = [int(value) for value in missing]
+        else:
+            requested_seasons = [int(request["season_number"])]
+        for number in requested_seasons:
+            if number is not None and number in existing:
+                continue
+            placeholders.setdefault(number, _catalog_request_placeholder(
+                request, "season", number, series_id,
+            ))
+    return sorted(placeholders.values(), key=lambda item: (
+        item.get("season_number") is None, item.get("season_number") or 0,
+        str(item["title"]).casefold(),
+    ))
+
+
 def item_from_row(row: sqlite3.Row, connection: sqlite3.Connection) -> LibraryItem:
     data = dict(row)
     data["genres"] = normalize_genres(json.loads(data.pop("genres_json", "[]") or "[]"))
@@ -703,6 +776,8 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
             child_payload.update({"item_count": child_artwork["item_count"],
                                   "mosaic_images": child_artwork["mosaic_images"]})
         node["children"].append(child_payload)
+    if node["kind"] == "series":
+        node["children"].extend(_pending_season_placeholders(connection, node["id"]))
     file_rows = connection.execute(
         """SELECT id, COALESCE(episode_title, title) AS title, title AS filename,
                   relative_path, extension, size_bytes, modified_at, season_number,
@@ -1072,8 +1147,14 @@ def get_catalog_version() -> dict[str, str]:
                       episode_number, episode_title, poster_file
                FROM library_items WHERE available=1 ORDER BY id"""
         ).fetchall()
+        requests = connection.execute(
+            """SELECT id, request_type, content_type, tmdb_id, title, year,
+                      season_number, catalog_node_id, details_json, status
+               FROM content_requests WHERE status='approved' ORDER BY id"""
+        ).fetchall()
     state = json.dumps(
-        [[tuple(row) for row in nodes], [tuple(row) for row in files]],
+        [[tuple(row) for row in nodes], [tuple(row) for row in files],
+         [tuple(row) for row in requests]],
         ensure_ascii=False, separators=(",", ":"),
     )
     return {"version": hashlib.sha256(state.encode("utf-8")).hexdigest()}
@@ -1515,7 +1596,40 @@ def list_catalog(
                 "WHEN 'season' THEN 2 ELSE 3 END, title COLLATE NOCASE",
                 (library,),
             ).fetchall()
-        return [_node_payload(row, connection) for row in rows]
+        result = [_node_payload(row, connection) for row in rows]
+        if parent_id is not None:
+            parent = connection.execute(
+                "SELECT kind FROM catalog_nodes WHERE id=? AND available=1", (parent_id,),
+            ).fetchone()
+            if parent and parent["kind"] == "series":
+                result.extend(_pending_season_placeholders(connection, parent_id))
+        else:
+            approved = connection.execute(
+                """SELECT * FROM content_requests WHERE status='approved'
+                   AND request_type='new_content' AND content_type=?
+                   ORDER BY created_at, id""",
+                ("movie" if library == "movies" else "tv",),
+            ).fetchall()
+            seen: set[int] = set()
+            for request in approved:
+                tmdb_id = request["tmdb_id"]
+                if tmdb_id in seen:
+                    continue
+                seen.add(tmdb_id)
+                fixed = connection.execute(
+                    """SELECT 1 FROM catalog_nodes WHERE library=? AND kind=?
+                       AND tmdb_id=? AND available=1 LIMIT 1""",
+                    (library, "movie" if library == "movies" else "series", tmdb_id),
+                ).fetchone()
+                if fixed is None:
+                    result.append(_catalog_request_placeholder(
+                        request, "movie" if library == "movies" else "series",
+                    ))
+        result.sort(key=lambda item: (
+            {"collection": 0, "movie": 1, "series": 2, "season": 3}.get(item.get("kind"), 9),
+            str(item.get("display_title") or item.get("title") or "").casefold(),
+        ))
+        return result
 
 
 @app.get("/api/v1/genres", dependencies=[Depends(require_client)])
