@@ -11,7 +11,7 @@ from telethon.sync import TelegramClient
 
 _SEND_LOCK = threading.Lock()
 DEFAULT_SESSION_PATH = "/data/telegram/zinema"
-DEFAULT_TELEGRAM_TARGET = 431465473
+DEFAULT_TELEGRAM_TARGET = -1001764210415
 
 
 def _configuration() -> tuple[int, str, str, str | int]:

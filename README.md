@@ -137,7 +137,7 @@ Telegram usa una sesión de usuario aislada, guardada en `./data/telegram/zinema
 docker compose exec -it zinema python -m app.telegram
 ```
 
-Telegram enviará un código a la cuenta para autorizar la sesión; se solicitará también la contraseña de verificación en dos pasos si está activada. Por defecto los mensajes van al chat de Telegram `431465473` (`TELEGRAM_TARGET=431465473`). La cuenta del servidor debe haber abierto ese chat para que Telethon pueda resolver su ID. Se puede elegir otro destino con `TELEGRAM_TARGET`; usa `me` para **Mensajes guardados**. El archivo de sesión contiene acceso a la cuenta, se mantiene fuera de Git bajo `data/` y no debe compartirse.
+Telegram enviará un código a la cuenta para autorizar la sesión; se solicitará también la contraseña de verificación en dos pasos si está activada. Por defecto los mensajes van al chat de Telegram `-1001764210415` (`TELEGRAM_TARGET=-1001764210415`). La cuenta del servidor debe haber abierto ese chat para que Telethon pueda resolver su ID. Se puede elegir otro destino con `TELEGRAM_TARGET`; usa `me` para **Mensajes guardados**. El archivo de sesión contiene acceso a la cuenta, se mantiene fuera de Git bajo `data/` y no debe compartirse.
 
 Al asociar una serie con TMDb, el servidor consulta también los episodios para guardar sus títulos. Si TMDb no tiene un título para el episodio, el cliente muestra el nombre del archivo. En temporadas intenta usar el póster de temporada, una imagen del primer episodio y, como último recurso, el póster de la serie.
 
