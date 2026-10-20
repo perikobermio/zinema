@@ -6359,7 +6359,7 @@ public class MainActivity extends Activity {
                 if (!account.optBoolean("is_admin")) return;
                 JSONObject state = null;
                 String loadError = "";
-                try { state = getJson("/api/v1/admin/incoming-download"); }
+                try { state = getJson("/api/v1/admin/incoming-download?refresh=true"); }
                 catch (Exception e) { loadError = e.getMessage() == null ? "" : e.getMessage(); }
                 JSONObject loadedState = state;
                 String error = loadError;

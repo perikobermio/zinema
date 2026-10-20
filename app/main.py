@@ -2902,7 +2902,9 @@ def start_nas_catalog_download() -> dict[str, object]:
 
 
 @app.get("/api/v1/admin/incoming-download", dependencies=[Depends(require_admin)])
-def get_nas_catalog_download() -> dict[str, object]:
+def get_nas_catalog_download(refresh: bool = False) -> dict[str, object]:
+    if refresh:
+        _scan_incoming_download_activity()
     with NAS_DOWNLOAD_LOCK:
         payload = {key: value for key, value in NAS_DOWNLOAD_STATE.items()
                    if not key.startswith("_")}
