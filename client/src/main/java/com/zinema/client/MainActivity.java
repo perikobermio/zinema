@@ -1494,11 +1494,7 @@ public class MainActivity extends Activity {
                 List<String> choices = new ArrayList<>();
                 List<Integer> actions = new ArrayList<>();
                 choices.add(t("Cambiar perfil")); actions.add(1);
-                choices.add(t("Administración")); actions.add(2);
                 choices.add(t("Pedir contenido")); actions.add(6);
-                if (prefs.getBoolean("account_is_admin", false)) {
-                    choices.add(t("Gestión de cuentas")); actions.add(5);
-                }
                 choices.add(t("Cerrar sesión")); actions.add(3);
                 choices.add(t("Salir")); actions.add(4);
                 showStyledActionDialog(t("Menú de perfil"), choices,
@@ -3009,7 +3005,7 @@ public class MainActivity extends Activity {
         if (isCollection) {
             TextView collectionIcon = label("▦", 17, Color.WHITE, true);
             collectionIcon.setGravity(Gravity.CENTER);
-            collectionIcon.setContentDescription("Colección");
+            collectionIcon.setContentDescription(t("Colección"));
             FrameLayout.LayoutParams collectionParams = new FrameLayout.LayoutParams(d(34), d(34), Gravity.TOP | Gravity.LEFT);
             collectionParams.setMargins(d(6), d(6), 0, 0);
             art.addView(collectionIcon, collectionParams);
@@ -3044,7 +3040,7 @@ public class MainActivity extends Activity {
         boolean seenNode = "episode".equals(node.optString("kind"))
                 ? isMediaSeen(node) : isNodeSeen(node);
         if (seenNode) {
-            TextView seen = label("✓ VISTO", 10, Color.WHITE, true);
+            TextView seen = label("✓ " + t("VISTO"), 10, Color.WHITE, true);
             seen.setGravity(Gravity.CENTER);
             seen.setPadding(d(8), d(5), d(8), d(5));
             seen.setBackground(round(0xDD22936F, d(10)));
@@ -3867,7 +3863,7 @@ public class MainActivity extends Activity {
                 actions.add(t("Pedir temporadas restantes"));
                 handlers.add(() -> requestRemainingSeasons(node));
             }
-            if (isAccountAdmin()) {
+            if (canAccessAdminTools()) {
                 actions.add("Reintentar metadata (TMDb)");
                 handlers.add(() -> retryMetadata(node));
             }
@@ -3880,7 +3876,7 @@ public class MainActivity extends Activity {
                 refreshPosterCard(node);
             });
         }
-        if (isAccountAdmin()) {
+        if (canAccessAdminTools()) {
             actions.add("Metadata manual");
             handlers.add(() -> showMetadataEditor(node, new JSONArray()));
         }
@@ -4052,7 +4048,7 @@ public class MainActivity extends Activity {
         List<String> actions = new ArrayList<>();
         List<Runnable> handlers = new ArrayList<>();
         String metadataKind = metadataNode.optString("kind", "");
-        if (isAccountAdmin() && (metadataKind.equals("movie") || metadataKind.equals("series"))) {
+        if (canAccessAdminTools() && (metadataKind.equals("movie") || metadataKind.equals("series"))) {
             actions.add("Reintentar metadata (TMDb)");
             handlers.add(() -> retryMetadata(metadataNode));
             actions.add("Metadata manual");
@@ -4175,7 +4171,7 @@ public class MainActivity extends Activity {
             kind = "series";
         }
         if (nodeId.isEmpty()) {
-            Toast.makeText(this, "No se encontró el detalle de este elemento.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, t("No se encontró el detalle de este elemento."), Toast.LENGTH_SHORT).show();
             return;
         }
         JSONObject node = findCatalogNodeById(nodeId, movies);
@@ -4270,7 +4266,11 @@ public class MainActivity extends Activity {
     }
 
     void retryMetadata(JSONObject node) {
-        if (!isAccountAdmin()) {
+        if (!canAccessAdminTools()) {
+            if (isActiveKidProfile()) {
+                showKidAdminAccessDenied();
+                return;
+            }
             Toast.makeText(this, t("Solo los administradores pueden modificar los metadatos."), Toast.LENGTH_LONG).show();
             return;
         }
@@ -4316,7 +4316,11 @@ public class MainActivity extends Activity {
     }
 
     void showMetadataEditor(JSONObject node, JSONArray candidates) {
-        if (!isAccountAdmin()) {
+        if (!canAccessAdminTools()) {
+            if (isActiveKidProfile()) {
+                showKidAdminAccessDenied();
+                return;
+            }
             Toast.makeText(this, t("Solo los administradores pueden modificar los metadatos."), Toast.LENGTH_LONG).show();
             return;
         }
@@ -4640,7 +4644,11 @@ public class MainActivity extends Activity {
     void saveMetadata(JSONObject node, EditText title, EditText year, List<String> selectedGenres,
                       EditText overview, long tmdbId, String imagePath, String imageType,
                       Button saveButton) {
-        if (!isAccountAdmin()) {
+        if (!canAccessAdminTools()) {
+            if (isActiveKidProfile()) {
+                showKidAdminAccessDenied();
+                return;
+            }
             Toast.makeText(this, t("Solo los administradores pueden modificar los metadatos."), Toast.LENGTH_LONG).show();
             return;
         }
@@ -4949,6 +4957,8 @@ public class MainActivity extends Activity {
                 return "Gerra, krimen, drama, beldurrezko eta western generoak dituzten tituluak ezkutatzen ditu, Familia ere badutenak izan ezik.";
             case "Este contenido no está disponible en un perfil infantil.":
                 return "Eduki hau ez dago eskuragarri haurren profilean.";
+            case "Esta opción no está disponible en un perfil infantil.":
+                return "Aukera hau ez dago eskuragarri haurren profilean.";
             case "Solo los administradores pueden modificar los metadatos.":
                 return "Administratzaileek soilik alda ditzakete metadatuak.";
             case "Menú de perfil": return "Profilaren menua";
@@ -5076,6 +5086,7 @@ public class MainActivity extends Activity {
             case "EMPEZAR SIGUIENTE TEMPORADA": return "HASI HURRENGO DENBORALDIA";
             case "CONTINUAR CAPÍTULO": return "ATALA IKUSTEN JARRAITU";
             case "CONTINUAR PELÍCULA": return "FILMA IKUSTEN JARRAITU";
+            case "EN CURSO": return "ABIAN";
             case "Ir al detalle": return "Joan xehetasunera";
             case "Capítulo": return "Atala";
             case "Tu biblioteca está vacía. Sincroniza el catálogo en el servidor.":
@@ -5119,6 +5130,72 @@ public class MainActivity extends Activity {
             case "Reintentar": return "Berriro saiatu";
             case "Configurar servidor": return "Zerbitzaria konfiguratu";
             case "Administración": return "Administrazioa";
+            case "No se encontraron pósteres.": return "Ez da posterik aurkitu.";
+            case "Reproductor": return "Erreproduzitzailea";
+            case "VLC devuelve posición y duración al terminar. El reproductor de Zinema incluye controles y guarda el progreso mientras ves el vídeo.":
+                return "VLCk posizioa eta iraupena itzultzen ditu amaitzean. Zinemaren erreproduzitzaileak kontrolak ditu eta bideoa ikusten duzun bitartean aurrerapena gordetzen du.";
+            case "Reproductor de Zinema": return "Zinemaren erreproduzitzailea";
+            case "Cuentas pendientes de aprobación": return "Onarpenaren zain dauden kontuak";
+            case "Estas cuentas todavía no pueden acceder a la biblioteca.":
+                return "Kontu hauek oraindik ezin dira liburutegira sartu.";
+            case "Aprobar": return "Onartu";
+            case "Rechazar": return "Baztertu";
+            case "Aprobar cuenta": return "Kontua onartu";
+            case "Rechazar cuenta": return "Kontua baztertu";
+            case "¿Permitir que ": return "Baimendu ";
+            case " acceda a Zinema y cree sus perfiles?": return "Zinemara sartzea eta bere profilak sortzea?";
+            case "¿Rechazar y eliminar la cuenta de ": return "Baztertu eta ezabatu kontu hau: ";
+            case "Cuenta aprobada: ": return "Kontua onartuta: ";
+            case "No se pudo aprobar la cuenta: ": return "Ezin izan da kontua onartu: ";
+            case "Cuenta rechazada y eliminada: ": return "Kontua baztertu eta ezabatu da: ";
+            case "No se pudo rechazar la cuenta: ": return "Ezin izan da kontua baztertu: ";
+            case "Todavía no hay cuentas registradas.": return "Oraindik ez dago erregistratutako konturik.";
+            case "Permite, deniega o elimina el acceso a Zinema.":
+                return "Zinemarako sarbidea baimendu, ukatu edo ezabatzen du.";
+            case "Permitido": return "Baimenduta";
+            case "Denegado": return "Ukatuta";
+            case "Permitir acceso": return "Sarbidea baimendu";
+            case "Denegar acceso": return "Sarbidea ukatu";
+            case " acceda al catálogo?": return " katalogora sartzea?";
+            case "¿Denegar temporalmente a ": return "Aldi baterako sarbidea ukatu ";
+            case "? Podrás permitirlo después.": return "? Gero baimendu ahal izango duzu.";
+            case "Borrar cuenta": return "Kontua ezabatu";
+            case "¿Borrar definitivamente la cuenta ": return "Betiko ezabatu kontu hau: ";
+            case " y sus perfiles?": return " eta haren profilak?";
+            case "Confirmar": return "Berretsi";
+            case "Cuenta actualizada: ": return "Kontua eguneratuta: ";
+            case "Sesión actual": return "Uneko saioa";
+            case "Acceso denegado": return "Sarbidea ukatuta";
+            case "Pendiente de aprobación": return "Onarpenaren zain";
+            case "Admin": return "Administratzailea";
+            case "No se pudieron cargar las cuentas.": return "Ezin izan dira kontuak kargatu.";
+            case "No hay capítulos disponibles.": return "Ez dago atal erabilgarririk.";
+            case "Buscando el siguiente capítulo…": return "Hurrengo atala bilatzen…";
+            case "No hay capítulos pendientes.": return "Ez dago atal gehiagorik.";
+            case "Se usará VLC. Si no está instalado, se abrirá el reproductor de Zinema.":
+                return "VLC erabiliko da. Instalatu gabe badago, Zinemaren erreproduzitzailea irekiko da.";
+            case "Se usará el reproductor de Zinema.": return "Zinemaren erreproduzitzailea erabiliko da.";
+            case "Hay una actualización de Zinema": return "Zinemaren eguneraketa bat dago";
+            case "Nueva versión disponible": return "Bertsio berria eskuragarri";
+            case "Descarga la nueva versión para seguir usando el cliente actualizado.":
+                return "Deskargatu bertsio berria bezero eguneratua erabiltzen jarraitzeko.";
+            case "Actualizar": return "Eguneratu";
+            case "Más tarde": return "Geroago";
+            case "Descargando actualización…": return "Eguneraketa deskargatzen…";
+            case "Permitir actualizaciones": return "Eguneraketak baimendu";
+            case "Android necesita permiso para instalar actualizaciones descargadas desde Zinema.":
+                return "Androiden baimena behar da Zinematik deskargatutako eguneraketak instalatzeko.";
+            case "Abrir ajustes": return "Ezarpenak ireki";
+            case "No se pudo abrir el instalador de Android: ": return "Ezin izan da Androiden instalatzailea ireki: ";
+            case "No se encontró el detalle de este elemento.": return "Ez da elementu honen xehetasunik aurkitu.";
+            case "No se pudo identificar el vídeo para reproducirlo.": return "Ezin izan da erreproduzitzeko bideoa identifikatu.";
+            case "Preparando reproducción…": return "Erreprodukzioa prestatzen…";
+            case "No se pudo buscar el siguiente capítulo: ": return "Ezin izan da hurrengo atala bilatu: ";
+            case "No se pudo actualizar la cuenta.": return "Ezin izan da kontua eguneratu.";
+            case "La descarga no coincide con la versión publicada.":
+                return "Deskarga ez dator bat argitaratutako bertsioarekin.";
+            case "No se pudo descargar la actualización: ": return "Ezin izan da eguneraketa deskargatu: ";
+            case "No se pudo preparar el vídeo: ": return "Ezin izan da bideoa prestatu: ";
             case "Iniciar sesión o crear cuenta": return "Hasi saioa edo sortu kontua";
             case "Iniciar sesión": return "Hasi saioa";
             case "Películas y series, para toda la familia": return "Filmak eta telesailak, familia osoarentzat";
@@ -5171,7 +5248,7 @@ public class MainActivity extends Activity {
             case "Probar conexión": return "Konexioa probatu";
             case "Guardar y conectar": return "Gorde eta konektatu";
             case "Dirección pública o local de tu servidor Zinema.": return "Zure Zinema zerbitzariaren helbide publikoa edo lokala.";
-            case "Español": return "Español";
+            case "Español": return "Gaztelania";
             case "Euskara": return "Euskara";
             case "Conectando…": return "Konektatzen…";
             case "Conexión correcta": return "Konexioa ondo dago";
@@ -5356,8 +5433,8 @@ public class MainActivity extends Activity {
             boolean watchedEpisode = isMediaSeen(file);
             long position = mediaProgressPosition(file);
             boolean inProgress = !watchedEpisode && position > 10000L;
-            String watched = watchedEpisode ? "   ·   ✓ VISTO"
-                    : inProgress ? "   ·   EN CURSO ·   "
+            String watched = watchedEpisode ? "   ·   ✓ " + t("VISTO")
+                    : inProgress ? "   ·   " + t("EN CURSO") + " ·   "
                     + formatTime((int) Math.min(Integer.MAX_VALUE, position)) : "";
             String extension = file.optString("extension", "").replace(".", "").toUpperCase();
             String subText = extension.isEmpty() ? formatSize(file.optLong("size_bytes"))
@@ -5426,7 +5503,7 @@ public class MainActivity extends Activity {
         }
         JSONArray children = node.optJSONArray("children");
         if (children != null && children.length() > 0) openNode(children.optJSONObject(0));
-        else Toast.makeText(this, "No hay un vídeo disponible.", Toast.LENGTH_SHORT).show();
+        else Toast.makeText(this, t("No hay un vídeo disponible."), Toast.LENGTH_SHORT).show();
     }
 
     void playNextSeriesEpisode(JSONObject seriesNode) {
@@ -5436,10 +5513,10 @@ public class MainActivity extends Activity {
         }
         JSONArray seasonNodes = seriesNode.optJSONArray("children");
         if (seasonNodes == null || seasonNodes.length() == 0) {
-            Toast.makeText(this, "No hay capítulos disponibles.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, t("No hay capítulos disponibles."), Toast.LENGTH_SHORT).show();
             return;
         }
-        Toast.makeText(this, "Buscando el siguiente capítulo…", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, t("Buscando el siguiente capítulo…"), Toast.LENGTH_SHORT).show();
         io.execute(() -> {
             try {
                 List<JSONObject> seasons = toList(seasonNodes);
@@ -5494,7 +5571,7 @@ public class MainActivity extends Activity {
                 JSONObject nextEpisode = selected;
                 runOnUiThread(() -> {
                     if (nextEpisode == null) {
-                        Toast.makeText(this, "No hay capítulos pendientes.", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, t("No hay capítulos pendientes."), Toast.LENGTH_SHORT).show();
                         return;
                     }
                     launchPlayer(nextEpisode.optString("stream_url"),
@@ -5505,7 +5582,7 @@ public class MainActivity extends Activity {
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> Toast.makeText(this,
-                        "No se pudo buscar el siguiente capítulo: " + e.getMessage(),
+                        t("No se pudo buscar el siguiente capítulo: ") + e.getMessage(),
                         Toast.LENGTH_LONG).show());
             }
         });
@@ -5620,7 +5697,7 @@ public class MainActivity extends Activity {
         detailP.topMargin = d(4);
         textBox.addView(detail, detailP);
         if ("episode".equals(result.optString("kind")) && isMediaSeen(result)) {
-            TextView watched = label("✓ VISTO", 10, 0xFF79E3B7, true);
+            TextView watched = label("✓ " + t("VISTO"), 10, 0xFF79E3B7, true);
             LinearLayout.LayoutParams watchedP = new LinearLayout.LayoutParams(-1, -2);
             watchedP.topMargin = d(3);
             textBox.addView(watched, watchedP);
@@ -5746,7 +5823,7 @@ public class MainActivity extends Activity {
                     slot.setVisibility(View.VISIBLE);
                     LinearLayout card = settingsCard();
                     slot.addView(card);
-                    card.addView(label("Cuentas pendientes de aprobación (" + pending.length() + ")",
+                    card.addView(label(t("Cuentas pendientes de aprobación") + " (" + pending.length() + ")",
                             16, Color.WHITE, true));
                     TextView hint = label("Estas cuentas todavía no pueden acceder a la biblioteca.",
                             12, MUTED, false);
@@ -5773,23 +5850,23 @@ public class MainActivity extends Activity {
                         Button approve = actionButton("Aprobar", true);
                         actions.addView(approve, new LinearLayout.LayoutParams(-2, d(44)));
                         approve.setOnClickListener(v -> new AlertDialog.Builder(this)
-                                .setTitle("Aprobar cuenta")
-                                .setMessage("¿Permitir que " + username + " acceda a Zinema y cree sus perfiles?")
-                                .setNegativeButton("Cancelar", null)
-                                .setPositiveButton("Aprobar", (dialog, which) -> {
+                                .setTitle(t("Aprobar cuenta"))
+                                .setMessage(t("¿Permitir que ") + username + t(" acceda a Zinema y cree sus perfiles?"))
+                                .setNegativeButton(t("Cancelar"), null)
+                                .setPositiveButton(t("Aprobar"), (dialog, which) -> {
                                     approve.setEnabled(false);
                                     io.execute(() -> {
                                         try {
                                             postJson("/api/v1/admin/accounts/" + enc(accountId) + "/approve");
                                             runOnUiThread(() -> {
-                                                Toast.makeText(this, "Cuenta aprobada: " + username,
+                                                Toast.makeText(this, t("Cuenta aprobada: ") + username,
                                                         Toast.LENGTH_LONG).show();
                                                 loadPendingAccountControls(slot);
                                             });
                                         } catch (Exception e) {
                                             runOnUiThread(() -> {
                                                 approve.setEnabled(true);
-                                                Toast.makeText(this, "No se pudo aprobar la cuenta: " + e.getMessage(),
+                                                Toast.makeText(this, t("No se pudo aprobar la cuenta: ") + e.getMessage(),
                                                         Toast.LENGTH_LONG).show();
                                             });
                                         }
@@ -5800,17 +5877,17 @@ public class MainActivity extends Activity {
                         rejectParams.leftMargin = d(7);
                         actions.addView(reject, rejectParams);
                         reject.setOnClickListener(v -> new AlertDialog.Builder(this)
-                                .setTitle("Rechazar cuenta")
-                                .setMessage("¿Rechazar y eliminar la cuenta de " + username + "?")
-                                .setNegativeButton("Cancelar", null)
-                                .setPositiveButton("Rechazar", (dialog, which) -> {
+                                .setTitle(t("Rechazar cuenta"))
+                                .setMessage(t("¿Rechazar y eliminar la cuenta de ") + username + "?")
+                                .setNegativeButton(t("Cancelar"), null)
+                                .setPositiveButton(t("Rechazar"), (dialog, which) -> {
                                     reject.setEnabled(false);
                                     approve.setEnabled(false);
                                     io.execute(() -> {
                                         try {
                                             postJson("/api/v1/admin/accounts/" + enc(accountId) + "/reject");
                                             runOnUiThread(() -> {
-                                                Toast.makeText(this, "Cuenta rechazada y eliminada: " + username,
+                                                Toast.makeText(this, t("Cuenta rechazada y eliminada: ") + username,
                                                         Toast.LENGTH_LONG).show();
                                                 loadPendingAccountControls(slot);
                                             });
@@ -5818,7 +5895,7 @@ public class MainActivity extends Activity {
                                             runOnUiThread(() -> {
                                                 reject.setEnabled(true);
                                                 approve.setEnabled(true);
-                                                Toast.makeText(this, "No se pudo rechazar la cuenta: " + e.getMessage(),
+                                                Toast.makeText(this, t("No se pudo rechazar la cuenta: ") + e.getMessage(),
                                                         Toast.LENGTH_LONG).show();
                                             });
                                         }
@@ -5979,6 +6056,10 @@ public class MainActivity extends Activity {
     }
 
     void showSettings() {
+        if (isActiveKidProfile()) {
+            showKidAdminAccessDenied();
+            return;
+        }
         if (clientApiToken().isEmpty()) {
             showLoginScreen();
             return;
@@ -6168,8 +6249,8 @@ public class MainActivity extends Activity {
             String choice = checkedId == vlcPlayer.getId() ? "vlc" : "builtin";
             prefs.edit().putString("player", choice).apply();
             Toast.makeText(this, choice.equals("vlc")
-                    ? "Se usará VLC. Si no está instalado, se abrirá el reproductor de Zinema."
-                    : "Se usará el reproductor de Zinema.", Toast.LENGTH_SHORT).show();
+                    ? t("Se usará VLC. Si no está instalado, se abrirá el reproductor de Zinema.")
+                    : t("Se usará el reproductor de Zinema."), Toast.LENGTH_SHORT).show();
         });
 
         LinearLayout syncSlot = new LinearLayout(this);
@@ -6380,6 +6461,10 @@ public class MainActivity extends Activity {
     }
 
     void showAccountManagement() {
+        if (isActiveKidProfile()) {
+            showKidAdminAccessDenied();
+            return;
+        }
         if (clientApiToken().isEmpty()) {
             showLoginScreen();
             return;
@@ -6389,6 +6474,17 @@ public class MainActivity extends Activity {
         showingDetail = false;
         buildShell("Gestión de cuentas");
         renderAccountManagement();
+    }
+
+    boolean canAccessAdminTools() {
+        return isAccountAdmin() && !isActiveKidProfile();
+    }
+
+    void showKidAdminAccessDenied() {
+        Toast.makeText(this, t("Esta opción no está disponible en un perfil infantil."), Toast.LENGTH_LONG).show();
+        showingAdmin = false;
+        showingDetail = false;
+        loadHome();
     }
 
     void renderAccountManagement() {
@@ -6449,7 +6545,7 @@ public class MainActivity extends Activity {
                         identityDetails.setOrientation(LinearLayout.VERTICAL);
                         identityDetails.setGravity(Gravity.CENTER_VERTICAL);
                         identity.addView(identityDetails, new LinearLayout.LayoutParams(0, -2, 1));
-                        TextView userLabel = label(username + (isAdmin ? "  ·  Admin" : ""), 16, Color.WHITE, true);
+                        TextView userLabel = label(username + (isAdmin ? "  ·  " + t("Admin") : ""), 16, Color.WHITE, true);
                         identityDetails.addView(userLabel);
                         if (!state.isEmpty()) {
                             TextView stateLabel = label(state, 12,
@@ -6470,7 +6566,7 @@ public class MainActivity extends Activity {
                         allow.setOnClickListener(v -> {
                             if (canAccess) return;
                             confirmAccountChange(username, "Permitir acceso",
-                                    "¿Permitir que " + username + " acceda al catálogo?", () -> {
+                                    t("¿Permitir que ") + username + t(" acceda al catálogo?"), () -> {
                                         try { postJson("/api/v1/admin/accounts/" + enc(accountId) + "/approve"); }
                                         catch (Exception e) { throw new RuntimeException(e); }
                                     });
@@ -6482,7 +6578,7 @@ public class MainActivity extends Activity {
                         deny.setOnClickListener(v -> {
                             if (!canAccess) return;
                             confirmAccountChange(username, "Denegar acceso",
-                                    "¿Denegar temporalmente a " + username + "? Podrás permitirlo después.", () -> {
+                                    t("¿Denegar temporalmente a ") + username + t("? Podrás permitirlo después."), () -> {
                                         try { adminAccountRequest("POST", "/api/v1/admin/accounts/" + enc(accountId) + "/disable"); }
                                         catch (Exception e) { throw new RuntimeException(e); }
                                     });
@@ -6492,14 +6588,14 @@ public class MainActivity extends Activity {
                         deleteParams.leftMargin = d(6);
                         actions.addView(delete, deleteParams);
                         delete.setOnClickListener(v -> confirmAccountChange(username, "Borrar cuenta",
-                                "¿Borrar definitivamente la cuenta " + username + " y sus perfiles?", () -> {
+                                t("¿Borrar definitivamente la cuenta ") + username + t(" y sus perfiles?"), () -> {
                                     try { adminAccountRequest("DELETE", "/api/v1/admin/accounts/" + enc(accountId)); }
                                     catch (Exception e) { throw new RuntimeException(e); }
                                 }));
                     }
                 });
             } catch (Exception e) {
-                String message = e.getMessage() == null ? "No se pudieron cargar las cuentas." : e.getMessage();
+                String message = e.getMessage() == null ? t("No se pudieron cargar las cuentas.") : e.getMessage();
                 runOnUiThread(() -> {
                     if (!showingAdmin || screen.getParent() == null) return;
                     screen.removeView(progress);
@@ -6517,13 +6613,13 @@ public class MainActivity extends Activity {
     interface AccountChange { void run() throws Exception; }
 
     void confirmAccountChange(String username, String title, String message, AccountChange change) {
-        new AlertDialog.Builder(this).setTitle(title).setMessage(message)
-                .setNegativeButton("Cancelar", null)
-                .setPositiveButton("Confirmar", (dialog, which) -> io.execute(() -> {
+        new AlertDialog.Builder(this).setTitle(t(title)).setMessage(t(message))
+                .setNegativeButton(t("Cancelar"), null)
+                .setPositiveButton(t("Confirmar"), (dialog, which) -> io.execute(() -> {
                     try {
                         change.run();
                         runOnUiThread(() -> {
-                            Toast.makeText(this, "Cuenta actualizada: " + username, Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, t("Cuenta actualizada: ") + username, Toast.LENGTH_SHORT).show();
                             renderAccountManagement();
                         });
                     } catch (Exception e) {
@@ -6777,11 +6873,12 @@ public class MainActivity extends Activity {
         if (version <= installedClientVersionCode() || isFinishing()) return;
         lastPromptedUpdateCode = version;
         String versionName = update.optString("version_name", "");
-        String title = versionName.isEmpty() ? "Hay una actualización de Zinema" : "Zinema " + versionName + " está disponible";
+        String title = versionName.isEmpty() ? t("Hay una actualización de Zinema")
+                : t("Nueva versión disponible") + " " + versionName;
         new AlertDialog.Builder(this).setTitle(title)
-                .setMessage("Descarga la nueva versión para seguir usando el cliente actualizado.")
-                .setPositiveButton("Actualizar", (dialog, which) -> downloadAndInstallUpdate(update))
-                .setNegativeButton("Más tarde", null).show();
+                .setMessage(t("Descarga la nueva versión para seguir usando el cliente actualizado."))
+                .setPositiveButton(t("Actualizar"), (dialog, which) -> downloadAndInstallUpdate(update))
+                .setNegativeButton(t("Más tarde"), null).show();
     }
 
     int installedClientVersionCode() {
@@ -6790,7 +6887,7 @@ public class MainActivity extends Activity {
     }
 
     void downloadAndInstallUpdate(JSONObject update) {
-        Toast.makeText(this, "Descargando actualización…", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, t("Descargando actualización…"), Toast.LENGTH_SHORT).show();
         io.execute(() -> {
             File apk = new File(getCacheDir(), "zinema-prod.apk");
             HttpURLConnection connection = null;
@@ -6814,12 +6911,12 @@ public class MainActivity extends Activity {
                 String actualHash = hex(digest.digest());
                 if (expectedHash.isEmpty() || !expectedHash.equalsIgnoreCase(actualHash)) {
                     apk.delete();
-                    throw new Exception("La descarga no coincide con la versión publicada.");
+                        throw new Exception(t("La descarga no coincide con la versión publicada."));
                 }
                 runOnUiThread(() -> startApkInstall(apk));
             } catch (Exception e) {
                 runOnUiThread(() -> Toast.makeText(this,
-                        "No se pudo descargar la actualización: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                        t("No se pudo descargar la actualización: ") + e.getMessage(), Toast.LENGTH_LONG).show());
             } finally {
                 if (connection != null) connection.disconnect();
             }
@@ -6835,13 +6932,13 @@ public class MainActivity extends Activity {
     void startApkInstall(File apk) {
         if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
             installAfterPermission = true;
-            new AlertDialog.Builder(this).setTitle("Permitir actualizaciones")
-                    .setMessage("Android necesita permiso para instalar actualizaciones descargadas desde Zinema.")
-                    .setPositiveButton("Abrir ajustes", (dialog, which) -> {
+            new AlertDialog.Builder(this).setTitle(t("Permitir actualizaciones"))
+                    .setMessage(t("Android necesita permiso para instalar actualizaciones descargadas desde Zinema."))
+                    .setPositiveButton(t("Abrir ajustes"), (dialog, which) -> {
                         Intent settings = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                                 Uri.parse("package:" + getPackageName()));
                         startActivity(settings);
-                    }).setNegativeButton("Cancelar", null).show();
+                    }).setNegativeButton(t("Cancelar"), null).show();
             return;
         }
         try {
@@ -6851,7 +6948,7 @@ public class MainActivity extends Activity {
             install.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             startActivity(install);
         } catch (Exception e) {
-            Toast.makeText(this, "No se pudo abrir el instalador de Android: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            Toast.makeText(this, t("No se pudo abrir el instalador de Android: ") + e.getMessage(), Toast.LENGTH_LONG).show();
         }
     }
 
@@ -6864,7 +6961,7 @@ public class MainActivity extends Activity {
         if (prefs.contains(key)) prefs.edit().remove(key).apply();
         else prefs.edit().putString(key, node.toString()).apply();
         scheduleProfileStateSync();
-        Toast.makeText(this, prefs.contains(key) ? "Añadido a Mi lista" : "Eliminado de Mi lista", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, prefs.contains(key) ? t("Añadido a Mi lista") : t("Eliminado de Mi lista"), Toast.LENGTH_SHORT).show();
     }
 
     List<JSONObject> readFavorites() {
@@ -7061,7 +7158,7 @@ public class MainActivity extends Activity {
             }
         }
         if (itemId.isEmpty()) {
-            Toast.makeText(this, "No se pudo identificar el vídeo para reproducirlo.", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, t("No se pudo identificar el vídeo para reproducirlo."), Toast.LENGTH_LONG).show();
             return;
         }
         final String resolvedItemId = itemId;
@@ -7070,7 +7167,7 @@ public class MainActivity extends Activity {
         try { position = new JSONObject(prefs.getString(key, "{}")).optLong("position"); }
         catch (JSONException ignored) { }
         final long resumePosition = position;
-        Toast.makeText(this, "Preparando reproducción…", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, t("Preparando reproducción…"), Toast.LENGTH_SHORT).show();
         io.execute(() -> {
             try {
                 JSONObject ticket = postJson("/api/v1/items/" + enc(resolvedItemId) + "/playback-ticket");
@@ -7103,7 +7200,7 @@ public class MainActivity extends Activity {
                         playingSeriesId, playingSeasonNumber));
             } catch (Exception e) {
                 runOnUiThread(() -> Toast.makeText(this,
-                        "No se pudo preparar el vídeo: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                        t("No se pudo preparar el vídeo: ") + e.getMessage(), Toast.LENGTH_LONG).show());
             }
         });
     }
