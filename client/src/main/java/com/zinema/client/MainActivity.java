@@ -5000,6 +5000,24 @@ public class MainActivity extends Activity {
             case "Pedir contenido": return "Edukia eskatu";
             case "Pedir temporadas restantes": return "Gainerako denboraldiak eskatu";
             case "Gestión de cuentas": return "Kontuen kudeaketa";
+            case "Gestión de Incoming": return "Incoming karpetaren kudeaketa";
+            case "Detecta los vídeos de Incoming y edita su ruta de destino antes de moverlos.":
+                return "Bilatu Incoming karpetako bideoak eta editatu helmugako bidea mugitu aurretik.";
+            case "Detectar vídeos": return "Bideoak bilatu";
+            case "Detectando vídeos…": return "Bideoak bilatzen…";
+            case "No hay vídeos en Incoming.": return "Ez dago bideorik Incoming karpetan.";
+            case "No se pudieron detectar los vídeos: ": return "Ezin izan dira bideoak aurkitu: ";
+            case "Petición previa asociada": return "Aurreko eskaera lotuta";
+            case "Ruta definitiva": return "Behin betiko bidea";
+            case "Generar": return "Sortu";
+            case "Fichero movido; sincronización del catálogo en cola.":
+                return "Fitxategia mugituta; katalogoaren sinkronizazioa ilaran dago.";
+            case "Fichero movido; sincronización del catálogo iniciada.":
+                return "Fitxategia mugituta; katalogoaren sinkronizazioa hasi da.";
+            case "Fichero movido; sincronización no disponible (configura TMDb).":
+                return "Fitxategia mugituta; sinkronizazioa ez dago erabilgarri (konfiguratu TMDb).";
+            case "Fichero movido a su destino.": return "Fitxategia helmugara mugitu da.";
+            case "No se pudo mover el fichero: ": return "Ezin izan da fitxategia mugitu: ";
             case "Toca un resultado para añadirlo a la petición. Puedes elegir la temporada de cada serie y enviar varios títulos juntos.":
                 return "Ukitu emaitza bat eskaerara gehitzeko. Telesail bakoitzaren denboraldia aukeratu eta hainbat titulu batera bidal ditzakezu.";
             case "Título de película o serie": return "Filmaren edo telesailaren izenburua";
@@ -6267,6 +6285,12 @@ public class MainActivity extends Activity {
         requestsSlotParams.topMargin = d(14);
         screen.addView(requestsSlot, requestsSlotParams);
 
+        LinearLayout incomingSlot = new LinearLayout(this);
+        incomingSlot.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams incomingSlotParams = new LinearLayout.LayoutParams(-1, -2);
+        incomingSlotParams.topMargin = d(14);
+        screen.addView(incomingSlot, incomingSlotParams);
+
         LinearLayout languageCard = settingsCard();
         LinearLayout.LayoutParams languageP = new LinearLayout.LayoutParams(-1, -2);
         languageP.topMargin = d(14);
@@ -6293,6 +6317,144 @@ public class MainActivity extends Activity {
         content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
         loadAdminSyncControls(syncSlot);
         loadContentRequestControls(requestsSlot);
+        loadIncomingControls(incomingSlot);
+    }
+
+    void loadIncomingControls(LinearLayout slot) {
+        if (slot == null || !showingAdmin) return;
+        io.execute(() -> {
+            try {
+                JSONObject account = getJson("/api/v1/auth/me");
+                if (!account.optBoolean("is_admin")) return;
+                runOnUiThread(() -> buildIncomingControls(slot));
+            } catch (Exception ignored) { }
+        });
+    }
+
+    void buildIncomingControls(LinearLayout slot) {
+        if (slot == null || !showingAdmin || slot.getParent() == null) return;
+        slot.removeAllViews();
+        slot.setVisibility(View.VISIBLE);
+        LinearLayout card = settingsCard();
+        slot.addView(card);
+        card.addView(label(t("Gestión de Incoming"), 16, Color.WHITE, true));
+        TextView hint = label(t("Detecta los vídeos de Incoming y edita su ruta de destino antes de moverlos."),
+                12, MUTED, false);
+        LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(-1, -2);
+        hintParams.topMargin = d(5);
+        card.addView(hint, hintParams);
+        LinearLayout rows = new LinearLayout(this);
+        rows.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams rowsParams = new LinearLayout.LayoutParams(-1, -2);
+        rowsParams.topMargin = d(10);
+        card.addView(rows, rowsParams);
+        Button detect = actionButton(t("Detectar vídeos"), true);
+        detect.setTag("incoming-detect");
+        LinearLayout.LayoutParams detectParams = new LinearLayout.LayoutParams(-1, d(46));
+        detectParams.topMargin = d(10);
+        card.addView(detect, detectParams);
+        detect.setOnClickListener(v -> detectIncomingVideos(rows, detect));
+    }
+
+    void detectIncomingVideos(LinearLayout rows, Button detect) {
+        detect.setEnabled(false);
+        detect.setText(t("Detectando vídeos…"));
+        io.execute(() -> {
+            try {
+                JSONArray files = getArray("/api/v1/admin/incoming");
+                runOnUiThread(() -> {
+                    if (!showingAdmin || rows.getParent() == null) return;
+                    rows.removeAllViews();
+                    if (files.length() == 0) {
+                        rows.addView(label(t("No hay vídeos en Incoming."), 13, MUTED, false));
+                    } else {
+                        for (int i = 0; i < files.length(); i++) {
+                            JSONObject file = files.optJSONObject(i);
+                            if (file != null) addIncomingVideoRow(rows, file);
+                        }
+                    }
+                    detect.setText(t("Detectar vídeos"));
+                    detect.setEnabled(true);
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    detect.setText(t("Detectar vídeos"));
+                    detect.setEnabled(true);
+                    Toast.makeText(this, t("No se pudieron detectar los vídeos: ") + e.getMessage(),
+                            Toast.LENGTH_LONG).show();
+                });
+            }
+        });
+    }
+
+    void addIncomingVideoRow(LinearLayout rows, JSONObject file) {
+        LinearLayout entry = settingsCard();
+        LinearLayout.LayoutParams entryParams = new LinearLayout.LayoutParams(-1, -2);
+        entryParams.bottomMargin = d(10);
+        rows.addView(entry, entryParams);
+        TextView filename = labelRaw(file.optString("filename", ""), 15, Color.WHITE, true);
+        filename.setMaxLines(2);
+        entry.addView(filename);
+        String kind = "series".equals(file.optString("library"))
+                ? t("Serie") + " · " + t("Temporada") + " " + file.optInt("season_number")
+                    + " · " + t("Capítulo") + " " + file.optInt("episode_number")
+                : t("Película") + (file.isNull("year") ? "" : " · " + file.optString("year"));
+        TextView info = label(kind + " · " + formatSize(file.optLong("size_bytes")), 12, MUTED, false);
+        LinearLayout.LayoutParams infoParams = new LinearLayout.LayoutParams(-1, -2);
+        infoParams.topMargin = d(4);
+        entry.addView(info, infoParams);
+        if (file.optBoolean("request_matched")) {
+            TextView request = label(t("Petición previa asociada") + ": " + file.optString("title", ""),
+                    12, 0xFF79E3B7, true);
+            LinearLayout.LayoutParams requestParams = new LinearLayout.LayoutParams(-1, -2);
+            requestParams.topMargin = d(4);
+            entry.addView(request, requestParams);
+        }
+        EditText destination = settingsField(file.optString("destination_path", ""),
+                t("Ruta definitiva"), true);
+        LinearLayout.LayoutParams destinationParams = new LinearLayout.LayoutParams(-1, d(48));
+        destinationParams.topMargin = d(8);
+        entry.addView(destination, destinationParams);
+        Button generate = actionButton(t("Generar"), true);
+        LinearLayout.LayoutParams generateParams = new LinearLayout.LayoutParams(-1, d(44));
+        generateParams.topMargin = d(8);
+        entry.addView(generate, generateParams);
+        generate.setOnClickListener(v -> moveIncomingVideo(file, destination, generate, rows));
+    }
+
+    void moveIncomingVideo(JSONObject file, EditText destination, Button generate, LinearLayout rows) {
+        String fileId = file.optString("file_id", "");
+        if (fileId.isEmpty()) return;
+        JSONObject payload = new JSONObject();
+        try { payload.put("destination_path", destination.getText().toString().trim()); }
+        catch (JSONException ignored) { return; }
+        generate.setEnabled(false);
+        io.execute(() -> {
+            try {
+                JSONObject result = postJson("/api/v1/admin/incoming/" + enc(fileId) + "/generate", payload);
+                runOnUiThread(() -> {
+                    if (!showingAdmin) return;
+                    if (result.optBoolean("request_matched")) {
+                        String syncJobId = result.optString("catalog_sync_job_id", "");
+                        String message = !syncJobId.isEmpty()
+                                ? t("Fichero movido; sincronización del catálogo iniciada.")
+                                : result.optBoolean("catalog_sync_queued")
+                                    ? t("Fichero movido; sincronización del catálogo en cola.")
+                                    : t("Fichero movido; sincronización no disponible (configura TMDb).");
+                        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+                    } else Toast.makeText(this, t("Fichero movido a su destino."), Toast.LENGTH_SHORT).show();
+                    Button detect = (Button) ((ViewGroup) rows.getParent()).findViewWithTag("incoming-detect");
+                    if (detect != null) detectIncomingVideos(rows, detect);
+                    else rows.removeView((View) generate.getParent());
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    generate.setEnabled(true);
+                    Toast.makeText(this, t("No se pudo mover el fichero: ") + e.getMessage(),
+                            Toast.LENGTH_LONG).show();
+                });
+            }
+        });
     }
 
     void loadContentRequestControls(LinearLayout slot) {

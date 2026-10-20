@@ -22,7 +22,7 @@ Los directorios anteriores a la carpeta de película o serie aparecen como colec
 
 ## Configurar y arrancar
 
-Requisitos: Docker Engine con Docker Compose v2, `curl` y acceso de lectura del host a las dos rutas del NAS.
+Requisitos: Docker Engine con Docker Compose v2, `curl` y acceso de lectura y escritura del host a las bibliotecas y a Incoming.
 
 1. En el NAS, clona el proyecto y crea su configuración:
 
@@ -33,7 +33,7 @@ Requisitos: Docker Engine con Docker Compose v2, `curl` y acceso de lectura del 
    nano .env
    ```
 
-2. Configura `MOVIES_PATH` y `SERIES_PATH`. Para TMDb puedes guardar la **API Key v3** en `TMDB_KEY` o el **API Read Access Token** en `TMDB_ACCESS_TOKEN`; basta con configurar uno. No subas estas credenciales a Git. `TMDB_LANGUAGE` controla el idioma preferido de los resultados; por defecto es `es-ES`.
+2. Configura `MOVIES_PATH`, `SERIES_PATH` e `INCOMING_PATH` (por defecto `/d/NAS/Incoming`). Incoming es la carpeta donde llegan las descargas. Para TMDb puedes guardar la **API Key v3** en `TMDB_KEY` o el **API Read Access Token** en `TMDB_ACCESS_TOKEN`; basta con configurar uno. No subas estas credenciales a Git. `TMDB_LANGUAGE` controla el idioma preferido de los resultados; por defecto es `es-ES`.
 
 3. Valida las rutas y arranca el servidor:
 
@@ -44,7 +44,7 @@ Requisitos: Docker Engine con Docker Compose v2, `curl` y acceso de lectura del 
    docker compose logs -f zinema
    ```
 
-El NAS y SQLite se montan de forma persistente en `./data`; las carpetas de medios se montan en solo lectura. La API está en el puerto `8180` del host.
+El NAS y SQLite se montan de forma persistente en `./data`. Las bibliotecas y Incoming necesitan permisos de escritura para que la administración pueda mover los vídeos. En Administración, «Gestión de Incoming» detecta archivos de vídeo, propone una ruta para películas o episodios y permite editarla antes de moverlos. La API está en el puerto `8180` del host.
 
 ### Crear la cuenta administradora inicial
 

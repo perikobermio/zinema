@@ -6,9 +6,11 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
+import unicodedata
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,7 +23,7 @@ from pydantic import BaseModel, Field
 from pwdlib import PasswordHash
 from starlette.responses import FileResponse, Response, StreamingResponse
 
-from app.catalog import scan_catalog
+from app.catalog import EPISODE_RE, VIDEO_EXTENSIONS, scan_catalog
 from app.telegram import send_telegram_message
 from app.tmdb import (apply_tmdb_id, enrich_pending, get_candidate_details,
                       search_content_requests, search_image_options, search_metadata_candidates,
@@ -32,6 +34,12 @@ MEDIA_ROOTS = {
     "movies": Path(os.getenv("MOVIES_ROOT", "/library/movies")).resolve(),
     "series": Path(os.getenv("SERIES_ROOT", "/library/series")).resolve(),
 }
+INCOMING_ROOT = Path(os.getenv("INCOMING_ROOT", "/incoming")).resolve()
+MEDIA_DISPLAY_ROOTS = {
+    "movies": Path(os.getenv("MOVIES_DISPLAY_ROOT", "/d/NAS/Pelikulek")).resolve(),
+    "series": Path(os.getenv("SERIES_DISPLAY_ROOT", "/d/NAS/Serijek")).resolve(),
+}
+INCOMING_DISPLAY_ROOT = Path(os.getenv("INCOMING_DISPLAY_ROOT", "/d/NAS/Incoming")).resolve()
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/zinema.sqlite3"))
 TMDB_ACCESS_TOKEN = os.getenv("TMDB_ACCESS_TOKEN", "")
 TMDB_KEY = os.getenv("TMDB_KEY", "") if not TMDB_ACCESS_TOKEN else ""
@@ -44,6 +52,9 @@ ARTWORK_DIR = DATABASE_PATH.parent / "artwork"
 CLIENT_UPDATE_DIR = DATABASE_PATH.parent / "client-update"
 CHUNK_SIZE = 1024 * 1024
 SYNC_LOCK = threading.Lock()
+SYNC_RETRY_LOCK = threading.Lock()
+SYNC_RETRY_SCHEDULED = False
+INCOMING_MOVE_LOCK = threading.Lock()
 METADATA_RETRY_LOCK = threading.Lock()
 METADATA_RETRY_LAST_REQUEST: dict[str, float] = {}
 METADATA_RETRY_COOLDOWN_SECONDS = 60
@@ -123,6 +134,10 @@ class ContentRequestCreate(BaseModel):
     season_number: int | None = Field(default=None, ge=1)
     catalog_node_id: str | None = Field(default=None, max_length=100)
     items: list[ContentRequestItem] = Field(default_factory=list, max_length=20)
+
+
+class IncomingGenerateRequest(BaseModel):
+    destination_path: str = Field(min_length=1, max_length=2000)
 
 
 class UserProfileRequest(BaseModel):
@@ -883,6 +898,147 @@ def _start_episode_thumbnail_job() -> None:
     threading.Thread(target=run, name="episode-thumbnails", daemon=True).start()
 
 
+def _clean_media_title(value: str) -> str:
+    value = re.sub(r"[._]+", " ", value.replace("/", " ").replace("\\", " "))
+    value = re.sub(r"[\x00-\x1f\x7f]", "", value)
+    value = re.sub(r"\s+", " ", value).strip(" -_.")
+    noise = re.search(
+        r"(?i)(?:\b(?:480|576|720|1080|2160)p\b|\b4k\b|\bweb[ ._-]?(?:dl|rip)\b|"
+        r"\bblu[ ._-]?ray\b|\b(?:x264|x265|h264|h265|hevc|avc|hdr10?)\b|\bproper\b|\brepack\b)",
+        value,
+    )
+    if noise:
+        value = value[:noise.start()].strip(" -_.")
+    return value.strip(" -_.")
+
+
+def _safe_path_component(value: str) -> str:
+    value = re.sub(r"[\\/\x00-\x1f\x7f]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    return value or "Unknown title"
+
+
+def _normalize_media_title(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    return re.sub(r"[^a-z0-9]", "", normalized.casefold())
+
+
+def _incoming_guess(path: Path) -> dict[str, object]:
+    stem = path.stem
+    episode = EPISODE_RE.search(stem)
+    if episode:
+        series_title = _clean_media_title(stem[:episode.start()]) or _clean_media_title(stem)
+        series_title = re.sub(r"\s*\(?\b(?:19|20)\d{2}\)?$", "", series_title).strip(" -_.")
+        if episode.group(1) is not None:
+            season_number, episode_number = int(episode.group(1)), int(episode.group(2))
+        else:
+            season_number, episode_number = int(episode.group(3)), int(episode.group(4))
+        episode_title = _clean_media_title(stem[episode.end():])
+        return {
+            "library": "series", "kind": "episode", "title": series_title,
+            "year": None, "season_number": season_number,
+            "episode_number": episode_number, "episode_title": episode_title,
+        }
+
+    year_matches = list(re.finditer(r"(?<!\d)((?:19|20)\d{2})(?!\d)", stem))
+    year_match = year_matches[-1] if year_matches else None
+    year = int(year_match.group(1)) if year_match else None
+    title_source = stem[:year_match.start()] if year_match else stem
+    title = _clean_media_title(title_source) or _clean_media_title(stem) or "Unknown title"
+    return {"library": "movies", "kind": "movie", "title": title,
+            "year": year, "season_number": None, "episode_number": None,
+            "episode_title": ""}
+
+
+def _match_incoming_request(connection: sqlite3.Connection,
+                            guess: dict[str, object]) -> sqlite3.Row | None:
+    normalized_title = _normalize_media_title(str(guess["title"]))
+    if not normalized_title:
+        return None
+    request_type = "movie" if guess["library"] == "movies" else "tv"
+    rows = connection.execute(
+        """SELECT * FROM content_requests WHERE status='approved'
+           ORDER BY created_at DESC, id"""
+    ).fetchall()
+    matches = []
+    for request in rows:
+        if request["request_type"] == "new_content":
+            if request["content_type"] != request_type:
+                continue
+            if request_type == "tv" and request["season_number"] is not None \
+                    and request["season_number"] != guess["season_number"]:
+                continue
+        elif request["request_type"] == "remaining_seasons":
+            if request_type != "tv":
+                continue
+            details = json.loads(request["details_json"] or "{}")
+            if details.get("missing_seasons") and guess["season_number"] not in {
+                    int(value) for value in details["missing_seasons"]}:
+                continue
+        else:
+            continue
+        if _normalize_media_title(request["title"]) != normalized_title:
+            continue
+        request_year = request["year"]
+        guess_year = guess["year"]
+        if request_year is not None and guess_year is not None and request_year != guess_year:
+            continue
+        matches.append(request)
+    return matches[0] if matches else None
+
+
+def _incoming_entries(connection: sqlite3.Connection) -> list[dict[str, object]]:
+    if not INCOMING_ROOT.is_dir():
+        raise HTTPException(status_code=503, detail="Incoming folder is not mounted")
+    entries: list[dict[str, object]] = []
+    for path in sorted(INCOMING_ROOT.rglob("*"), key=lambda item: item.as_posix().casefold()):
+        try:
+            if path.is_symlink() or not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
+                continue
+            resolved = path.resolve(strict=True)
+            relative = resolved.relative_to(INCOMING_ROOT)
+            stat = resolved.stat()
+        except (OSError, ValueError):
+            continue
+        guess = _incoming_guess(resolved)
+        request = _match_incoming_request(connection, guess)
+        library = str(guess["library"])
+        request_title = request["title"] if request is not None else str(guess["title"])
+        path_title = _safe_path_component(str(request_title))
+        request_year = request["year"] if request is not None and request["year"] else guess["year"]
+        if library == "movies":
+            folder = path_title + (f" ({request_year})" if request_year else "")
+            output_name = f"{path_title}{resolved.suffix}"
+            default_target = MEDIA_DISPLAY_ROOTS[library] / folder / output_name
+        else:
+            series_title = path_title
+            season_number = int(guess["season_number"])
+            episode_number = int(guess["episode_number"])
+            episode_title = _safe_path_component(str(guess["episode_title"] or series_title))
+            output_name = f"{episode_title} S{season_number:02d}E{episode_number:02d}{resolved.suffix}"
+            default_target = (MEDIA_DISPLAY_ROOTS[library] / series_title
+                              / f"Season {season_number:02d}" / output_name)
+        file_id = hashlib.sha256(
+            f"{relative.as_posix()}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8")
+        ).hexdigest()
+        entries.append({
+            "file_id": file_id, "filename": resolved.name,
+            "relative_path": relative.as_posix(),
+            "source_path": str(INCOMING_DISPLAY_ROOT / relative),
+            "size_bytes": stat.st_size, "library": library,
+            "content_kind": str(guess["kind"]), "title": request_title,
+            "year": request_year, "season_number": guess["season_number"],
+            "episode_number": guess["episode_number"],
+            "episode_title": guess["episode_title"],
+            "destination_path": str(default_target),
+            "request_matched": request is not None,
+            "request_id": request["id"] if request is not None else None,
+            "request_status": request["status"] if request is not None else None,
+        })
+    return entries
+
+
 def _remove_fulfilled_content_requests(connection: sqlite3.Connection) -> int:
     requests = connection.execute(
         "SELECT * FROM content_requests WHERE status='approved' ORDER BY id"
@@ -1004,6 +1160,34 @@ def _start_sync_job() -> str | None:
         SYNC_LOCK.release()
         raise
     return job_id
+
+
+def _schedule_sync_when_available() -> bool:
+    global SYNC_RETRY_SCHEDULED
+    if not TMDB_CONFIGURED:
+        return False
+    with SYNC_RETRY_LOCK:
+        if SYNC_RETRY_SCHEDULED:
+            return True
+        SYNC_RETRY_SCHEDULED = True
+
+    def retry() -> None:
+        global SYNC_RETRY_SCHEDULED
+        try:
+            deadline = time.monotonic() + 3600
+            while TMDB_CONFIGURED and time.monotonic() < deadline:
+                try:
+                    if _start_sync_job() is not None:
+                        return
+                except Exception:
+                    pass
+                time.sleep(2)
+        finally:
+            with SYNC_RETRY_LOCK:
+                SYNC_RETRY_SCHEDULED = False
+
+    threading.Thread(target=retry, daemon=True, name="zinema-incoming-sync-retry").start()
+    return True
 
 
 def _metadata_retry_targets(connection: sqlite3.Connection, node_id: str) -> list[str]:
@@ -2386,6 +2570,90 @@ def get_episode_poster(item_id: str):
     if not image_path.is_file():
         raise HTTPException(status_code=404, detail="Episode image not found")
     return FileResponse(image_path)
+
+
+@app.get("/api/v1/admin/incoming", dependencies=[Depends(require_admin)])
+def list_incoming_videos() -> list[dict[str, object]]:
+    with closing(database()) as connection:
+        return _incoming_entries(connection)
+
+
+@app.post("/api/v1/admin/incoming/{file_id}/generate", status_code=200,
+          dependencies=[Depends(require_admin)])
+def generate_incoming_destination(file_id: str,
+                                  request: IncomingGenerateRequest) -> dict[str, object]:
+    if not INCOMING_MOVE_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another incoming file is being moved")
+    try:
+        with closing(database()) as connection:
+            entry = next((item for item in _incoming_entries(connection)
+                          if item["file_id"] == file_id), None)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Incoming video not found; detect files again")
+
+        source = (INCOMING_ROOT / str(entry["relative_path"])).resolve(strict=True)
+        try:
+            source.relative_to(INCOMING_ROOT)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Incoming source path is invalid") from None
+        if source.is_symlink() or not source.is_file() or source.suffix.lower() not in VIDEO_EXTENSIONS:
+            raise HTTPException(status_code=422, detail="Incoming source is not a supported video")
+
+        submitted_destination = Path(request.destination_path).resolve(strict=False)
+        library = None
+        relative_destination = None
+        for candidate_library, display_root in MEDIA_DISPLAY_ROOTS.items():
+            try:
+                relative_destination = submitted_destination.relative_to(display_root)
+                library = candidate_library
+                break
+            except ValueError:
+                continue
+        if library is None or relative_destination is None or not relative_destination.parts \
+                or ".." in relative_destination.parts:
+            raise HTTPException(status_code=422, detail="Choose a destination inside a media library")
+        if submitted_destination.suffix.lower() != source.suffix.lower():
+            raise HTTPException(status_code=422, detail="Keep the source video's file extension")
+
+        media_root = MEDIA_ROOTS[library]
+        destination = (media_root / relative_destination).resolve(strict=False)
+        try:
+            destination.relative_to(media_root)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Destination escapes the media library") from None
+        try:
+            destination.relative_to(INCOMING_ROOT)
+            raise HTTPException(status_code=422, detail="Destination cannot be inside Incoming")
+        except ValueError:
+            pass
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination = destination.resolve(strict=False)
+        try:
+            destination.relative_to(media_root)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Destination escapes the media library") from None
+        if destination.exists() or destination.is_symlink():
+            raise HTTPException(status_code=409, detail="A file already exists at the destination")
+
+        try:
+            shutil.move(str(source), str(destination))
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Could not move incoming video: {exc}") from None
+
+        request_matched = bool(entry["request_matched"])
+        sync_job_id = _start_sync_job() if request_matched else None
+        sync_queued = request_matched and sync_job_id is None and _schedule_sync_when_available()
+        return {
+            "moved": True,
+            "destination_path": str(MEDIA_DISPLAY_ROOTS[library]
+                                    / relative_destination),
+            "request_matched": request_matched,
+            "catalog_sync_job_id": sync_job_id,
+            "catalog_sync_queued": sync_queued,
+        }
+    finally:
+        INCOMING_MOVE_LOCK.release()
 
 
 @app.post("/api/v1/admin/sync", status_code=202, dependencies=[Depends(require_admin)])

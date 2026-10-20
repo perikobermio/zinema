@@ -22,10 +22,16 @@ set +a
 
 [ -n "${MOVIES_PATH:-}" ] || fail "Falta MOVIES_PATH en .env."
 [ -n "${SERIES_PATH:-}" ] || fail "Falta SERIES_PATH en .env."
+[ -n "${INCOMING_PATH:-/d/NAS/Incoming}" ] || fail "Falta INCOMING_PATH en .env."
 [ -d "$MOVIES_PATH" ] || fail "No existe la carpeta de películas: $MOVIES_PATH"
 [ -r "$MOVIES_PATH" ] || fail "Docker/este usuario no puede leer: $MOVIES_PATH"
+[ -w "$MOVIES_PATH" ] || fail "Docker/este usuario no puede escribir en: $MOVIES_PATH"
 [ -d "$SERIES_PATH" ] || fail "No existe la carpeta de series: $SERIES_PATH"
 [ -r "$SERIES_PATH" ] || fail "Docker/este usuario no puede leer: $SERIES_PATH"
+[ -w "$SERIES_PATH" ] || fail "Docker/este usuario no puede escribir en: $SERIES_PATH"
+[ -d "$INCOMING_PATH" ] || fail "No existe la carpeta Incoming: $INCOMING_PATH"
+[ -r "$INCOMING_PATH" ] || fail "Docker/este usuario no puede leer: $INCOMING_PATH"
+[ -w "$INCOMING_PATH" ] || fail "Docker/este usuario no puede escribir en: $INCOMING_PATH"
 if [ -z "${TMDB_ACCESS_TOKEN:-}" ]; then
     printf 'AVISO: falta TMDB_ACCESS_TOKEN; el escaneo funcionará, pero la sincronización de metadata no.\n'
 fi
@@ -34,5 +40,5 @@ cd "$PROJECT_DIR"
 docker compose config -q || fail "La configuración de Docker Compose no es válida."
 
 printf 'OK: Docker está activo y Compose v2 está disponible.\n'
-printf 'OK: .env contiene las rutas y las dos bibliotecas existen y se pueden leer.\n'
+printf 'OK: .env contiene las rutas y las bibliotecas e Incoming existen con permisos de lectura/escritura.\n'
 printf 'OK: la configuración de Docker Compose es válida.\n'
