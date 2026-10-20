@@ -61,10 +61,13 @@ INCOMING_MOVE_LOCK = threading.Lock()
 NAS_DOWNLOAD_LOCK = threading.Lock()
 INCOMING_SCAN_LOCK = threading.Lock()
 INCOMING_ACTIVITY_LOCK = threading.Lock()
+INCOMING_MONITOR_WAKE = threading.Event()
 INCOMING_ACTIVITY_SNAPSHOT: dict[str, dict[str, object]] = {}
 INCOMING_ACTIVE_PATHS: set[str] = set()
 INCOMING_MONITOR_STARTED = False
 INCOMING_MONITOR_SETTLE_SECONDS = 18.0
+INCOMING_MONITOR_IDLE_INTERVAL_SECONDS = 60.0
+INCOMING_MONITOR_ACTIVE_INTERVAL_SECONDS = 1.0
 NAS_DOWNLOAD_STATE: dict[str, object] = {
     "id": None, "status": "idle", "progress": "", "current_file": None, "started_at": None,
     "current_bytes": 0, "current_path": None, "source": None,
@@ -1400,11 +1403,21 @@ def _scan_incoming_download_activity_impl() -> dict[str, object] | None:
 
 def _incoming_download_monitor_loop() -> None:
     while True:
+        # Clear before scanning so a download started during the scan wakes the
+        # following wait instead of being lost between wait() and clear().
+        INCOMING_MONITOR_WAKE.clear()
         try:
-            _scan_incoming_download_activity()
+            state = _scan_incoming_download_activity()
         except Exception:
-            pass
-        time.sleep(2)
+            state = None
+        with INCOMING_ACTIVITY_LOCK:
+            has_active_file = bool(INCOMING_ACTIVE_PATHS)
+        state = state or {}
+        download_running = state.get("status") in {"starting", "running"}
+        interval = (INCOMING_MONITOR_ACTIVE_INTERVAL_SECONDS
+                    if has_active_file or download_running
+                    else INCOMING_MONITOR_IDLE_INTERVAL_SECONDS)
+        INCOMING_MONITOR_WAKE.wait(interval)
 
 
 def _settle_app_download_files() -> None:
@@ -2882,6 +2895,7 @@ def start_nas_catalog_download() -> dict[str, object]:
             "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": None,
             "exit_code": None, "error": None,
         })
+    INCOMING_MONITOR_WAKE.set()
     threading.Thread(target=_run_nas_download, args=(job_id,), daemon=True,
                      name=f"nas-download-{job_id[:8]}").start()
     return {"id": job_id, "status": "starting"}
