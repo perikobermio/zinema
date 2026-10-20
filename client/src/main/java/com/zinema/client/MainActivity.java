@@ -2975,7 +2975,7 @@ public class MainActivity extends Activity {
                     int index = r * 2 + c;
                     ImageView tile = new ImageView(this);
                     tile.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                    tile.setBackgroundColor(PANEL);
+                    showPosterPlaceholder(tile);
                     LinearLayout.LayoutParams tileParams = new LinearLayout.LayoutParams(0, -1, 1);
                     tileParams.setMargins(d(1), d(1), d(1), d(1));
                     mosaicRow.addView(tile, tileParams);
@@ -3213,6 +3213,10 @@ public class MainActivity extends Activity {
         }
     }
 
+    void showPosterPlaceholder(ImageView target) {
+        if (target != null) target.setImageResource(R.drawable.ic_poster_placeholder);
+    }
+
     void loadImage(String path, ImageView target, boolean backdrop) {
         loadImage(path, target, backdrop, "");
     }
@@ -3225,14 +3229,14 @@ public class MainActivity extends Activity {
             if (fallbackPath != null && !fallbackPath.trim().isEmpty()
                     && !"null".equalsIgnoreCase(fallbackPath.trim()))
                 loadImage(fallbackPath, target, backdrop, "");
-            else target.setBackground(round(PANEL, d(8)));
+            else showPosterPlaceholder(target);
             return;
         }
         String url = path.startsWith("http") ? path : server + (path.startsWith("/") ? path : "/" + path);
         if (url.equals(requestedImages.get(target))) return;
         if (!isImageVisible(target)) {
             requestedImages.remove(target);
-            target.setImageDrawable(null);
+            showPosterPlaceholder(target);
             target.setTag(url);
             deferredImageRequests.put(target, new String[]{path, Boolean.toString(backdrop),
                     fallbackPath == null ? "" : fallbackPath});
@@ -3245,6 +3249,7 @@ public class MainActivity extends Activity {
         requestedImages.put(target, url);
         Bitmap cached = imageCache.get(url);
         if (cached != null) { target.setImageBitmap(cached); return; }
+        showPosterPlaceholder(target);
         List<ImageView> pending = pendingImageTargets.get(url);
         if (pending != null) {
             pending.add(target);
@@ -3275,7 +3280,7 @@ public class MainActivity extends Activity {
                     else if (fallbackPath != null && !fallbackPath.isEmpty()
                             && !fallbackPath.equals(path))
                         loadImage(fallbackPath, image, backdrop, "");
-                    else image.setBackground(round(PANEL, d(8)));
+                    else showPosterPlaceholder(image);
                 }
             });
         });
@@ -3315,12 +3320,12 @@ public class MainActivity extends Activity {
     }
 
     void showPoster(String path, ImageView target, boolean lazy) {
+        showPosterPlaceholder(target);
         if (!lazy) {
             loadImage(path, target, false);
             return;
         }
         if (path == null || path.trim().isEmpty() || "null".equalsIgnoreCase(path.trim())) {
-            target.setBackground(round(PANEL, d(8)));
             return;
         }
         String url = path.startsWith("http") ? path : server + (path.startsWith("/") ? path : "/" + path);
