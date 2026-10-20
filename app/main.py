@@ -883,6 +883,69 @@ def _start_episode_thumbnail_job() -> None:
     threading.Thread(target=run, name="episode-thumbnails", daemon=True).start()
 
 
+def _remove_fulfilled_content_requests(connection: sqlite3.Connection) -> int:
+    requests = connection.execute(
+        "SELECT * FROM content_requests WHERE status='approved' ORDER BY id"
+    ).fetchall()
+    removed = 0
+    for request in requests:
+        request_type = request["request_type"]
+        fulfilled = False
+        if request_type == "new_content" and request["tmdb_id"] is not None:
+            if request["content_type"] == "movie":
+                fulfilled = connection.execute(
+                    """SELECT 1 FROM catalog_nodes WHERE available=1 AND library='movies'
+                       AND kind='movie' AND tmdb_id=? LIMIT 1""",
+                    (request["tmdb_id"],),
+                ).fetchone() is not None
+            elif request["content_type"] == "tv":
+                series = connection.execute(
+                    """SELECT id FROM catalog_nodes WHERE available=1 AND library='series'
+                       AND kind='series' AND tmdb_id=? LIMIT 1""",
+                    (request["tmdb_id"],),
+                ).fetchone()
+                if series is not None:
+                    season_number = request["season_number"]
+                    if season_number is None:
+                        fulfilled = True
+                    else:
+                        fulfilled = connection.execute(
+                            """SELECT 1 FROM catalog_nodes WHERE available=1 AND kind='season'
+                               AND parent_id=? AND season_number=? LIMIT 1""",
+                            (series["id"], season_number),
+                        ).fetchone() is not None
+        elif request_type == "remaining_seasons" and request["catalog_node_id"]:
+            series = connection.execute(
+                """SELECT id, tmdb_episodes_json FROM catalog_nodes
+                   WHERE id=? AND available=1 AND kind='series'""",
+                (request["catalog_node_id"],),
+            ).fetchone()
+            if series is not None:
+                details = json.loads(request["details_json"] or "{}")
+                missing_seasons = details.get("missing_seasons") or []
+                if missing_seasons:
+                    fulfilled = all(connection.execute(
+                        """SELECT 1 FROM catalog_nodes WHERE available=1 AND kind='season'
+                           AND parent_id=? AND season_number=? LIMIT 1""",
+                        (series["id"], int(number)),
+                    ).fetchone() is not None for number in missing_seasons)
+                elif int(details.get("missing_episode_count") or 0) > 0:
+                    completion = _series_completion(
+                        connection, series["id"], series["tmdb_episodes_json"],
+                    )
+                    fulfilled = completion["completion_known"] and not completion["incomplete"]
+
+        if fulfilled:
+            cursor = connection.execute(
+                "DELETE FROM content_requests WHERE id=? AND status='approved'",
+                (request["id"],),
+            )
+            removed += cursor.rowcount
+    if removed:
+        connection.commit()
+    return removed
+
+
 def _run_sync_job(job_id: str) -> None:
     try:
         started = datetime.now(timezone.utc).isoformat()
@@ -906,7 +969,10 @@ def _run_sync_job(job_id: str) -> None:
             _update_sync_job(job_id, stage=f"metadata:{metadata_result['processed']}")
             if batch["processed"] < TMDB_SYNC_BATCH_SIZE:
                 break
-        result = {"catalog": scan_result, "metadata": metadata_result}
+        with closing(database()) as connection:
+            fulfilled_requests_removed = _remove_fulfilled_content_requests(connection)
+        result = {"catalog": scan_result, "metadata": metadata_result,
+                  "fulfilled_requests_removed": fulfilled_requests_removed}
         _update_sync_job(
             job_id, status="completed", stage="complete",
             completed_at=datetime.now(timezone.utc).isoformat(),
