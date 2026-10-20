@@ -116,6 +116,7 @@ public class MainActivity extends Activity {
     Runnable contentRequestSearchTask;
     Runnable adminSyncPollTask;
     Runnable nasDownloadPollTask;
+    String incomingRefreshDownloadId = "";
     final LruCache<String, Bitmap> imageCache = new LruCache<String, Bitmap>(bitmapCacheBytes()) {
         @Override protected int sizeOf(String key, Bitmap value) {
             return Math.max(1, value.getAllocationByteCount());
@@ -5264,6 +5265,7 @@ public class MainActivity extends Activity {
             case "Listo para descargar.": return "Deskargatzeko prest.";
             case "Iniciando descarga…": return "Deskarga hasten…";
             case "Descarga en curso…": return "Deskarga egiten…";
+            case "Descargando archivo: ": return "Fitxategia deskargatzen: ";
             case "Descarga finalizada.": return "Deskarga amaitu da.";
             case "Descarga finalizada; buscando vídeos en Incoming…":
                 return "Deskarga amaitu da; Incoming-eko bideoak bilatzen…";
@@ -5965,13 +5967,8 @@ public class MainActivity extends Activity {
                     slot.removeAllViews();
                     slot.setVisibility(View.VISIBLE);
                     LinearLayout card = settingsCard();
-                    slot.addView(card);
+                    slot.addView(card, new LinearLayout.LayoutParams(-1, d(190)));
                     card.addView(label(t("Sincronización del catálogo"), 16, Color.WHITE, true));
-                    TextView hint = label(t("Escanea las carpetas del NAS y vuelve a obtener metadata."),
-                            12, MUTED, false);
-                    LinearLayout.LayoutParams hintP = new LinearLayout.LayoutParams(-1, -2);
-                    hintP.topMargin = d(6);
-                    card.addView(hint, hintP);
                     ProgressBar progress = new ProgressBar(this);
                     progress.setIndeterminate(true);
                     LinearLayout.LayoutParams progressP = new LinearLayout.LayoutParams(-1, d(4));
@@ -5979,8 +5976,7 @@ public class MainActivity extends Activity {
                     card.addView(progress, progressP);
                     progress.setVisibility(View.GONE);
                     TextView status = label(t("Sincronización nunca ejecutada"), 12, MUTED, false);
-                    LinearLayout.LayoutParams statusP = new LinearLayout.LayoutParams(-1, -2);
-                    statusP.topMargin = d(10);
+                    LinearLayout.LayoutParams statusP = new LinearLayout.LayoutParams(-1, 0, 1);
                     card.addView(status, statusP);
                     Button sync = actionButton("Sincronizar ahora", true);
                     LinearLayout.LayoutParams syncP = new LinearLayout.LayoutParams(-1, d(46));
@@ -6283,18 +6279,18 @@ public class MainActivity extends Activity {
         syncSlotParams.leftMargin = d(10);
         topAdminRow.addView(syncSlot, syncSlotParams);
 
+        LinearLayout incomingSlot = new LinearLayout(this);
+        incomingSlot.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams incomingSlotParams = new LinearLayout.LayoutParams(-1, -2);
+        incomingSlotParams.topMargin = d(14);
+        screen.addView(incomingSlot, incomingSlotParams);
+
         LinearLayout requestsSlot = new LinearLayout(this);
         requestsSlot.setOrientation(LinearLayout.VERTICAL);
         requestsSlot.setVisibility(View.GONE);
         LinearLayout.LayoutParams requestsSlotParams = new LinearLayout.LayoutParams(-1, -2);
         requestsSlotParams.topMargin = d(14);
         screen.addView(requestsSlot, requestsSlotParams);
-
-        LinearLayout incomingSlot = new LinearLayout(this);
-        incomingSlot.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams incomingSlotParams = new LinearLayout.LayoutParams(-1, -2);
-        incomingSlotParams.topMargin = d(14);
-        screen.addView(incomingSlot, incomingSlotParams);
 
         LinearLayout languageCard = settingsCard();
         LinearLayout.LayoutParams languageP = new LinearLayout.LayoutParams(-1, -2);
@@ -6351,8 +6347,8 @@ public class MainActivity extends Activity {
         content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
         loadNasDownloadControls(downloadSlot);
         loadAdminSyncControls(syncSlot);
-        loadContentRequestControls(requestsSlot);
         loadIncomingControls(incomingSlot);
+        loadContentRequestControls(requestsSlot);
     }
 
     void loadNasDownloadControls(LinearLayout slot) {
@@ -6376,39 +6372,34 @@ public class MainActivity extends Activity {
         slot.removeAllViews();
         slot.setVisibility(View.VISIBLE);
         LinearLayout card = settingsCard();
-        slot.addView(card);
+        slot.addView(card, new LinearLayout.LayoutParams(-1, d(190)));
         card.addView(label(t("Descarga desde Telegram"), 15, Color.WHITE, true));
-        TextView hint = label(t("Ejecuta la descarga de Telegram y muestra el progreso."),
-                11, MUTED, false);
-        LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(-1, -2);
-        hintParams.topMargin = d(5);
-        card.addView(hint, hintParams);
         ProgressBar progress = new ProgressBar(this);
         progress.setIndeterminate(true);
         LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(-1, d(4));
-        progressParams.topMargin = d(10);
+        progressParams.topMargin = d(14);
         card.addView(progress, progressParams);
         TextView status = label(t(loadError.isEmpty() ? "Listo para descargar." : "Descarga/script no disponible."),
                 11, MUTED, false);
         status.setTag("nas-download-status");
         status.setMaxLines(3);
-        LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(-1, -2);
-        statusParams.topMargin = d(8);
+        LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(-1, 0, 1);
         card.addView(status, statusParams);
         Button start = actionButton(t("Iniciar descarga"), true);
         start.setTag("nas-download-start");
-        LinearLayout.LayoutParams startParams = new LinearLayout.LayoutParams(-1, d(42));
-        startParams.topMargin = d(10);
+        LinearLayout.LayoutParams startParams = new LinearLayout.LayoutParams(-1, d(46));
+        startParams.topMargin = d(12);
         card.addView(start, startParams);
         start.setOnClickListener(v -> startNasDownload(status, progress, start));
 
         if (state != null) {
-            boolean active = applyNasDownloadState(state, status, progress, start, false);
             String jobId = state.optString("id", "");
-            if (active && !jobId.isEmpty()) pollNasDownload(jobId, status, progress, start);
+            applyNasDownloadState(state, status, progress, start, false);
+            pollNasDownload(jobId, status, progress, start);
         } else {
             progress.setVisibility(View.GONE);
             start.setEnabled(loadError.isEmpty());
+            pollNasDownload("", status, progress, start);
         }
     }
 
@@ -6420,13 +6411,19 @@ public class MainActivity extends Activity {
         start.setEnabled(!active);
         if ("starting".equals(stateName)) status.setText(t("Iniciando descarga…"));
         else if ("running".equals(stateName)) {
+            String currentFile = state.optString("current_file", "").trim();
             String output = state.optString("progress", "").trim();
-            status.setText(output.isEmpty() ? t("Descarga en curso…") : output);
+            status.setText(currentFile.isEmpty()
+                    ? (output.isEmpty() ? t("Descarga en curso…") : output)
+                    : t("Descargando archivo: ") + currentFile);
         } else if ("completed".equals(stateName)) {
-            status.setText(t(notifyCompletion
-                    ? "Descarga finalizada; buscando vídeos en Incoming…"
-                    : "Descarga finalizada."));
-            if (notifyCompletion) refreshIncomingAfterDownload(status);
+            String completedId = state.optString("id", "");
+            if (notifyCompletion && !completedId.isEmpty()
+                    && !completedId.equals(incomingRefreshDownloadId)) {
+                incomingRefreshDownloadId = completedId;
+                status.setText(t("Descarga finalizada; buscando vídeos en Incoming…"));
+                refreshIncomingAfterDownload(status);
+            } else status.setText(t("Descarga finalizada."));
         } else if ("failed".equals(stateName)) {
             String detail = state.optString("error", "");
             String output = state.optString("progress", "").trim();
@@ -6475,9 +6472,8 @@ public class MainActivity extends Activity {
                 JSONObject state = getJson("/api/v1/admin/incoming-download");
                 runOnUiThread(() -> {
                     if (!showingAdmin || status.getParent() == null) return;
-                    if (!jobId.equals(state.optString("id", ""))) return;
-                    boolean active = applyNasDownloadState(state, status, progress, start, true);
-                    if (active) scheduleNasDownloadPoll(jobId, status, progress, start);
+                    applyNasDownloadState(state, status, progress, start, true);
+                    scheduleNasDownloadPoll(state.optString("id", ""), status, progress, start);
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
@@ -6495,7 +6491,7 @@ public class MainActivity extends Activity {
             nasDownloadPollTask = null;
             pollNasDownload(jobId, status, progress, start);
         };
-        nasDownloadHandler.postDelayed(nasDownloadPollTask, 1500);
+        nasDownloadHandler.postDelayed(nasDownloadPollTask, 2500);
     }
 
     void refreshIncomingAfterDownload(TextView status) {

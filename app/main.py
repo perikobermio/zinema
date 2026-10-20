@@ -60,7 +60,7 @@ SYNC_RETRY_SCHEDULED = False
 INCOMING_MOVE_LOCK = threading.Lock()
 NAS_DOWNLOAD_LOCK = threading.Lock()
 NAS_DOWNLOAD_STATE: dict[str, object] = {
-    "id": None, "status": "idle", "progress": "", "started_at": None,
+    "id": None, "status": "idle", "progress": "", "current_file": None, "started_at": None,
     "completed_at": None, "exit_code": None, "error": None,
 }
 METADATA_RETRY_LOCK = threading.Lock()
@@ -1255,6 +1255,28 @@ def _update_nas_download_state(**values: object) -> None:
         NAS_DOWNLOAD_STATE.update(values)
 
 
+def _download_filename_from_output(line: str) -> str | None:
+    extensions = "|".join(re.escape(ext.lstrip(".")) for ext in VIDEO_EXTENSIONS)
+    suffix_pattern = rf"\.(?:{extensions})(?=$|[\s\"'`),;\]])"
+    # Downloader output usually prefixes the path with a verb or a field label.
+    labelled = re.search(
+        rf"(?i)(?:downloading|descargando|archivo|file|downloaded|saving|saved)\b"
+        rf"(?:\s*[:=]\s*|\s+)([^\r\n]+?{suffix_pattern})",
+        line,
+    )
+    candidate = labelled.group(1) if labelled else ""
+    if not candidate:
+        quoted = re.findall(r"[\"']([^\"']+" + suffix_pattern + r")[\"']", line, re.IGNORECASE)
+        candidate = quoted[-1] if quoted else ""
+    if not candidate:
+        path_candidates = re.findall(rf"(?:^|[\s=:])([^\r\n]+?{suffix_pattern})", line, re.IGNORECASE)
+        candidate = path_candidates[-1] if path_candidates else ""
+    if not candidate:
+        return None
+    filename = Path(candidate.strip().strip("\"'`.,;()[]{} ")).name
+    return filename if Path(filename).suffix.lower() in VIDEO_EXTENSIONS else None
+
+
 def _run_nas_download(job_id: str) -> None:
     try:
         process = subprocess.Popen(
@@ -1271,7 +1293,11 @@ def _run_nas_download(job_id: str) -> None:
             for line in process.stdout:
                 progress = line.strip()
                 if progress:
-                    _update_nas_download_state(progress=progress[-300:])
+                    values: dict[str, object] = {"progress": progress[-300:]}
+                    filename = _download_filename_from_output(progress)
+                    if filename:
+                        values["current_file"] = filename
+                    _update_nas_download_state(**values)
         exit_code = process.wait()
         completed_at = datetime.now(timezone.utc).isoformat()
         if exit_code == 0:
@@ -2690,6 +2716,7 @@ def start_nas_catalog_download() -> dict[str, object]:
         job_id = uuid4().hex
         NAS_DOWNLOAD_STATE.update({
             "id": job_id, "status": "starting", "progress": "Iniciando descarga…",
+            "current_file": None,
             "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": None,
             "exit_code": None, "error": None,
         })
