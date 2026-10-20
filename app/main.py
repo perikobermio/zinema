@@ -946,6 +946,7 @@ def _incoming_guess(path: Path) -> dict[str, object]:
     year = int(year_match.group(1)) if year_match else None
     title_source = stem[:year_match.start()] if year_match else stem
     title = _clean_media_title(title_source) or _clean_media_title(stem) or "Unknown title"
+    title = re.sub(r"[([{]+\s*$", "", title).strip(" -_.") or "Unknown title"
     return {"library": "movies", "kind": "movie", "title": title,
             "year": year, "season_number": None, "episode_number": None,
             "episode_title": ""}
@@ -1050,6 +1051,12 @@ def _incoming_entries(connection: sqlite3.Connection) -> list[dict[str, object]]
         path_title = _safe_path_component(str(request_title))
         request_year = request["year"] if request is not None and request["year"] else guess["year"]
         if library == "movies":
+            if request_year:
+                year_suffix = re.compile(
+                    rf"(?:\s*\(\s*{int(request_year)}\s*\)|"
+                    rf"\s*\[\s*{int(request_year)}\s*\]|\s+{int(request_year)})$"
+                )
+                path_title = year_suffix.sub("", path_title).strip(" .") or path_title
             folder = path_title + (f" ({request_year})" if request_year else "")
             output_name = f"{path_title}{resolved.suffix}"
             default_target = MEDIA_DISPLAY_ROOTS[library] / folder / output_name
@@ -1057,8 +1064,10 @@ def _incoming_entries(connection: sqlite3.Connection) -> list[dict[str, object]]
             series_title = path_title
             season_number = int(guess["season_number"])
             episode_number = int(guess["episode_number"])
-            episode_title = _safe_path_component(str(guess["episode_title"] or series_title))
-            output_name = f"{episode_title} S{season_number:02d}E{episode_number:02d}{resolved.suffix}"
+            episode_title = _safe_path_component(str(guess["episode_title"])) \
+                if guess["episode_title"] else ""
+            title_prefix = f"{episode_title} - " if episode_title else ""
+            output_name = f"{title_prefix}s{season_number:02d}e{episode_number:02d}{resolved.suffix}"
             default_target = (MEDIA_DISPLAY_ROOTS[library] / series_title
                               / f"Season {season_number:02d}" / output_name)
         file_id = hashlib.sha256(

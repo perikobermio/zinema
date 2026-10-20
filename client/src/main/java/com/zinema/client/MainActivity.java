@@ -5,6 +5,7 @@ import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.ContentProvider;
 import android.content.ContentValues;
+import android.content.res.ColorStateList;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.net.Uri;
@@ -6471,10 +6472,11 @@ public class MainActivity extends Activity {
         generate.setTextSize(19);
         generate.setContentDescription(t("Generar"));
         generateSlot.addView(generate, new FrameLayout.LayoutParams(-1, -1));
-        ProgressBar loading = new ProgressBar(this);
+        ProgressBar loading = new ProgressBar(this, null, android.R.attr.progressBarStyleSmall);
         loading.setIndeterminate(true);
+        loading.setIndeterminateTintList(ColorStateList.valueOf(Color.WHITE));
         loading.setContentDescription(t("Moviendo…"));
-        FrameLayout.LayoutParams loadingParams = new FrameLayout.LayoutParams(d(22), d(22), Gravity.CENTER);
+        FrameLayout.LayoutParams loadingParams = new FrameLayout.LayoutParams(d(26), d(26), Gravity.CENTER);
         generateSlot.addView(loading, loadingParams);
         loading.setVisibility(View.GONE);
         generate.setOnClickListener(v -> moveIncomingVideo(file, destination, generate, loading, rows));
@@ -6490,6 +6492,7 @@ public class MainActivity extends Activity {
         generate.setEnabled(false);
         generate.setText("");
         loading.setVisibility(View.VISIBLE);
+        loading.bringToFront();
         io.execute(() -> {
             try {
                 JSONObject result = postJson("/api/v1/admin/incoming/" + enc(fileId) + "/generate", payload);
