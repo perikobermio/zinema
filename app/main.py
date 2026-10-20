@@ -988,6 +988,48 @@ def _match_incoming_request(connection: sqlite3.Connection,
     return matches[0] if matches else None
 
 
+def _incoming_poster_url(connection: sqlite3.Connection, guess: dict[str, object],
+                         request: sqlite3.Row | None) -> str | None:
+    if request is not None:
+        details = json.loads(request["details_json"] or "{}")
+        poster_url = details.get("poster_url")
+        if isinstance(poster_url, str) and poster_url.startswith(("http://", "https://", "/")):
+            return poster_url
+        poster_path = details.get("poster_path")
+        if isinstance(poster_path, str) and poster_path.startswith("/"):
+            return f"https://image.tmdb.org/t/p/w342{poster_path}"
+        node_id = request["catalog_node_id"]
+        if node_id:
+            node = connection.execute(
+                "SELECT id, kind, poster_file FROM catalog_nodes WHERE id=? AND available=1",
+                (node_id,),
+            ).fetchone()
+            if node is not None and node["poster_file"]:
+                return _artwork_url(node["id"], "poster", node["poster_file"])
+            if node is not None and node["kind"] == "series":
+                fallback = _series_fallback_poster(connection, node["id"])
+                if fallback:
+                    return _artwork_url(node["id"], "poster", fallback[1])
+
+    library = "series" if guess["library"] == "series" else "movies"
+    kind = "series" if library == "series" else "movie"
+    title = _normalize_media_title(str(guess["title"]))
+    if not title:
+        return None
+    for node in connection.execute(
+        """SELECT id, title, metadata_title, original_title, poster_file
+           FROM catalog_nodes WHERE library=? AND kind=? AND available=1 AND poster_file IS NOT NULL
+             AND (title=? COLLATE NOCASE OR metadata_title=? COLLATE NOCASE
+                  OR original_title=? COLLATE NOCASE)""",
+        (library, kind, str(guess["title"]), str(guess["title"]), str(guess["title"])),
+    ):
+        if title in {_normalize_media_title(node["title"] or ""),
+                     _normalize_media_title(node["metadata_title"] or ""),
+                     _normalize_media_title(node["original_title"] or "")}:
+            return _artwork_url(node["id"], "poster", node["poster_file"])
+    return None
+
+
 def _incoming_entries(connection: sqlite3.Connection) -> list[dict[str, object]]:
     if not INCOMING_ROOT.is_dir():
         raise HTTPException(status_code=503, detail="Incoming folder is not mounted")
@@ -1035,6 +1077,7 @@ def _incoming_entries(connection: sqlite3.Connection) -> list[dict[str, object]]
             "request_matched": request is not None,
             "request_id": request["id"] if request is not None else None,
             "request_status": request["status"] if request is not None else None,
+            "poster_url": _incoming_poster_url(connection, guess, request),
         })
     return entries
 

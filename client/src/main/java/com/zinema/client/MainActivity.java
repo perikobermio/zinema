@@ -171,6 +171,7 @@ public class MainActivity extends Activity {
     String startupRemoteStateProfileId = "";
     String startupPrefetchError;
     String startupCatalogVersion = "";
+    volatile JSONArray incomingFilesCache;
     String adminReturnDetailId = "";
     String editingProfileId = "";
     String selectedProfileAvatar = "";
@@ -237,6 +238,7 @@ public class MainActivity extends Activity {
                     startStartupPrefetch();
                     showIntro();
                 });
+                if (isAdmin) prefetchIncomingVideosForAdmin();
             } catch (Exception e) {
                 String message = e.getMessage() == null ? "" : e.getMessage();
                 if (message.contains("HTTP 401") || message.contains("HTTP 403")) {
@@ -5010,6 +5012,7 @@ public class MainActivity extends Activity {
             case "Petición previa asociada": return "Aurreko eskaera lotuta";
             case "Ruta definitiva": return "Behin betiko bidea";
             case "Generar": return "Sortu";
+            case "Moviendo…": return "Mugitzen…";
             case "Fichero movido; sincronización del catálogo en cola.":
                 return "Fitxategia mugituta; katalogoaren sinkronizazioa ilaran dago.";
             case "Fichero movido; sincronización del catálogo iniciada.":
@@ -6345,6 +6348,7 @@ public class MainActivity extends Activity {
         card.addView(hint, hintParams);
         LinearLayout rows = new LinearLayout(this);
         rows.setOrientation(LinearLayout.VERTICAL);
+        rows.setTag("incoming-rows");
         LinearLayout.LayoutParams rowsParams = new LinearLayout.LayoutParams(-1, -2);
         rowsParams.topMargin = d(10);
         card.addView(rows, rowsParams);
@@ -6354,6 +6358,24 @@ public class MainActivity extends Activity {
         detectParams.topMargin = d(10);
         card.addView(detect, detectParams);
         detect.setOnClickListener(v -> detectIncomingVideos(rows, detect));
+        JSONArray cachedFiles = incomingFilesCache;
+        if (cachedFiles != null) renderIncomingVideos(rows, cachedFiles);
+    }
+
+    void prefetchIncomingVideosForAdmin() {
+        if (!isAccountAdmin()) return;
+        io.execute(() -> {
+            try {
+                JSONArray files = getArray("/api/v1/admin/incoming");
+                incomingFilesCache = files;
+                runOnUiThread(() -> {
+                    if (!showingAdmin || content == null) return;
+                    View rowsView = content.findViewWithTag("incoming-rows");
+                    if (rowsView instanceof LinearLayout)
+                        renderIncomingVideos((LinearLayout) rowsView, files);
+                });
+            } catch (Exception ignored) { }
+        });
     }
 
     void detectIncomingVideos(LinearLayout rows, Button detect) {
@@ -6362,17 +6384,10 @@ public class MainActivity extends Activity {
         io.execute(() -> {
             try {
                 JSONArray files = getArray("/api/v1/admin/incoming");
+                incomingFilesCache = files;
                 runOnUiThread(() -> {
                     if (!showingAdmin || rows.getParent() == null) return;
-                    rows.removeAllViews();
-                    if (files.length() == 0) {
-                        rows.addView(label(t("No hay vídeos en Incoming."), 13, MUTED, false));
-                    } else {
-                        for (int i = 0; i < files.length(); i++) {
-                            JSONObject file = files.optJSONObject(i);
-                            if (file != null) addIncomingVideoRow(rows, file);
-                        }
-                    }
+                    renderIncomingVideos(rows, files);
                     detect.setText(t("Detectar vídeos"));
                     detect.setEnabled(true);
                 });
@@ -6387,14 +6402,40 @@ public class MainActivity extends Activity {
         });
     }
 
+    void renderIncomingVideos(LinearLayout rows, JSONArray files) {
+        if (rows == null || files == null) return;
+        rows.removeAllViews();
+        if (files.length() == 0) {
+            rows.addView(label(t("No hay vídeos en Incoming."), 13, MUTED, false));
+            return;
+        }
+        for (int i = 0; i < files.length(); i++) {
+            JSONObject file = files.optJSONObject(i);
+            if (file != null) addIncomingVideoRow(rows, file);
+        }
+    }
+
     void addIncomingVideoRow(LinearLayout rows, JSONObject file) {
         LinearLayout entry = settingsCard();
         LinearLayout.LayoutParams entryParams = new LinearLayout.LayoutParams(-1, -2);
         entryParams.bottomMargin = d(10);
         rows.addView(entry, entryParams);
+        LinearLayout summary = new LinearLayout(this);
+        summary.setGravity(Gravity.CENTER_VERTICAL);
+        entry.addView(summary, new LinearLayout.LayoutParams(-1, -2));
+        ImageView thumbnail = new ImageView(this);
+        thumbnail.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        thumbnail.setBackground(round(PANEL, d(6)));
+        LinearLayout.LayoutParams thumbnailParams = new LinearLayout.LayoutParams(d(54), d(78));
+        thumbnailParams.rightMargin = d(10);
+        summary.addView(thumbnail, thumbnailParams);
+        loadImage(file.optString("poster_url", ""), thumbnail, false);
+        LinearLayout summaryText = new LinearLayout(this);
+        summaryText.setOrientation(LinearLayout.VERTICAL);
+        summary.addView(summaryText, new LinearLayout.LayoutParams(0, -2, 1));
         TextView filename = labelRaw(file.optString("filename", ""), 15, Color.WHITE, true);
         filename.setMaxLines(2);
-        entry.addView(filename);
+        summaryText.addView(filename);
         String kind = "series".equals(file.optString("library"))
                 ? t("Serie") + " · " + t("Temporada") + " " + file.optInt("season_number")
                     + " · " + t("Capítulo") + " " + file.optInt("episode_number")
@@ -6402,33 +6443,53 @@ public class MainActivity extends Activity {
         TextView info = label(kind + " · " + formatSize(file.optLong("size_bytes")), 12, MUTED, false);
         LinearLayout.LayoutParams infoParams = new LinearLayout.LayoutParams(-1, -2);
         infoParams.topMargin = d(4);
-        entry.addView(info, infoParams);
+        summaryText.addView(info, infoParams);
         if (file.optBoolean("request_matched")) {
             TextView request = label(t("Petición previa asociada") + ": " + file.optString("title", ""),
                     12, 0xFF79E3B7, true);
             LinearLayout.LayoutParams requestParams = new LinearLayout.LayoutParams(-1, -2);
             requestParams.topMargin = d(4);
-            entry.addView(request, requestParams);
+            summaryText.addView(request, requestParams);
         }
         EditText destination = settingsField(file.optString("destination_path", ""),
                 t("Ruta definitiva"), true);
-        LinearLayout.LayoutParams destinationParams = new LinearLayout.LayoutParams(-1, d(48));
-        destinationParams.topMargin = d(8);
-        entry.addView(destination, destinationParams);
+        destination.setTextSize(12);
+        destination.setHorizontallyScrolling(true);
+        LinearLayout destinationRow = new LinearLayout(this);
+        destinationRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams destinationRowParams = new LinearLayout.LayoutParams(-1, d(44));
+        destinationRowParams.topMargin = d(8);
+        entry.addView(destinationRow, destinationRowParams);
+        LinearLayout.LayoutParams destinationParams = new LinearLayout.LayoutParams(0, d(44), 1);
+        destinationRow.addView(destination, destinationParams);
+        FrameLayout generateSlot = new FrameLayout(this);
+        LinearLayout.LayoutParams generateSlotParams = new LinearLayout.LayoutParams(d(50), d(44));
+        generateSlotParams.leftMargin = d(8);
+        destinationRow.addView(generateSlot, generateSlotParams);
         Button generate = actionButton(t("Generar"), true);
-        LinearLayout.LayoutParams generateParams = new LinearLayout.LayoutParams(-1, d(44));
-        generateParams.topMargin = d(8);
-        entry.addView(generate, generateParams);
-        generate.setOnClickListener(v -> moveIncomingVideo(file, destination, generate, rows));
+        generate.setText("➜");
+        generate.setTextSize(19);
+        generate.setContentDescription(t("Generar"));
+        generateSlot.addView(generate, new FrameLayout.LayoutParams(-1, -1));
+        ProgressBar loading = new ProgressBar(this);
+        loading.setIndeterminate(true);
+        loading.setContentDescription(t("Moviendo…"));
+        FrameLayout.LayoutParams loadingParams = new FrameLayout.LayoutParams(d(22), d(22), Gravity.CENTER);
+        generateSlot.addView(loading, loadingParams);
+        loading.setVisibility(View.GONE);
+        generate.setOnClickListener(v -> moveIncomingVideo(file, destination, generate, loading, rows));
     }
 
-    void moveIncomingVideo(JSONObject file, EditText destination, Button generate, LinearLayout rows) {
+    void moveIncomingVideo(JSONObject file, EditText destination, Button generate,
+                           ProgressBar loading, LinearLayout rows) {
         String fileId = file.optString("file_id", "");
         if (fileId.isEmpty()) return;
         JSONObject payload = new JSONObject();
         try { payload.put("destination_path", destination.getText().toString().trim()); }
         catch (JSONException ignored) { return; }
         generate.setEnabled(false);
+        generate.setText("");
+        loading.setVisibility(View.VISIBLE);
         io.execute(() -> {
             try {
                 JSONObject result = postJson("/api/v1/admin/incoming/" + enc(fileId) + "/generate", payload);
@@ -6450,6 +6511,8 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 runOnUiThread(() -> {
                     generate.setEnabled(true);
+                    generate.setText(t("Generar"));
+                    loading.setVisibility(View.GONE);
                     Toast.makeText(this, t("No se pudo mover el fichero: ") + e.getMessage(),
                             Toast.LENGTH_LONG).show();
                 });
@@ -6880,6 +6943,8 @@ public class MainActivity extends Activity {
                 prefs.edit().putString("client_device_id", deviceId)
                         .putString("account_email", username).putBoolean("account_is_admin", isAdmin)
                         .remove("profile_sync_token").apply();
+                incomingFilesCache = null;
+                if (isAdmin) prefetchIncomingVideosForAdmin();
                 runOnUiThread(() -> {
                     passwordInput.setText("");
                     accountStatus.setVisibility(View.GONE);
