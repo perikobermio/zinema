@@ -1370,10 +1370,19 @@ def _scan_incoming_download_activity_impl() -> dict[str, object] | None:
                                           and state["status"] in {"completed", "failed"}
                                           and state.get("current_path") in active_path_names)
         if current_file and (app_download_active or app_download_recently_finished):
+            if app_download_recently_finished:
+                state.update({
+                    "status": "running", "progress": "Descarga detectada en Incoming…",
+                    "completed_at": None, "_awaiting_file_settle": True,
+                })
             state.update({
                 "current_file": current_file["filename"], "current_bytes": current_file["size"],
                 "current_path": current_file["path"],
             })
+            state["_last_activity_monotonic"] = max(
+                float(state.get("_last_activity_monotonic", 0.0)),
+                float(current_file["last_change"]),
+            )
         elif current_file:
             if state["source"] != "incoming" or state["status"] != "running":
                 state.update({
@@ -1391,12 +1400,14 @@ def _scan_incoming_download_activity_impl() -> dict[str, object] | None:
             state["_last_activity_monotonic"] = max(
                 float(state.get("_last_activity_monotonic", 0.0)), last_file_change,
             )
-        elif state["source"] == "incoming" and state["status"] == "running":
+        elif (state["status"] == "running"
+              and (state["source"] == "incoming" or state.get("_awaiting_file_settle"))):
             last_activity = float(state.get("_last_activity_monotonic", now))
             if now - last_activity >= INCOMING_DOWNLOAD_MONITOR_SETTLE_SECONDS:
                 state.update({
                     "status": "completed", "progress": "Descarga finalizada.",
                     "completed_at": datetime.now(timezone.utc).isoformat(), "exit_code": 0,
+                    "_awaiting_file_settle": False,
                 })
         return dict(state)
 
@@ -2893,7 +2904,7 @@ def start_nas_catalog_download() -> dict[str, object]:
             "current_file": None,
             "current_bytes": 0, "current_path": None, "source": "app",
             "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": None,
-            "exit_code": None, "error": None,
+            "exit_code": None, "error": None, "_awaiting_file_settle": False,
         })
     INCOMING_MONITOR_WAKE.set()
     threading.Thread(target=_run_nas_download, args=(job_id,), daemon=True,

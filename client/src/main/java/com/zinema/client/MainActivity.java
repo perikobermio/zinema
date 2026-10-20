@@ -5264,7 +5264,7 @@ public class MainActivity extends Activity {
             case "Iniciar descarga": return "Deskarga hasi";
             case "Listo para descargar.": return "Deskargatzeko prest.";
             case "Iniciando descarga…": return "Deskarga hasten…";
-            case "Descarga en curso…": return "Deskarga egiten…";
+            case "Descarga en curso…": return "Deskarga martxan…";
             case "Descargando archivo: ": return "Fitxategia deskargatzen: ";
             case "Descarga detectada en Incoming…": return "Deskarga bat detektatu da Incoming-en…";
             case "Descarga finalizada.": return "Deskarga amaitu da.";
@@ -6410,6 +6410,7 @@ public class MainActivity extends Activity {
         boolean active = "starting".equals(stateName) || "running".equals(stateName);
         progress.setVisibility(active ? View.VISIBLE : View.GONE);
         start.setEnabled(!active);
+        start.setText(t(active ? "Descarga en curso…" : "Iniciar descarga"));
         if ("starting".equals(stateName)) status.setText(t("Iniciando descarga…"));
         else if ("running".equals(stateName)) {
             String currentFile = state.optString("current_file", "").trim();
@@ -6441,6 +6442,7 @@ public class MainActivity extends Activity {
 
     void startNasDownload(TextView status, ProgressBar progress, Button start) {
         start.setEnabled(false);
+        start.setText(t("Descarga en curso…"));
         progress.setVisibility(View.VISIBLE);
         status.setText(t("Iniciando descarga…"));
         io.execute(() -> {
@@ -6465,6 +6467,7 @@ public class MainActivity extends Activity {
                     if (!showingAdmin || status.getParent() == null) return;
                     progress.setVisibility(View.GONE);
                     start.setEnabled(true);
+                    start.setText(t("Iniciar descarga"));
                     status.setText(t("No se pudo iniciar la descarga: ") + message);
                 });
             }
