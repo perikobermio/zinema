@@ -59,8 +59,15 @@ SYNC_RETRY_LOCK = threading.Lock()
 SYNC_RETRY_SCHEDULED = False
 INCOMING_MOVE_LOCK = threading.Lock()
 NAS_DOWNLOAD_LOCK = threading.Lock()
+INCOMING_SCAN_LOCK = threading.Lock()
+INCOMING_ACTIVITY_LOCK = threading.Lock()
+INCOMING_ACTIVITY_SNAPSHOT: dict[str, dict[str, object]] = {}
+INCOMING_ACTIVE_PATHS: set[str] = set()
+INCOMING_MONITOR_STARTED = False
+INCOMING_MONITOR_SETTLE_SECONDS = 18.0
 NAS_DOWNLOAD_STATE: dict[str, object] = {
     "id": None, "status": "idle", "progress": "", "current_file": None, "started_at": None,
+    "current_bytes": 0, "current_path": None, "source": None,
     "completed_at": None, "exit_code": None, "error": None,
 }
 METADATA_RETRY_LOCK = threading.Lock()
@@ -1042,6 +1049,8 @@ def _incoming_poster_url(connection: sqlite3.Connection, guess: dict[str, object
 def _incoming_entries(connection: sqlite3.Connection) -> list[dict[str, object]]:
     if not INCOMING_ROOT.is_dir():
         raise HTTPException(status_code=503, detail="Incoming folder is not mounted")
+    with INCOMING_ACTIVITY_LOCK:
+        active_paths = set(INCOMING_ACTIVE_PATHS)
     entries: list[dict[str, object]] = []
     for path in sorted(INCOMING_ROOT.rglob("*"), key=lambda item: item.as_posix().casefold()):
         try:
@@ -1049,6 +1058,8 @@ def _incoming_entries(connection: sqlite3.Connection) -> list[dict[str, object]]
                 continue
             resolved = path.resolve(strict=True)
             relative = resolved.relative_to(INCOMING_ROOT)
+            if relative.as_posix() in active_paths:
+                continue
             stat = resolved.stat()
         except (OSError, ValueError):
             continue
@@ -1277,6 +1288,146 @@ def _download_filename_from_output(line: str) -> str | None:
     return filename if Path(filename).suffix.lower() in VIDEO_EXTENSIONS else None
 
 
+def _incoming_download_candidate(path: Path) -> tuple[str, str] | None:
+    suffix = path.suffix.lower()
+    if suffix in VIDEO_EXTENSIONS:
+        return path.name, suffix
+    if suffix in {".part", ".tmp", ".download"} and Path(path.stem).suffix.lower() in VIDEO_EXTENSIONS:
+        return Path(path.stem).name, Path(path.stem).suffix.lower()
+    return None
+
+
+def _scan_incoming_download_activity() -> dict[str, object] | None:
+    with INCOMING_SCAN_LOCK:
+        return _scan_incoming_download_activity_impl()
+
+
+def _scan_incoming_download_activity_impl() -> dict[str, object] | None:
+    if not INCOMING_ROOT.is_dir():
+        with NAS_DOWNLOAD_LOCK:
+            return dict(NAS_DOWNLOAD_STATE)
+    now = time.monotonic()
+    wall_now = time.time()
+    with INCOMING_ACTIVITY_LOCK:
+        previous_snapshot = dict(INCOMING_ACTIVITY_SNAPSHOT)
+    current: dict[str, dict[str, object]] = {}
+    active: list[dict[str, object]] = []
+    try:
+        files = INCOMING_ROOT.rglob("*") if INCOMING_ROOT.is_dir() else ()
+        for path in files:
+            if path.is_symlink():
+                continue
+            candidate = _incoming_download_candidate(path)
+            if candidate is None or not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+                relative = path.relative_to(INCOMING_ROOT).as_posix()
+            except (OSError, ValueError):
+                continue
+            display_name, _ = candidate
+            previous = previous_snapshot.get(relative)
+            changed = previous is not None and (
+                previous.get("size") != stat.st_size or previous.get("mtime_ns") != stat.st_mtime_ns
+            )
+            first_seen = float(previous["first_seen"]) if previous else now
+            last_change = now if changed else (float(previous["last_change"]) if previous else now)
+            has_changed = bool(previous and (previous.get("has_changed") or changed))
+            snapshot = {
+                "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+                "first_seen": first_seen, "last_change": last_change,
+                "has_changed": has_changed, "filename": display_name,
+            }
+            current[relative] = snapshot
+            file_age = max(0.0, wall_now - stat.st_mtime)
+            provisional = (previous is None and now - first_seen < 5 and file_age < 12)
+            is_active = ((has_changed and now - last_change < INCOMING_DOWNLOAD_MONITOR_SETTLE_SECONDS)
+                         or provisional)
+            if is_active:
+                active.append({
+                    "path": relative, "filename": display_name,
+                    "size": stat.st_size, "last_change": last_change,
+                })
+    except OSError:
+        active = []
+
+    active_path_names = {str(item["path"]) for item in active}
+    with INCOMING_ACTIVITY_LOCK:
+        INCOMING_ACTIVITY_SNAPSHOT.clear()
+        INCOMING_ACTIVITY_SNAPSHOT.update(current)
+        INCOMING_ACTIVE_PATHS.clear()
+        INCOMING_ACTIVE_PATHS.update(active_path_names)
+
+    current_file = max(active, key=lambda item: float(item["last_change"])) if active else None
+    with NAS_DOWNLOAD_LOCK:
+        state = NAS_DOWNLOAD_STATE
+        app_download_active = (state["source"] == "app"
+                               and state["status"] in {"starting", "running"})
+        app_download_recently_finished = (state["source"] == "app"
+                                          and state["status"] in {"completed", "failed"}
+                                          and state.get("current_path") in active_path_names)
+        if current_file and (app_download_active or app_download_recently_finished):
+            state.update({
+                "current_file": current_file["filename"], "current_bytes": current_file["size"],
+                "current_path": current_file["path"],
+            })
+        elif current_file:
+            if state["source"] != "incoming" or state["status"] != "running":
+                state.update({
+                    "id": f"incoming-{uuid4().hex}", "status": "running",
+                    "progress": "Descarga detectada en Incoming…",
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "completed_at": None, "exit_code": None, "error": None,
+                    "source": "incoming",
+                })
+            state.update({
+                "current_file": current_file["filename"], "current_bytes": current_file["size"],
+                "current_path": current_file["path"],
+            })
+            state["_last_activity_monotonic"] = now
+        elif state["source"] == "incoming" and state["status"] == "running":
+            last_activity = float(state.get("_last_activity_monotonic", now))
+            if now - last_activity >= INCOMING_DOWNLOAD_MONITOR_SETTLE_SECONDS:
+                state.update({
+                    "status": "completed", "progress": "Descarga finalizada.",
+                    "completed_at": datetime.now(timezone.utc).isoformat(), "exit_code": 0,
+                })
+        return dict(state)
+
+
+def _incoming_download_monitor_loop() -> None:
+    while True:
+        try:
+            _scan_incoming_download_activity()
+        except Exception:
+            pass
+        time.sleep(2)
+
+
+def _settle_app_download_files() -> None:
+    with INCOMING_SCAN_LOCK:
+        with INCOMING_ACTIVITY_LOCK:
+            now = time.monotonic()
+            for path in INCOMING_ROOT.rglob("*") if INCOMING_ROOT.is_dir() else ():
+                if path.is_symlink() or not path.is_file() or _incoming_download_candidate(path) is None:
+                    continue
+                try:
+                    stat = path.stat()
+                    relative = path.relative_to(INCOMING_ROOT).as_posix()
+                except (OSError, ValueError):
+                    continue
+                snapshot = INCOMING_ACTIVITY_SNAPSHOT.get(relative)
+                if snapshot is None:
+                    snapshot = {"first_seen": now, "filename": path.name}
+                    INCOMING_ACTIVITY_SNAPSHOT[relative] = snapshot
+                snapshot.update({
+                    "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+                    "has_changed": False,
+                    "last_change": now - INCOMING_DOWNLOAD_MONITOR_SETTLE_SECONDS,
+                })
+            INCOMING_ACTIVE_PATHS.clear()
+
+
 def _run_nas_download(job_id: str) -> None:
     try:
         process = subprocess.Popen(
@@ -1299,6 +1450,7 @@ def _run_nas_download(job_id: str) -> None:
                         values["current_file"] = filename
                     _update_nas_download_state(**values)
         exit_code = process.wait()
+        _settle_app_download_files()
         completed_at = datetime.now(timezone.utc).isoformat()
         if exit_code == 0:
             _update_nas_download_state(
@@ -1442,7 +1594,7 @@ def _sync_job_payload(row: sqlite3.Row) -> SyncJob:
 
 @app.on_event("startup")
 def initialize_database() -> None:
-    global SCHEDULER_STARTED
+    global SCHEDULER_STARTED, INCOMING_MONITOR_STARTED
     age_rating_backfill_pending = False
     with closing(database()) as connection:
         for row in connection.execute("SELECT id, genres FROM catalog_nodes WHERE genres!='[]'").fetchall():
@@ -1466,6 +1618,10 @@ def initialize_database() -> None:
     if not SCHEDULER_STARTED:
         threading.Thread(target=_daily_sync_loop, daemon=True, name="zinema-daily-sync").start()
         SCHEDULER_STARTED = True
+    if not INCOMING_MONITOR_STARTED:
+        threading.Thread(target=_incoming_download_monitor_loop, daemon=True,
+                         name="zinema-incoming-download-monitor").start()
+        INCOMING_MONITOR_STARTED = True
 
 
 @app.get("/health")
@@ -2701,6 +2857,7 @@ def get_episode_poster(item_id: str):
 
 @app.get("/api/v1/admin/incoming", dependencies=[Depends(require_admin)])
 def list_incoming_videos() -> list[dict[str, object]]:
+    _scan_incoming_download_activity()
     with closing(database()) as connection:
         return _incoming_entries(connection)
 
@@ -2710,6 +2867,7 @@ def list_incoming_videos() -> list[dict[str, object]]:
 def start_nas_catalog_download() -> dict[str, object]:
     if not NAS_DOWNLOADER_SCRIPT.is_file():
         raise HTTPException(status_code=503, detail="NAS downloader script is not mounted")
+    _scan_incoming_download_activity()
     with NAS_DOWNLOAD_LOCK:
         if NAS_DOWNLOAD_STATE["status"] in {"starting", "running"}:
             raise HTTPException(status_code=409, detail="A NAS download is already running")
@@ -2717,6 +2875,7 @@ def start_nas_catalog_download() -> dict[str, object]:
         NAS_DOWNLOAD_STATE.update({
             "id": job_id, "status": "starting", "progress": "Iniciando descarga…",
             "current_file": None,
+            "current_bytes": 0, "current_path": None, "source": "app",
             "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": None,
             "exit_code": None, "error": None,
         })
@@ -2728,13 +2887,16 @@ def start_nas_catalog_download() -> dict[str, object]:
 @app.get("/api/v1/admin/incoming-download", dependencies=[Depends(require_admin)])
 def get_nas_catalog_download() -> dict[str, object]:
     with NAS_DOWNLOAD_LOCK:
-        return dict(NAS_DOWNLOAD_STATE)
+        payload = {key: value for key, value in NAS_DOWNLOAD_STATE.items()
+                   if not key.startswith("_")}
+        return payload
 
 
 @app.post("/api/v1/admin/incoming/{file_id}/generate", status_code=200,
           dependencies=[Depends(require_admin)])
 def generate_incoming_destination(file_id: str,
                                   request: IncomingGenerateRequest) -> dict[str, object]:
+    _scan_incoming_download_activity()
     if not INCOMING_MOVE_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Another incoming file is being moved")
     try:

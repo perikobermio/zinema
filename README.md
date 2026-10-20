@@ -44,7 +44,7 @@ Requisitos: Docker Engine con Docker Compose v2, `curl` y acceso de lectura y es
    docker compose logs -f zinema
    ```
 
-El NAS y SQLite se montan de forma persistente en `./data`. Las bibliotecas, Incoming y la carpeta de sesión/script de Telegram necesitan permisos de escritura. En Administración, la tarjeta de descarga inicia `python /d/NAS/scripts/telegram_download.py --force`, muestra su salida y, al terminar, detecta automáticamente los nuevos vídeos en Incoming. «Gestión de Incoming» permite revisar la ruta propuesta y mover cada fichero. La API está en el puerto `8180` del host.
+El NAS y SQLite se montan de forma persistente en `./data`. Las bibliotecas, Incoming y la carpeta de sesión/script de Telegram necesitan permisos de escritura. En Administración, la tarjeta de descarga inicia `python /d/NAS/scripts/telegram_download.py --force`, muestra su salida y el servidor vigila Incoming para detectar ficheros cuyo tamaño o fecha de modificación cambian, incluso si la descarga se inició fuera de Zinema. Mientras detecta actividad bloquea otro inicio y oculta ese fichero de la lista para evitar moverlo a medio descargar; cuando se estabiliza, actualiza la lista. La tarjeta muestra el nombre y tamaño actual si puede identificar el fichero. «Gestión de Incoming» permite revisar la ruta propuesta y mover cada fichero. La API está en el puerto `8180` del host.
 
 ### Crear la cuenta administradora inicial
 

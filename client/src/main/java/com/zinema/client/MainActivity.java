@@ -5266,6 +5266,7 @@ public class MainActivity extends Activity {
             case "Iniciando descarga…": return "Deskarga hasten…";
             case "Descarga en curso…": return "Deskarga egiten…";
             case "Descargando archivo: ": return "Fitxategia deskargatzen: ";
+            case "Descarga detectada en Incoming…": return "Deskarga bat detektatu da Incoming-en…";
             case "Descarga finalizada.": return "Deskarga amaitu da.";
             case "Descarga finalizada; buscando vídeos en Incoming…":
                 return "Deskarga amaitu da; Incoming-eko bideoak bilatzen…";
@@ -6413,9 +6414,14 @@ public class MainActivity extends Activity {
         else if ("running".equals(stateName)) {
             String currentFile = state.optString("current_file", "").trim();
             String output = state.optString("progress", "").trim();
-            status.setText(currentFile.isEmpty()
-                    ? (output.isEmpty() ? t("Descarga en curso…") : output)
-                    : t("Descargando archivo: ") + currentFile);
+            if (!currentFile.isEmpty()) {
+                long bytes = state.optLong("current_bytes", 0);
+                String size = bytes > 0 ? String.format(java.util.Locale.US, " · %.1f MB",
+                        bytes / (1024.0 * 1024.0)) : "";
+                status.setText(t("Descargando archivo: ") + currentFile + size);
+            } else if ("incoming".equals(state.optString("source")))
+                status.setText(t("Descarga detectada en Incoming…"));
+            else status.setText(output.isEmpty() ? t("Descarga en curso…") : output);
         } else if ("completed".equals(stateName)) {
             String completedId = state.optString("id", "");
             if (notifyCompletion && !completedId.isEmpty()
