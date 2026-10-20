@@ -12,6 +12,7 @@ services:
       MOVIES_DISPLAY_ROOT: ${MOVIES_PATH:?Set MOVIES_PATH to the mounted NAS movies folder}
       SERIES_DISPLAY_ROOT: ${SERIES_PATH:?Set SERIES_PATH to the mounted NAS series folder}
       INCOMING_DISPLAY_ROOT: ${INCOMING_PATH:-/d/NAS/Incoming}
+      NAS_SCRIPTS_ROOT: ${NAS_SCRIPTS_PATH:-/d/NAS/scripts}
       DATABASE_PATH: /data/zinema.sqlite3
       TMDB_ACCESS_TOKEN: ${TMDB_ACCESS_TOKEN:-}
       TMDB_KEY: ${TMDB_KEY:-}
@@ -37,6 +38,16 @@ services:
       - type: bind
         source: ${INCOMING_PATH:-/d/NAS/Incoming}
         target: /incoming
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${INCOMING_PATH:-/d/NAS/Incoming}
+        target: ${INCOMING_PATH:-/d/NAS/Incoming}
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${NAS_SCRIPTS_PATH:-/d/NAS/scripts}
+        target: ${NAS_SCRIPTS_PATH:-/d/NAS/scripts}
         bind:
           create_host_path: false
       - ./data:/data

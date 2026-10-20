@@ -33,7 +33,7 @@ Requisitos: Docker Engine con Docker Compose v2, `curl` y acceso de lectura y es
    nano .env
    ```
 
-2. Configura `MOVIES_PATH`, `SERIES_PATH` e `INCOMING_PATH` (por defecto `/d/NAS/Incoming`). Incoming es la carpeta donde llegan las descargas. Para TMDb puedes guardar la **API Key v3** en `TMDB_KEY` o el **API Read Access Token** en `TMDB_ACCESS_TOKEN`; basta con configurar uno. No subas estas credenciales a Git. `TMDB_LANGUAGE` controla el idioma preferido de los resultados; por defecto es `es-ES`.
+2. Configura `MOVIES_PATH`, `SERIES_PATH`, `INCOMING_PATH` (por defecto `/d/NAS/Incoming`) y `NAS_SCRIPTS_PATH` (por defecto `/d/NAS/scripts`). Incoming es la carpeta donde llegan las descargas. El script `telegram_download.py` debe existir dentro de `NAS_SCRIPTS_PATH`; el contenedor monta esa carpeta y Incoming en sus rutas del NAS para lanzar la descarga con la sesión existente. Para TMDb puedes guardar la **API Key v3** en `TMDB_KEY` o el **API Read Access Token** en `TMDB_ACCESS_TOKEN`; basta con configurar uno. No subas estas credenciales a Git. `TMDB_LANGUAGE` controla el idioma preferido de los resultados; por defecto es `es-ES`.
 
 3. Valida las rutas y arranca el servidor:
 
@@ -44,7 +44,7 @@ Requisitos: Docker Engine con Docker Compose v2, `curl` y acceso de lectura y es
    docker compose logs -f zinema
    ```
 
-El NAS y SQLite se montan de forma persistente en `./data`. Las bibliotecas y Incoming necesitan permisos de escritura para que la administración pueda mover los vídeos. En Administración, «Gestión de Incoming» detecta archivos de vídeo, propone una ruta para películas o episodios y permite editarla antes de moverlos. La API está en el puerto `8180` del host.
+El NAS y SQLite se montan de forma persistente en `./data`. Las bibliotecas, Incoming y la carpeta de sesión/script de Telegram necesitan permisos de escritura. En Administración, la tarjeta de descarga inicia `python /d/NAS/scripts/telegram_download.py --force`, muestra su salida y, al terminar, detecta automáticamente los nuevos vídeos en Incoming. «Gestión de Incoming» permite revisar la ruta propuesta y mover cada fichero. La API está en el puerto `8180` del host.
 
 ### Crear la cuenta administradora inicial
 

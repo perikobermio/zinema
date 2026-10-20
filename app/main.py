@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import unicodedata
@@ -40,6 +41,8 @@ MEDIA_DISPLAY_ROOTS = {
     "series": Path(os.getenv("SERIES_DISPLAY_ROOT", "/d/NAS/Serijek")).resolve(),
 }
 INCOMING_DISPLAY_ROOT = Path(os.getenv("INCOMING_DISPLAY_ROOT", "/d/NAS/Incoming")).resolve()
+NAS_SCRIPTS_ROOT = Path(os.getenv("NAS_SCRIPTS_ROOT", "/d/NAS/scripts")).resolve()
+NAS_DOWNLOADER_SCRIPT = NAS_SCRIPTS_ROOT / "telegram_download.py"
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/zinema.sqlite3"))
 TMDB_ACCESS_TOKEN = os.getenv("TMDB_ACCESS_TOKEN", "")
 TMDB_KEY = os.getenv("TMDB_KEY", "") if not TMDB_ACCESS_TOKEN else ""
@@ -55,6 +58,11 @@ SYNC_LOCK = threading.Lock()
 SYNC_RETRY_LOCK = threading.Lock()
 SYNC_RETRY_SCHEDULED = False
 INCOMING_MOVE_LOCK = threading.Lock()
+NAS_DOWNLOAD_LOCK = threading.Lock()
+NAS_DOWNLOAD_STATE: dict[str, object] = {
+    "id": None, "status": "idle", "progress": "", "started_at": None,
+    "completed_at": None, "exit_code": None, "error": None,
+}
 METADATA_RETRY_LOCK = threading.Lock()
 METADATA_RETRY_LAST_REQUEST: dict[str, float] = {}
 METADATA_RETRY_COOLDOWN_SECONDS = 60
@@ -1240,6 +1248,47 @@ def _schedule_sync_when_available() -> bool:
 
     threading.Thread(target=retry, daemon=True, name="zinema-incoming-sync-retry").start()
     return True
+
+
+def _update_nas_download_state(**values: object) -> None:
+    with NAS_DOWNLOAD_LOCK:
+        NAS_DOWNLOAD_STATE.update(values)
+
+
+def _run_nas_download(job_id: str) -> None:
+    try:
+        process = subprocess.Popen(
+            ["python", "-u", str(NAS_DOWNLOADER_SCRIPT), "--force"],
+            cwd=str(NAS_SCRIPTS_ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        _update_nas_download_state(status="running", started_at=datetime.now(timezone.utc).isoformat())
+        if process.stdout is not None:
+            for line in process.stdout:
+                progress = line.strip()
+                if progress:
+                    _update_nas_download_state(progress=progress[-300:])
+        exit_code = process.wait()
+        completed_at = datetime.now(timezone.utc).isoformat()
+        if exit_code == 0:
+            _update_nas_download_state(
+                status="completed", completed_at=completed_at, exit_code=exit_code,
+                error=None, progress="Descarga finalizada.",
+            )
+        else:
+            _update_nas_download_state(
+                status="failed", completed_at=completed_at, exit_code=exit_code,
+                error=f"El script terminó con código {exit_code}.",
+            )
+    except Exception as exc:
+        _update_nas_download_state(
+            status="failed", completed_at=datetime.now(timezone.utc).isoformat(),
+            exit_code=None, error=str(exc)[:500],
+        )
 
 
 def _metadata_retry_targets(connection: sqlite3.Connection, node_id: str) -> list[str]:
@@ -2628,6 +2677,31 @@ def get_episode_poster(item_id: str):
 def list_incoming_videos() -> list[dict[str, object]]:
     with closing(database()) as connection:
         return _incoming_entries(connection)
+
+
+@app.post("/api/v1/admin/incoming-download", status_code=202,
+          dependencies=[Depends(require_admin)])
+def start_nas_catalog_download() -> dict[str, object]:
+    if not NAS_DOWNLOADER_SCRIPT.is_file():
+        raise HTTPException(status_code=503, detail="NAS downloader script is not mounted")
+    with NAS_DOWNLOAD_LOCK:
+        if NAS_DOWNLOAD_STATE["status"] in {"starting", "running"}:
+            raise HTTPException(status_code=409, detail="A NAS download is already running")
+        job_id = uuid4().hex
+        NAS_DOWNLOAD_STATE.update({
+            "id": job_id, "status": "starting", "progress": "Iniciando descarga…",
+            "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": None,
+            "exit_code": None, "error": None,
+        })
+    threading.Thread(target=_run_nas_download, args=(job_id,), daemon=True,
+                     name=f"nas-download-{job_id[:8]}").start()
+    return {"id": job_id, "status": "starting"}
+
+
+@app.get("/api/v1/admin/incoming-download", dependencies=[Depends(require_admin)])
+def get_nas_catalog_download() -> dict[str, object]:
+    with NAS_DOWNLOAD_LOCK:
+        return dict(NAS_DOWNLOAD_STATE)
 
 
 @app.post("/api/v1/admin/incoming/{file_id}/generate", status_code=200,

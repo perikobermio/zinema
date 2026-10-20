@@ -111,9 +111,11 @@ public class MainActivity extends Activity {
     static final long IMAGE_DISK_CACHE_MAX_BYTES = 160L * 1024L * 1024L;
     final ExecutorService io = Executors.newFixedThreadPool(4);
     final Handler adminSyncHandler = new Handler(Looper.getMainLooper());
+    final Handler nasDownloadHandler = new Handler(Looper.getMainLooper());
     final Handler contentRequestSearchHandler = new Handler(Looper.getMainLooper());
     Runnable contentRequestSearchTask;
     Runnable adminSyncPollTask;
+    Runnable nasDownloadPollTask;
     final LruCache<String, Bitmap> imageCache = new LruCache<String, Bitmap>(bitmapCacheBytes()) {
         @Override protected int sizeOf(String key, Bitmap value) {
             return Math.max(1, value.getAllocationByteCount());
@@ -5255,6 +5257,21 @@ public class MainActivity extends Activity {
             case "Revisa la dirección y el nombre del servidor.":
                 return "Egiaztatu zerbitzariaren helbidea eta izena.";
             case "Idioma de la aplicación": return "Aplikazioaren hizkuntza";
+            case "Descarga desde Telegram": return "Telegram bidez deskargatu";
+            case "Ejecuta la descarga de Telegram y muestra el progreso.":
+                return "Telegram deskarga hasi eta aurrerapena erakusten du.";
+            case "Iniciar descarga": return "Deskarga hasi";
+            case "Listo para descargar.": return "Deskargatzeko prest.";
+            case "Iniciando descarga…": return "Deskarga hasten…";
+            case "Descarga en curso…": return "Deskarga egiten…";
+            case "Descarga finalizada.": return "Deskarga amaitu da.";
+            case "Descarga finalizada; buscando vídeos en Incoming…":
+                return "Deskarga amaitu da; Incoming-eko bideoak bilatzen…";
+            case "Descarga finalizada; vídeos detectados en Incoming: ":
+                return "Deskarga amaitu da; Incoming-en aurkitutako bideoak: ";
+            case "Descarga fallida: ": return "Deskargak huts egin du: ";
+            case "No se pudo iniciar la descarga: ": return "Ezin izan da deskarga hasi: ";
+            case "Descarga/script no disponible.": return "Deskarga-script-a ez dago erabilgarri.";
             case "Sincronización del catálogo": return "Katalogoa sinkronizatzea";
             case "Escanea las carpetas del NAS y vuelve a obtener metadata.":
                 return "NASeko karpetak eskaneatu eta metadatuak berriro lortzen ditu.";
@@ -6251,41 +6268,20 @@ public class MainActivity extends Activity {
         introP.bottomMargin = d(20);
         screen.addView(intro, introP);
 
-        LinearLayout playerCard = settingsCard();
-        LinearLayout.LayoutParams playerCardParams = new LinearLayout.LayoutParams(-1, -2);
-        playerCardParams.bottomMargin = d(14);
-        screen.addView(playerCard, playerCardParams);
-        playerCard.addView(label("Reproductor", 14, Color.WHITE, true));
-        TextView playerHint = label("VLC devuelve posición y duración al terminar. El reproductor de Zinema incluye controles y guarda el progreso mientras ves el vídeo.",
-                12, MUTED, false);
-        LinearLayout.LayoutParams playerHintParams = new LinearLayout.LayoutParams(-1, -2);
-        playerHintParams.topMargin = d(5);
-        playerCard.addView(playerHint, playerHintParams);
-        RadioGroup playerGroup = new RadioGroup(this);
-        playerGroup.setOrientation(RadioGroup.VERTICAL);
-        LinearLayout.LayoutParams playerGroupParams = new LinearLayout.LayoutParams(-1, -2);
-        playerGroupParams.topMargin = d(8);
-        playerCard.addView(playerGroup, playerGroupParams);
-        RadioButton zinemaPlayer = settingsRadio("Reproductor de Zinema", "builtin".equals(prefs.getString("player", "vlc")));
-        zinemaPlayer.setId(View.generateViewId());
-        playerGroup.addView(zinemaPlayer);
-        RadioButton vlcPlayer = settingsRadio("VLC", "vlc".equals(prefs.getString("player", "vlc")));
-        vlcPlayer.setId(View.generateViewId());
-        playerGroup.addView(vlcPlayer);
-        playerGroup.setOnCheckedChangeListener((group, checkedId) -> {
-            String choice = checkedId == vlcPlayer.getId() ? "vlc" : "builtin";
-            prefs.edit().putString("player", choice).apply();
-            Toast.makeText(this, choice.equals("vlc")
-                    ? t("Se usará VLC. Si no está instalado, se abrirá el reproductor de Zinema.")
-                    : t("Se usará el reproductor de Zinema."), Toast.LENGTH_SHORT).show();
-        });
-
+        LinearLayout topAdminRow = new LinearLayout(this);
+        topAdminRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams topAdminRowParams = new LinearLayout.LayoutParams(-1, -2);
+        screen.addView(topAdminRow, topAdminRowParams);
+        LinearLayout downloadSlot = new LinearLayout(this);
+        downloadSlot.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams downloadSlotParams = new LinearLayout.LayoutParams(0, -2, 1);
+        topAdminRow.addView(downloadSlot, downloadSlotParams);
         LinearLayout syncSlot = new LinearLayout(this);
         syncSlot.setOrientation(LinearLayout.VERTICAL);
         syncSlot.setVisibility(View.GONE);
-        LinearLayout.LayoutParams syncSlotParams = new LinearLayout.LayoutParams(-1, -2);
-        syncSlotParams.topMargin = d(14);
-        screen.addView(syncSlot, syncSlotParams);
+        LinearLayout.LayoutParams syncSlotParams = new LinearLayout.LayoutParams(0, -2, 1);
+        syncSlotParams.leftMargin = d(10);
+        topAdminRow.addView(syncSlot, syncSlotParams);
 
         LinearLayout requestsSlot = new LinearLayout(this);
         requestsSlot.setOrientation(LinearLayout.VERTICAL);
@@ -6319,14 +6315,210 @@ public class MainActivity extends Activity {
         spanish.setOnClickListener(v -> changeLanguage("es"));
         basque.setOnClickListener(v -> changeLanguage("eu"));
 
+        LinearLayout playerCard = settingsCard();
+        LinearLayout.LayoutParams playerCardParams = new LinearLayout.LayoutParams(-1, -2);
+        playerCardParams.topMargin = d(14);
+        screen.addView(playerCard, playerCardParams);
+        playerCard.addView(label("Reproductor", 14, Color.WHITE, true));
+        TextView playerHint = label("VLC devuelve posición y duración al terminar. El reproductor de Zinema incluye controles y guarda el progreso mientras ves el vídeo.",
+                12, MUTED, false);
+        LinearLayout.LayoutParams playerHintParams = new LinearLayout.LayoutParams(-1, -2);
+        playerHintParams.topMargin = d(5);
+        playerCard.addView(playerHint, playerHintParams);
+        RadioGroup playerGroup = new RadioGroup(this);
+        playerGroup.setOrientation(RadioGroup.VERTICAL);
+        LinearLayout.LayoutParams playerGroupParams = new LinearLayout.LayoutParams(-1, -2);
+        playerGroupParams.topMargin = d(8);
+        playerCard.addView(playerGroup, playerGroupParams);
+        RadioButton zinemaPlayer = settingsRadio("Reproductor de Zinema", "builtin".equals(prefs.getString("player", "vlc")));
+        zinemaPlayer.setId(View.generateViewId());
+        playerGroup.addView(zinemaPlayer);
+        RadioButton vlcPlayer = settingsRadio("VLC", "vlc".equals(prefs.getString("player", "vlc")));
+        vlcPlayer.setId(View.generateViewId());
+        playerGroup.addView(vlcPlayer);
+        playerGroup.setOnCheckedChangeListener((group, checkedId) -> {
+            String choice = checkedId == vlcPlayer.getId() ? "vlc" : "builtin";
+            prefs.edit().putString("player", choice).apply();
+            Toast.makeText(this, choice.equals("vlc")
+                    ? t("Se usará VLC. Si no está instalado, se abrirá el reproductor de Zinema.")
+                    : t("Se usará el reproductor de Zinema."), Toast.LENGTH_SHORT).show();
+        });
+
         TextView attribution = label("This product uses the TMDB API but is not endorsed or certified by TMDB.",
                 11, MUTED, false);
         attribution.setPadding(d(2), d(16), d(2), 0);
         screen.addView(attribution);
         content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
+        loadNasDownloadControls(downloadSlot);
         loadAdminSyncControls(syncSlot);
         loadContentRequestControls(requestsSlot);
         loadIncomingControls(incomingSlot);
+    }
+
+    void loadNasDownloadControls(LinearLayout slot) {
+        io.execute(() -> {
+            try {
+                JSONObject account = getJson("/api/v1/auth/me");
+                if (!account.optBoolean("is_admin")) return;
+                JSONObject state = null;
+                String loadError = "";
+                try { state = getJson("/api/v1/admin/incoming-download"); }
+                catch (Exception e) { loadError = e.getMessage() == null ? "" : e.getMessage(); }
+                JSONObject loadedState = state;
+                String error = loadError;
+                runOnUiThread(() -> buildNasDownloadControls(slot, loadedState, error));
+            } catch (Exception ignored) { }
+        });
+    }
+
+    void buildNasDownloadControls(LinearLayout slot, JSONObject state, String loadError) {
+        if (slot == null || !showingAdmin || slot.getParent() == null) return;
+        slot.removeAllViews();
+        slot.setVisibility(View.VISIBLE);
+        LinearLayout card = settingsCard();
+        slot.addView(card);
+        card.addView(label(t("Descarga desde Telegram"), 15, Color.WHITE, true));
+        TextView hint = label(t("Ejecuta la descarga de Telegram y muestra el progreso."),
+                11, MUTED, false);
+        LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(-1, -2);
+        hintParams.topMargin = d(5);
+        card.addView(hint, hintParams);
+        ProgressBar progress = new ProgressBar(this);
+        progress.setIndeterminate(true);
+        LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(-1, d(4));
+        progressParams.topMargin = d(10);
+        card.addView(progress, progressParams);
+        TextView status = label(t(loadError.isEmpty() ? "Listo para descargar." : "Descarga/script no disponible."),
+                11, MUTED, false);
+        status.setTag("nas-download-status");
+        status.setMaxLines(3);
+        LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(-1, -2);
+        statusParams.topMargin = d(8);
+        card.addView(status, statusParams);
+        Button start = actionButton(t("Iniciar descarga"), true);
+        start.setTag("nas-download-start");
+        LinearLayout.LayoutParams startParams = new LinearLayout.LayoutParams(-1, d(42));
+        startParams.topMargin = d(10);
+        card.addView(start, startParams);
+        start.setOnClickListener(v -> startNasDownload(status, progress, start));
+
+        if (state != null) {
+            boolean active = applyNasDownloadState(state, status, progress, start, false);
+            String jobId = state.optString("id", "");
+            if (active && !jobId.isEmpty()) pollNasDownload(jobId, status, progress, start);
+        } else {
+            progress.setVisibility(View.GONE);
+            start.setEnabled(loadError.isEmpty());
+        }
+    }
+
+    boolean applyNasDownloadState(JSONObject state, TextView status, ProgressBar progress,
+                                  Button start, boolean notifyCompletion) {
+        String stateName = state.optString("status", "idle");
+        boolean active = "starting".equals(stateName) || "running".equals(stateName);
+        progress.setVisibility(active ? View.VISIBLE : View.GONE);
+        start.setEnabled(!active);
+        if ("starting".equals(stateName)) status.setText(t("Iniciando descarga…"));
+        else if ("running".equals(stateName)) {
+            String output = state.optString("progress", "").trim();
+            status.setText(output.isEmpty() ? t("Descarga en curso…") : output);
+        } else if ("completed".equals(stateName)) {
+            status.setText(t(notifyCompletion
+                    ? "Descarga finalizada; buscando vídeos en Incoming…"
+                    : "Descarga finalizada."));
+            if (notifyCompletion) refreshIncomingAfterDownload(status);
+        } else if ("failed".equals(stateName)) {
+            String detail = state.optString("error", "");
+            String output = state.optString("progress", "").trim();
+            if (!output.isEmpty()) detail += (detail.isEmpty() ? "" : " · ") + output;
+            status.setText(t("Descarga fallida: ") + detail);
+        } else status.setText(t("Listo para descargar."));
+        return active;
+    }
+
+    void startNasDownload(TextView status, ProgressBar progress, Button start) {
+        start.setEnabled(false);
+        progress.setVisibility(View.VISIBLE);
+        status.setText(t("Iniciando descarga…"));
+        io.execute(() -> {
+            try {
+                JSONObject started = postJson("/api/v1/admin/incoming-download", new JSONObject());
+                String jobId = started.optString("id", "");
+                if (jobId.isEmpty()) throw new Exception("El servidor no devolvió el ID de descarga.");
+                runOnUiThread(() -> pollNasDownload(jobId, status, progress, start));
+            } catch (Exception e) {
+                String message = e.getMessage() == null ? "" : e.getMessage();
+                if (message.contains("409")) {
+                    try {
+                        JSONObject current = getJson("/api/v1/admin/incoming-download");
+                        String jobId = current.optString("id", "");
+                        if (!jobId.isEmpty()) {
+                            runOnUiThread(() -> pollNasDownload(jobId, status, progress, start));
+                            return;
+                        }
+                    } catch (Exception ignored) { }
+                }
+                runOnUiThread(() -> {
+                    if (!showingAdmin || status.getParent() == null) return;
+                    progress.setVisibility(View.GONE);
+                    start.setEnabled(true);
+                    status.setText(t("No se pudo iniciar la descarga: ") + message);
+                });
+            }
+        });
+    }
+
+    void pollNasDownload(String jobId, TextView status, ProgressBar progress, Button start) {
+        if (!showingAdmin || status.getParent() == null) return;
+        io.execute(() -> {
+            try {
+                JSONObject state = getJson("/api/v1/admin/incoming-download");
+                runOnUiThread(() -> {
+                    if (!showingAdmin || status.getParent() == null) return;
+                    if (!jobId.equals(state.optString("id", ""))) return;
+                    boolean active = applyNasDownloadState(state, status, progress, start, true);
+                    if (active) scheduleNasDownloadPoll(jobId, status, progress, start);
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (!showingAdmin || status.getParent() == null) return;
+                    status.setText(t("No se pudo consultar el estado") + ": " + e.getMessage());
+                    scheduleNasDownloadPoll(jobId, status, progress, start);
+                });
+            }
+        });
+    }
+
+    void scheduleNasDownloadPoll(String jobId, TextView status, ProgressBar progress, Button start) {
+        if (nasDownloadPollTask != null) nasDownloadHandler.removeCallbacks(nasDownloadPollTask);
+        nasDownloadPollTask = () -> {
+            nasDownloadPollTask = null;
+            pollNasDownload(jobId, status, progress, start);
+        };
+        nasDownloadHandler.postDelayed(nasDownloadPollTask, 1500);
+    }
+
+    void refreshIncomingAfterDownload(TextView status) {
+        io.execute(() -> {
+            try {
+                JSONArray files = getArray("/api/v1/admin/incoming");
+                incomingFilesCache = files;
+                runOnUiThread(() -> {
+                    if (!showingAdmin) return;
+                    View rowsView = content == null ? null : content.findViewWithTag("incoming-rows");
+                    if (rowsView instanceof LinearLayout)
+                        renderIncomingVideos((LinearLayout) rowsView, files);
+                    if (status.getParent() != null)
+                        status.setText(t("Descarga finalizada; vídeos detectados en Incoming: ")
+                                + files.length());
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (status.getParent() != null)
+                        status.setText(t("Descarga finalizada; buscando vídeos en Incoming…"));
+                });
+            }
+        });
     }
 
     void loadIncomingControls(LinearLayout slot) {
