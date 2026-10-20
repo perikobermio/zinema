@@ -1384,7 +1384,10 @@ def _scan_incoming_download_activity_impl() -> dict[str, object] | None:
                 "current_file": current_file["filename"], "current_bytes": current_file["size"],
                 "current_path": current_file["path"],
             })
-            state["_last_activity_monotonic"] = now
+            last_file_change = float(current_file["last_change"])
+            state["_last_activity_monotonic"] = max(
+                float(state.get("_last_activity_monotonic", 0.0)), last_file_change,
+            )
         elif state["source"] == "incoming" and state["status"] == "running":
             last_activity = float(state.get("_last_activity_monotonic", now))
             if now - last_activity >= INCOMING_DOWNLOAD_MONITOR_SETTLE_SECONDS:
