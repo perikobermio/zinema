@@ -2368,7 +2368,7 @@ def get_catalog_recommendations(
         if tmdb_ids:
             rows = connection.execute(
                 f"""SELECT id, kind, tmdb_id, title, metadata_title,
-                           COALESCE(year, source_year) AS year, genres_json,
+                           COALESCE(year, source_year) AS year, genres AS genres_json,
                            age_limit, poster_file
                     FROM catalog_nodes WHERE available=1 AND kind=? AND tmdb_id IN ({placeholders})""",
                 (kind, *tmdb_ids),
