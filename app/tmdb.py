@@ -483,6 +483,7 @@ def get_candidate_details(kind: str, tmdb_id: int, access_token: str,
         "age_rating": age_rating,
         "poster_path": details.get("poster_path"),
         "backdrop_path": details.get("backdrop_path"),
+        "cast": _cast_payload(details),
         "seasons": ([{"season_number": int(item["season_number"]),
                       "name": item.get("name") or f"Season {item['season_number']}",
                       "episode_count": int(item.get("episode_count") or 0)}

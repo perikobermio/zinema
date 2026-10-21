@@ -2591,10 +2591,35 @@ def get_content_request_title(content_type: str, tmdb_id: int) -> dict[str, obje
     if not TMDB_CONFIGURED:
         raise HTTPException(status_code=503, detail="TMDb credentials are not configured")
     try:
-        return get_candidate_details(content_type, tmdb_id, TMDB_ACCESS_TOKEN,
-                                     TMDB_LANGUAGE, TMDB_KEY)
+        details = get_candidate_details(content_type, tmdb_id, TMDB_ACCESS_TOKEN,
+                                        TMDB_LANGUAGE, TMDB_KEY)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Could not load TMDb title: {str(exc)[:300]}") from None
+    title = str(details.get("metadata_title") or "").strip()
+    poster_path = details.get("poster_path")
+    backdrop_path = details.get("backdrop_path")
+    with closing(database()) as connection:
+        requested = connection.execute(
+            """SELECT 1 FROM content_requests
+               WHERE request_type='new_content' AND content_type=? AND tmdb_id=? LIMIT 1""",
+            (content_type, tmdb_id),
+        ).fetchone() is not None
+    return {
+        **details,
+        "id": f"tmdb-{content_type}-{tmdb_id}",
+        "kind": "movie" if content_type == "movie" else "series",
+        "title": title,
+        "display_title": title,
+        "library": "movies" if content_type == "movie" else "series",
+        "poster_url": (f"https://image.tmdb.org/t/p/w500{poster_path}"
+                       if isinstance(poster_path, str) and poster_path.startswith("/") else None),
+        "backdrop_url": (f"https://image.tmdb.org/t/p/w1280{backdrop_path}"
+                         if isinstance(backdrop_path, str) and backdrop_path.startswith("/") else None),
+        "children": [],
+        "files": [],
+        "is_external_recommendation": True,
+        "requested": requested,
+    }
 
 
 @app.post("/api/v1/content-requests", status_code=201,

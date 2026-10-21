@@ -160,6 +160,9 @@ public class MainActivity extends Activity {
     JSONObject currentDetailNode;
     String catalogVersion = "";
     int detailReturnScrollY;
+    JSONObject externalRecommendationReturnNode;
+    int externalRecommendationReturnScrollY;
+    String loadingExternalRecommendationId = "";
     int pendingListingRestoreY = -1;
     long lastCatalogVersionCheckMs;
     long lastProfileSyncMs;
@@ -4794,6 +4797,7 @@ public class MainActivity extends Activity {
         detailNodeId = node.optString("id");
         currentDetailNode = node;
         recommendationRows.clear();
+        boolean externalRecommendation = node.optBoolean("is_external_recommendation", false);
         if ("series".equals(node.optString("kind")) && isKidAllowedByGenres(node)) {
             JSONArray seasons = node.optJSONArray("children");
             if (seasons != null) for (int i = 0; i < seasons.length(); i++) {
@@ -4844,7 +4848,8 @@ public class MainActivity extends Activity {
         info.addView(labelRaw(displayTitle(node), 30, Color.WHITE, true));
         String year = cleanDisplayText(node.optString("year", ""));
         String genres = node.optJSONArray("genres") == null ? "" : cleanDisplayText(join(node.optJSONArray("genres")));
-        String meta = "series".equals(node.optString("kind")) ? cleanDisplayText(cardSubtitle(node))
+        String meta = "series".equals(node.optString("kind")) && !externalRecommendation
+                ? cleanDisplayText(cardSubtitle(node))
                 : year + (year.isEmpty() || genres.isEmpty() ? "" : "   •   ") + genres;
         if (!meta.isEmpty()) {
             TextView metadata = label(meta, 13, 0xFFD7D9DF, false);
@@ -4863,8 +4868,11 @@ public class MainActivity extends Activity {
         JSONArray files = node.optJSONArray("files");
         LinearLayout controls = new LinearLayout(this);
         controls.setGravity(Gravity.CENTER_VERTICAL);
-        Button play = actionButton("Reproducir", true);
-        controls.addView(play, new LinearLayout.LayoutParams(-2, d(44)));
+        Button primaryAction = actionButton(externalRecommendation
+                ? (node.optBoolean("requested") ? "Ya solicitado" : "Pedir contenido")
+                : "Reproducir", !node.optBoolean("requested"));
+        primaryAction.setEnabled(!externalRecommendation || !node.optBoolean("requested"));
+        controls.addView(primaryAction, new LinearLayout.LayoutParams(-2, d(44)));
         if ("movie".equals(node.optString("kind")) && files != null && files.length() > 0) {
             Button details = actionButton("ⓘ  " + t("Details"), false);
             LinearLayout.LayoutParams detailsParams = new LinearLayout.LayoutParams(-2, d(44));
@@ -4875,12 +4883,17 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams controlsP = new LinearLayout.LayoutParams(-1, -2);
         controlsP.topMargin = d(14);
         info.addView(controls, controlsP);
-        play.setOnClickListener(v -> {
-            if ("series".equals(node.optString("kind"))) playNextSeriesEpisode(node);
-            else playFirst(node);
-        });
+        if (externalRecommendation) {
+            primaryAction.setOnClickListener(v -> confirmRecommendationRequest(node, primaryAction));
+        } else {
+            primaryAction.setOnClickListener(v -> {
+                if ("series".equals(node.optString("kind"))) playNextSeriesEpisode(node);
+                else playFirst(node);
+            });
+        }
         banner.addView(info, new FrameLayout.LayoutParams(-1, -1));
-        banner.setOnLongClickListener(v -> { showActions(node); return true; });
+        if (!externalRecommendation)
+            banner.setOnLongClickListener(v -> { showActions(node); return true; });
         int heroHeight = contentScroller == null ? 0 : contentScroller.getHeight();
         if (heroHeight <= 0)
             heroHeight = getResources().getDisplayMetrics().heightPixels - d(116);
@@ -4888,7 +4901,8 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(-1, heroHeight);
         bp.setMargins(0, 0, 0, d(10));
         content.addView(banner, bp);
-        if (isTelevision()) play.post(() -> play.requestFocus());
+        if (isTelevision() && primaryAction.isEnabled())
+            primaryAction.post(() -> primaryAction.requestFocus());
 
         JSONArray children = node.optJSONArray("children");
         if ("series".equals(node.optString("kind")) && children != null && children.length() > 0) {
@@ -4897,7 +4911,8 @@ public class MainActivity extends Activity {
         }
         if ("movie".equals(node.optString("kind")) || "series".equals(node.optString("kind")))
             addCastSection(node.optJSONArray("cast"));
-        if ("movie".equals(node.optString("kind")) || "series".equals(node.optString("kind"))) {
+        if (!externalRecommendation && ("movie".equals(node.optString("kind"))
+                || "series".equals(node.optString("kind")))) {
             addRecommendationSection(node, "library");
             addRecommendationSection(node, "external");
         }
@@ -4908,7 +4923,8 @@ public class MainActivity extends Activity {
         if (files != null && files.length() > 0) {
             if (!"movie".equals(node.optString("kind"))) addEpisodeList(files, node.optString("poster_url", ""), node);
         }
-        if ((files == null || files.length() == 0) && (children == null || children.length() == 0)
+        if (!externalRecommendation && (files == null || files.length() == 0)
+                && (children == null || children.length() == 0)
                 && !node.optString("kind").equals("movie")) addEmpty("No se encontraron episodios.");
     }
 
@@ -4983,6 +4999,7 @@ public class MainActivity extends Activity {
             case "Más como esto en tu catálogo": return "Antzeko gehiago zure katalogoan";
             case "Más sugerencias de TMDb": return "TMDb-ko iradokizun gehiago";
             case "Cargando sugerencias…": return "Iradokizunak kargatzen…";
+            case "Abrir detalle": return "Xehetasunak ireki";
             case "Solicitar descarga": return "Deskarga eskatu";
             case "Vas a crear una solicitud de descarga para:":
                 return "Deskarga eskaria sortuko duzu honetarako:";
@@ -5570,6 +5587,15 @@ public class MainActivity extends Activity {
         showPoster(item.optString("poster_url", ""), poster, true);
         posterFrame.addView(poster, new FrameLayout.LayoutParams(-1, -1));
         if (!inCatalog) {
+            poster.setFocusable(isTelevision());
+            poster.setClickable(true);
+            poster.setContentDescription(cleanDisplayText(item.optString("title", ""))
+                    + ", " + t("Abrir detalle"));
+            poster.setOnClickListener(v -> openExternalRecommendation(item));
+            applyTvFocusStyle(poster, true);
+            poster.setFocusable(isTelevision());
+        }
+        if (!inCatalog) {
             boolean alreadyRequested = item.optBoolean("requested", false);
             Button request = new Button(this);
             request.setText(alreadyRequested ? "✓" : "+");
@@ -5605,6 +5631,37 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(d(104), -2);
         cardParams.setMargins(0, 0, d(9), 0);
         state.cards.addView(card, cardParams);
+    }
+
+    void openExternalRecommendation(JSONObject item) {
+        if (item == null || !isKidAllowedNode(item)) return;
+        String kind = item.optString("kind", "");
+        String contentType = "movie".equals(kind) ? "movie" : "tv";
+        long tmdbId = item.optLong("tmdb_id", 0);
+        if (tmdbId <= 0) return;
+        externalRecommendationReturnNode = currentDetailNode;
+        externalRecommendationReturnScrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
+        detailReturnScrollY = externalRecommendationReturnScrollY;
+        loadingExternalRecommendationId = contentType + ":" + tmdbId;
+        showingDetail = true;
+        if (backButton != null) backButton.setVisibility(View.VISIBLE);
+        showLoading("Cargando ficha…");
+        io.execute(() -> {
+            try {
+                JSONObject details = getJson("/api/v1/content-requests/tmdb/" + contentType + "/" + tmdbId);
+                runOnUiThread(() -> {
+                    if (!(contentType + ":" + tmdbId).equals(loadingExternalRecommendationId)) return;
+                    loadingExternalRecommendationId = "";
+                    renderDetail(details);
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (!(contentType + ":" + tmdbId).equals(loadingExternalRecommendationId)) return;
+                    loadingExternalRecommendationId = "";
+                    renderError(e.getMessage());
+                });
+            }
+        });
     }
 
     void confirmRecommendationRequest(JSONObject item, Button requestButton) {
@@ -8096,6 +8153,16 @@ public class MainActivity extends Activity {
         }
         if (metadataEditorMode) {
             returnFromMetadataEditor();
+            return;
+        }
+        if (showingDetail && externalRecommendationReturnNode != null) {
+            JSONObject returnNode = externalRecommendationReturnNode;
+            int returnScrollY = externalRecommendationReturnScrollY;
+            externalRecommendationReturnNode = null;
+            loadingExternalRecommendationId = "";
+            renderDetail(returnNode);
+            if (contentScroller != null)
+                contentScroller.post(() -> contentScroller.scrollTo(0, returnScrollY));
             return;
         }
         if (showingDetail) {
