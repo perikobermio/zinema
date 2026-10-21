@@ -1344,7 +1344,7 @@ def _scan_incoming_download_activity_impl() -> dict[str, object] | None:
             current[relative] = snapshot
             file_age = max(0.0, wall_now - stat.st_mtime)
             provisional = (previous is None and now - first_seen < 5 and file_age < 12)
-            is_active = ((has_changed and now - last_change < INCOMING_DOWNLOAD_MONITOR_SETTLE_SECONDS)
+            is_active = ((has_changed and now - last_change < INCOMING_MONITOR_SETTLE_SECONDS)
                          or provisional)
             if is_active:
                 active.append({
@@ -1403,7 +1403,7 @@ def _scan_incoming_download_activity_impl() -> dict[str, object] | None:
         elif (state["status"] == "running"
               and (state["source"] == "incoming" or state.get("_awaiting_file_settle"))):
             last_activity = float(state.get("_last_activity_monotonic", now))
-            if now - last_activity >= INCOMING_DOWNLOAD_MONITOR_SETTLE_SECONDS:
+            if now - last_activity >= INCOMING_MONITOR_SETTLE_SECONDS:
                 state.update({
                     "status": "completed", "progress": "Descarga finalizada.",
                     "completed_at": datetime.now(timezone.utc).isoformat(), "exit_code": 0,
@@ -1450,7 +1450,7 @@ def _settle_app_download_files() -> None:
                 snapshot.update({
                     "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
                     "has_changed": False,
-                    "last_change": now - INCOMING_DOWNLOAD_MONITOR_SETTLE_SECONDS,
+                    "last_change": now - INCOMING_MONITOR_SETTLE_SECONDS,
                 })
             INCOMING_ACTIVE_PATHS.clear()
 
