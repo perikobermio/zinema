@@ -98,6 +98,19 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
+    static class RecommendationRowState {
+        String nodeId;
+        String scope;
+        LinearLayout section;
+        LinearLayout cards;
+        HorizontalScrollView horizontal;
+        TextView status;
+        int nextPage = 1;
+        boolean hasMore = true;
+        boolean loading;
+        final Set<String> seen = new HashSet<>();
+    }
+
     static final Pattern EPISODE_MARKER_PATTERN = Pattern.compile(
             "(?i)s(\\d{1,2})\\s*e(\\d{1,3})|(?:^|[^0-9])(\\d{1,2})x(\\d{1,3})(?:$|[^0-9])");
     static final int BG = Color.rgb(9, 10, 13);
@@ -127,6 +140,7 @@ public class MainActivity extends Activity {
     final Set<ImageView> lazyImageScrollWatchers = Collections.newSetFromMap(new WeakHashMap<>());
     final Map<String, List<JSONObject>> catalogCache = new HashMap<>();
     final Map<String, Long> catalogCacheUpdatedAt = new HashMap<>();
+    final Map<String, RecommendationRowState> recommendationRows = new HashMap<>();
     SharedPreferences prefs;
     FrameLayout frame;
     LinearLayout page;
@@ -3352,10 +3366,18 @@ public class MainActivity extends Activity {
     }
 
     void loadVisibleLazyRowsIn(View view) {
-        if (view instanceof HorizontalScrollView &&
-                ("zinema-lazy-posters".equals(view.getTag()) || "zinema-lazy-cast".equals(view.getTag()))) {
-            loadLazyRow((HorizontalScrollView) view);
-            return;
+        if (view instanceof HorizontalScrollView) {
+            Object tag = view.getTag();
+            if ("zinema-lazy-posters".equals(tag) || "zinema-lazy-cast".equals(tag)) {
+                loadLazyRow((HorizontalScrollView) view);
+                return;
+            }
+            if (tag instanceof String && ((String) tag).startsWith("zinema-recommendations-")) {
+                HorizontalScrollView row = (HorizontalScrollView) view;
+                loadLazyRow(row);
+                requestRecommendationsIfVisible(row, false);
+                return;
+            }
         }
         if (view instanceof ImageView) {
             ImageView image = (ImageView) view;
@@ -4771,6 +4793,7 @@ public class MainActivity extends Activity {
         showingDetail = true;
         detailNodeId = node.optString("id");
         currentDetailNode = node;
+        recommendationRows.clear();
         if ("series".equals(node.optString("kind")) && isKidAllowedByGenres(node)) {
             JSONArray seasons = node.optJSONArray("children");
             if (seasons != null) for (int i = 0; i < seasons.length(); i++) {
@@ -4874,6 +4897,10 @@ public class MainActivity extends Activity {
         }
         if ("movie".equals(node.optString("kind")) || "series".equals(node.optString("kind")))
             addCastSection(node.optJSONArray("cast"));
+        if ("movie".equals(node.optString("kind")) || "series".equals(node.optString("kind"))) {
+            addRecommendationSection(node, "library");
+            addRecommendationSection(node, "external");
+        }
         if (!"series".equals(node.optString("kind")) && children != null && children.length() > 0) {
             addSectionHeader("Explorar", "Selecciona para continuar");
             addGrid(toList(children));
@@ -4953,6 +4980,13 @@ public class MainActivity extends Activity {
             case "capítulos": return "atal";
             case "Inicio": return "Hasiera";
             case "Lo más nuevo": return "Eduki berrienak";
+            case "Más como esto en tu catálogo": return "Antzeko gehiago zure katalogoan";
+            case "Más sugerencias de TMDb": return "TMDb-ko iradokizun gehiago";
+            case "Cargando sugerencias…": return "Iradokizunak kargatzen…";
+            case "No se encontraron sugerencias visibles. Pulsa para seguir buscando.":
+                return "Ez da iradokizun ikusgarririk aurkitu. Sakatu bilatzen jarraitzeko.";
+            case "No se pudieron cargar las sugerencias: ":
+                return "Ezin izan dira iradokizunak kargatu: ";
             case "Perfiles": return "Profilak";
             case "Perfil": return "Profila";
             case "Cambiar perfil": return "Profila aldatu";
@@ -5385,6 +5419,163 @@ public class MainActivity extends Activity {
         horizontal.addView(cards);
         content.addView(horizontal, new LinearLayout.LayoutParams(-1, -2));
         installLazyRowScroll(horizontal);
+    }
+
+    String recommendationKey(String nodeId, String scope) {
+        return nodeId + ":" + scope;
+    }
+
+    void addRecommendationSection(JSONObject node, String scope) {
+        String nodeId = node.optString("id", "");
+        if (nodeId.isEmpty()) return;
+        RecommendationRowState state = new RecommendationRowState();
+        state.nodeId = nodeId;
+        state.scope = scope;
+        state.section = new LinearLayout(this);
+        state.section.setOrientation(LinearLayout.VERTICAL);
+
+        String heading = "library".equals(scope)
+                ? "Más como esto en tu catálogo" : "Más sugerencias de TMDb";
+        TextView title = label(t(heading), 19, Color.WHITE, true);
+        title.setPadding(d(20), d(14), d(20), d(4));
+        state.section.addView(title);
+
+        state.status = label(t("Cargando sugerencias…"), 11, MUTED, false);
+        state.status.setPadding(d(20), 0, d(20), d(6));
+        state.section.addView(state.status);
+        state.status.setOnClickListener(v -> requestRecommendationsIfVisible(state.horizontal, true));
+
+        state.horizontal = new HorizontalScrollView(this);
+        state.horizontal.setHorizontalScrollBarEnabled(false);
+        state.horizontal.setClipToPadding(false);
+        state.horizontal.setClipChildren(false);
+        state.horizontal.setTag("zinema-recommendations-" + scope);
+        state.cards = new LinearLayout(this);
+        state.cards.setOrientation(LinearLayout.HORIZONTAL);
+        state.cards.setPadding(d(16), 0, d(16), d(12));
+        state.horizontal.addView(state.cards, new HorizontalScrollView.LayoutParams(-2, -2));
+        state.section.addView(state.horizontal, new LinearLayout.LayoutParams(-1, -2));
+        state.horizontal.setOnScrollChangeListener((View view, int x, int y, int oldX, int oldY) -> {
+            loadLazyRow(state.horizontal);
+            View cards = state.horizontal.getChildCount() == 0 ? null : state.horizontal.getChildAt(0);
+            if (cards != null && x + state.horizontal.getWidth() + d(220) >= cards.getWidth())
+                requestRecommendationsIfVisible(state.horizontal, true);
+        });
+        content.addView(state.section, new LinearLayout.LayoutParams(-1, -2));
+        recommendationRows.put(recommendationKey(nodeId, scope), state);
+        state.horizontal.post(() -> requestRecommendationsIfVisible(state.horizontal, false));
+    }
+
+    void requestRecommendationsIfVisible(HorizontalScrollView horizontal, boolean loadNext) {
+        if (horizontal == null || !showingDetail || horizontal.getParent() == null) return;
+        Rect visible = new Rect();
+        if (!horizontal.getGlobalVisibleRect(visible)) return;
+        Object tag = horizontal.getTag();
+        if (!(tag instanceof String) || !((String) tag).startsWith("zinema-recommendations-")) return;
+        String scope = ((String) tag).substring("zinema-recommendations-".length());
+        RecommendationRowState state = recommendationRows.get(recommendationKey(detailNodeId, scope));
+        if (state == null || state.loading || !state.hasMore) return;
+        if (state.nextPage > 1 && !loadNext) return;
+
+        state.loading = true;
+        if (state.cards.getChildCount() == 0) {
+            state.status.setText(t("Cargando sugerencias…"));
+            state.status.setVisibility(View.VISIBLE);
+        }
+        final int firstPage = state.nextPage;
+        io.execute(() -> {
+            List<JSONObject> fetched = new ArrayList<>();
+            int nextPage = firstPage;
+            int pagesRead = 0;
+            String error = "";
+            try {
+                while (nextPage > 0 && pagesRead < 5 && fetched.size() < 8) {
+                    JSONObject payload = getJson("/api/v1/catalog/" + enc(state.nodeId)
+                            + "/recommendations?scope=" + enc(state.scope) + "&page=" + nextPage);
+                    JSONArray items = payload.optJSONArray("items");
+                    if (items != null) {
+                        for (int i = 0; i < items.length(); i++) {
+                            JSONObject item = items.optJSONObject(i);
+                            if (item != null) fetched.add(new JSONObject(item.toString()));
+                        }
+                    }
+                    nextPage = payload.isNull("next_page") ? 0 : payload.optInt("next_page", 0);
+                    pagesRead++;
+                }
+            } catch (Exception e) {
+                error = e.getMessage() == null ? "" : e.getMessage();
+            }
+            final int followingPage = nextPage;
+            final int readCount = pagesRead;
+            final String loadError = error;
+            runOnUiThread(() -> {
+                state.loading = false;
+                if (!showingDetail || !state.nodeId.equals(detailNodeId)
+                        || state.horizontal.getParent() == null) return;
+                state.nextPage = followingPage;
+                state.hasMore = followingPage > 0;
+                int added = 0;
+                for (JSONObject item : fetched) {
+                    String itemId = item.optString("id", "");
+                    if (itemId.isEmpty() || state.seen.contains(itemId) || !isKidAllowedNode(item)) continue;
+                    state.seen.add(itemId);
+                    addRecommendationCard(state, item);
+                    added++;
+                }
+                if (!loadError.isEmpty()) {
+                    state.status.setText(t("No se pudieron cargar las sugerencias: ") + loadError);
+                    state.status.setVisibility(View.VISIBLE);
+                    state.status.setOnClickListener(v -> requestRecommendationsIfVisible(state.horizontal, true));
+                } else if (state.cards.getChildCount() == 0 && !state.hasMore) {
+                    content.removeView(state.section);
+                    recommendationRows.remove(recommendationKey(state.nodeId, state.scope));
+                } else if (added > 0) {
+                    state.status.setVisibility(View.GONE);
+                    state.status.setOnClickListener(null);
+                    state.horizontal.post(() -> {
+                        loadLazyRow(state.horizontal);
+                        View cards = state.horizontal.getChildAt(0);
+                        if (state.hasMore && cards != null && cards.getWidth() <= state.horizontal.getWidth())
+                            requestRecommendationsIfVisible(state.horizontal, true);
+                    });
+                } else if (state.hasMore && readCount >= 5) {
+                    state.status.setText(t("No se encontraron sugerencias visibles. Pulsa para seguir buscando."));
+                    state.status.setVisibility(View.VISIBLE);
+                    state.status.setOnClickListener(v -> requestRecommendationsIfVisible(state.horizontal, true));
+                }
+            });
+        });
+    }
+
+    void addRecommendationCard(RecommendationRowState state, JSONObject item) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(0, 0, 0, d(4));
+        boolean inCatalog = "library".equals(state.scope);
+        if (inCatalog) {
+            card.setFocusable(isTelevision());
+            card.setClickable(true);
+            card.setOnClickListener(v -> openNode(item));
+        }
+        ImageView poster = new ImageView(this);
+        poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        poster.setBackground(round(PANEL, d(8)));
+        poster.setClipToOutline(true);
+        showPoster(item.optString("poster_url", ""), poster, true);
+        card.addView(poster, new LinearLayout.LayoutParams(d(104), d(146)));
+        TextView title = labelRaw(cleanDisplayText(item.optString("title", "")), 12, Color.WHITE, true);
+        title.setMaxLines(2);
+        LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(-1, -2);
+        titleParams.topMargin = d(5);
+        card.addView(title, titleParams);
+        int year = item.optInt("year", 0);
+        if (year > 0) {
+            TextView yearView = labelRaw(Integer.toString(year), 10, MUTED, false);
+            card.addView(yearView);
+        }
+        LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(d(104), -2);
+        cardParams.setMargins(0, 0, d(9), 0);
+        state.cards.addView(card, cardParams);
     }
 
     void showMovieFileDetails(JSONObject node) {

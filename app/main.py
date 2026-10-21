@@ -27,7 +27,7 @@ from starlette.responses import FileResponse, Response, StreamingResponse
 from app.catalog import EPISODE_RE, VIDEO_EXTENSIONS, scan_catalog
 from app.telegram import send_telegram_message
 from app.tmdb import (apply_tmdb_id, enrich_pending, get_candidate_details,
-                      search_content_requests, search_image_options, search_metadata_candidates,
+                      get_similar_content, search_content_requests, search_image_options, search_metadata_candidates,
                       _image_config, _save_image, normalize_genres)
 from app.video_thumbnails import extract_episode_thumbnails
 
@@ -2319,6 +2319,111 @@ def get_catalog_node(node_id: str) -> dict:
         if row is None:
             raise HTTPException(status_code=404, detail="Catalog node not found")
         return _node_payload(row, connection)
+
+
+TMDB_GENRE_NAMES = {
+    12: "Aventura", 14: "Fantasía", 16: "Animación", 18: "Drama", 27: "Terror",
+    28: "Acción", 35: "Comedia", 36: "Historia", 37: "Western", 53: "Suspense",
+    80: "Crimen", 99: "Documental", 878: "Ciencia ficción", 9648: "Misterio",
+    10402: "Música", 10749: "Romance", 10751: "Familia", 10752: "Bélica",
+    10759: "Acción y aventura", 10762: "Infantil", 10763: "Noticias",
+    10764: "Reality", 10765: "Ciencia ficción y fantasía", 10766: "Telenovela",
+    10767: "Talk show", 10768: "Guerra y política", 10770: "Película de TV",
+}
+
+
+@app.get("/api/v1/catalog/{node_id}/recommendations",
+         dependencies=[Depends(require_client)])
+def get_catalog_recommendations(
+        node_id: str,
+        scope: str = Query(default="library", pattern="^(library|external)$"),
+        page: int = Query(default=1, ge=1, le=500)) -> dict[str, object]:
+    if not TMDB_CONFIGURED:
+        return {"scope": scope, "items": [], "page": page, "next_page": None}
+    with closing(database()) as connection:
+        source = connection.execute(
+            "SELECT id, kind, tmdb_id FROM catalog_nodes WHERE id=? AND available=1",
+            (node_id,),
+        ).fetchone()
+        if source is None:
+            raise HTTPException(status_code=404, detail="Catalog node not found")
+        if source["kind"] not in {"movie", "series"} or not source["tmdb_id"]:
+            return {"scope": scope, "items": [], "page": page, "next_page": None}
+        kind = str(source["kind"])
+        tmdb_kind = "movie" if kind == "movie" else "tv"
+        try:
+            similar = get_similar_content(
+                tmdb_kind, int(source["tmdb_id"]), TMDB_ACCESS_TOKEN,
+                TMDB_LANGUAGE, page, TMDB_KEY,
+            )
+        except Exception:
+            raise HTTPException(status_code=502,
+                                detail="Could not load recommendations from TMDb") from None
+
+        results = similar["results"]
+        tmdb_ids = [int(item["id"]) for item in results
+                    if isinstance(item, dict) and item.get("id") is not None]
+        placeholders = ",".join("?" for _ in tmdb_ids)
+        catalog_by_tmdb: dict[int, sqlite3.Row] = {}
+        if tmdb_ids:
+            rows = connection.execute(
+                f"""SELECT id, kind, tmdb_id, title, metadata_title,
+                           COALESCE(year, source_year) AS year, genres_json,
+                           age_limit, poster_file
+                    FROM catalog_nodes WHERE available=1 AND kind=? AND tmdb_id IN ({placeholders})""",
+                (kind, *tmdb_ids),
+            ).fetchall()
+            for row in rows:
+                catalog_by_tmdb.setdefault(int(row["tmdb_id"]), row)
+        catalog_rows = connection.execute(
+            "SELECT tmdb_id FROM catalog_nodes WHERE available=1 AND kind=? AND tmdb_id IS NOT NULL",
+            (kind,),
+        ).fetchall()
+        catalog_ids = {int(row["tmdb_id"]) for row in catalog_rows}
+
+        items: list[dict[str, object]] = []
+        for result in results:
+            if not isinstance(result, dict) or result.get("id") is None:
+                continue
+            result_id = int(result["id"])
+            if result_id == int(source["tmdb_id"]):
+                continue
+            local = catalog_by_tmdb.get(result_id)
+            if scope == "library":
+                if local is None:
+                    continue
+                genres = normalize_genres(json.loads(local["genres_json"] or "[]"))
+                items.append({
+                    "id": local["id"], "tmdb_id": result_id, "kind": kind,
+                    "title": local["metadata_title"] or local["title"],
+                    "year": local["year"], "genres": genres,
+                    "age_limit": local["age_limit"],
+                    "poster_url": (_artwork_url(local["id"], "poster", local["poster_file"])
+                                   if local["poster_file"] else None),
+                })
+                continue
+            if result_id in catalog_ids or result.get("adult") is True:
+                continue
+            title = result.get("title") if kind == "movie" else result.get("name")
+            date = result.get("release_date") if kind == "movie" else result.get("first_air_date")
+            year = int(date[:4]) if isinstance(date, str) and len(date) >= 4 and date[:4].isdigit() else None
+            poster_path = result.get("poster_path")
+            genre_ids = result.get("genre_ids") or []
+            items.append({
+                "id": f"tmdb-{kind}-{result_id}", "tmdb_id": result_id, "kind": kind,
+                "title": str(title or "").strip(), "year": year,
+                "genres": [TMDB_GENRE_NAMES[int(genre_id)] for genre_id in genre_ids
+                           if str(genre_id).isdigit() and int(genre_id) in TMDB_GENRE_NAMES],
+                "age_limit": None,
+                "poster_url": (f"https://image.tmdb.org/t/p/w342{poster_path}"
+                               if isinstance(poster_path, str) and poster_path.startswith("/") else None),
+            })
+        current_page = int(similar.get("page") or page)
+        total_pages = int(similar.get("total_pages") or 0)
+        return {
+            "scope": scope, "items": items, "page": current_page,
+            "next_page": current_page + 1 if current_page < total_pages else None,
+        }
 
 
 @app.post("/api/v1/catalog/{node_id}/metadata/retry", status_code=202,

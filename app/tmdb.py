@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 import unicodedata
 from difflib import SequenceMatcher
@@ -15,6 +16,9 @@ import httpx
 TMDB_API = "https://api.themoviedb.org/3"
 TMDB_IMAGES = "https://image.tmdb.org/t/p"
 YEAR_RE = re.compile(r"\s*\(((?:19|20)\d{2})\)\s*$")
+SIMILAR_CACHE_TTL_SECONDS = 6 * 60 * 60
+SIMILAR_CACHE_LOCK = threading.Lock()
+SIMILAR_CACHE: dict[tuple[str, int, str, int], tuple[float, dict]] = {}
 
 
 def _normalise(value: str) -> str:
@@ -422,6 +426,41 @@ def search_content_requests(query: str, access_token: str, language: str,
                 })
     results.sort(key=lambda item: item["score"], reverse=True)
     return results[:12]
+
+
+def get_similar_content(kind: str, tmdb_id: int, access_token: str, language: str,
+                        page: int = 1, api_key: str = "") -> dict:
+    """Get a cached, language-specific TMDb similar titles page."""
+    entity_kind = "movie" if kind == "movie" else "tv"
+    cache_key = (entity_kind, int(tmdb_id), language, int(page))
+    now = time.monotonic()
+    with SIMILAR_CACHE_LOCK:
+        cached = SIMILAR_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+
+    headers = {"accept": "application/json"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    with httpx.Client(headers=headers, timeout=httpx.Timeout(20.0), follow_redirects=True) as client:
+        data = _api_get(
+            client, f"/{entity_kind}/{int(tmdb_id)}/similar",
+            {"language": language, "page": int(page), "include_adult": "false"}, api_key,
+        )
+    payload = {
+        "page": int(data.get("page") or page),
+        "total_pages": int(data.get("total_pages") or 0),
+        "results": data.get("results") or [],
+    }
+    with SIMILAR_CACHE_LOCK:
+        if len(SIMILAR_CACHE) >= 256:
+            expired = [key for key, (expiry, _) in SIMILAR_CACHE.items() if expiry <= now]
+            for key in expired:
+                SIMILAR_CACHE.pop(key, None)
+            if len(SIMILAR_CACHE) >= 256:
+                SIMILAR_CACHE.pop(next(iter(SIMILAR_CACHE)))
+        SIMILAR_CACHE[cache_key] = (now + SIMILAR_CACHE_TTL_SECONDS, payload)
+    return payload
 
 
 def get_candidate_details(kind: str, tmdb_id: int, access_token: str,
