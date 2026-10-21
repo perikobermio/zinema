@@ -2380,6 +2380,14 @@ def get_catalog_recommendations(
             (kind,),
         ).fetchall()
         catalog_ids = {int(row["tmdb_id"]) for row in catalog_rows}
+        requested_content_type = "movie" if kind == "movie" else "tv"
+        requested_rows = connection.execute(
+            f"""SELECT DISTINCT tmdb_id FROM content_requests
+                WHERE request_type='new_content' AND content_type=?
+                  AND tmdb_id IN ({placeholders})""",
+            (requested_content_type, *tmdb_ids),
+        ).fetchall() if tmdb_ids else []
+        requested_ids = {int(row["tmdb_id"]) for row in requested_rows}
 
         items: list[dict[str, object]] = []
         for result in results:
@@ -2415,6 +2423,7 @@ def get_catalog_recommendations(
                 "genres": [TMDB_GENRE_NAMES[int(genre_id)] for genre_id in genre_ids
                            if str(genre_id).isdigit() and int(genre_id) in TMDB_GENRE_NAMES],
                 "age_limit": None,
+                "requested": result_id in requested_ids,
                 "poster_url": (f"https://image.tmdb.org/t/p/w342{poster_path}"
                                if isinstance(poster_path, str) and poster_path.startswith("/") else None),
             })
@@ -2657,9 +2666,24 @@ def create_content_request(request: ContentRequestCreate,
                 )]
             if not TMDB_CONFIGURED:
                 raise HTTPException(status_code=503, detail="TMDb credentials are not configured")
+            selected_keys: list[tuple[str, int, int | None]] = []
             for item in selected_items:
                 if item.content_type == "movie" and item.season_number is not None:
                     raise HTTPException(status_code=422, detail="Movies do not have seasons")
+                if any(content_type == item.content_type and tmdb_id == item.tmdb_id
+                       and (season is None or item.season_number is None or season == item.season_number)
+                       for content_type, tmdb_id, season in selected_keys):
+                    raise HTTPException(status_code=409, detail="This content has already been requested")
+                selected_keys.append((item.content_type, item.tmdb_id, item.season_number))
+                already_requested = connection.execute(
+                    """SELECT 1 FROM content_requests
+                       WHERE request_type='new_content' AND content_type=? AND tmdb_id=?
+                         AND (season_number IS NULL OR ? IS NULL OR season_number=?)
+                       LIMIT 1""",
+                    (item.content_type, item.tmdb_id, item.season_number, item.season_number),
+                ).fetchone()
+                if already_requested:
+                    raise HTTPException(status_code=409, detail="This content has already been requested")
                 try:
                     candidate = get_candidate_details(
                         item.content_type, item.tmdb_id,

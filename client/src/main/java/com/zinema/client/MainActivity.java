@@ -4983,6 +4983,11 @@ public class MainActivity extends Activity {
             case "Más como esto en tu catálogo": return "Antzeko gehiago zure katalogoan";
             case "Más sugerencias de TMDb": return "TMDb-ko iradokizun gehiago";
             case "Cargando sugerencias…": return "Iradokizunak kargatzen…";
+            case "Solicitar descarga": return "Deskarga eskatu";
+            case "Vas a crear una solicitud de descarga para:":
+                return "Deskarga eskaria sortuko duzu honetarako:";
+            case "Solicitud enviada": return "Eskaera bidalita";
+            case "Ya solicitado": return "Dagoeneko eskatuta";
             case "No se encontraron sugerencias visibles. Pulsa para seguir buscando.":
                 return "Ez da iradokizun ikusgarririk aurkitu. Sakatu bilatzen jarraitzeko.";
             case "No se pudieron cargar las sugerencias: ":
@@ -5557,12 +5562,36 @@ public class MainActivity extends Activity {
             card.setClickable(true);
             card.setOnClickListener(v -> openNode(item));
         }
+        FrameLayout posterFrame = new FrameLayout(this);
+        posterFrame.setBackground(round(PANEL, d(8)));
+        posterFrame.setClipToOutline(true);
         ImageView poster = new ImageView(this);
         poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        poster.setBackground(round(PANEL, d(8)));
-        poster.setClipToOutline(true);
         showPoster(item.optString("poster_url", ""), poster, true);
-        card.addView(poster, new LinearLayout.LayoutParams(d(104), d(146)));
+        posterFrame.addView(poster, new FrameLayout.LayoutParams(-1, -1));
+        if (!inCatalog) {
+            boolean alreadyRequested = item.optBoolean("requested", false);
+            Button request = new Button(this);
+            request.setText(alreadyRequested ? "✓" : "+");
+            request.setTextSize(22);
+            request.setTextColor(Color.WHITE);
+            request.setAllCaps(false);
+            request.setPadding(0, 0, 0, d(2));
+            request.setMinWidth(0);
+            request.setMinHeight(0);
+            request.setBackground(round(alreadyRequested ? 0xE62E7654
+                    : 0xE6000000 | (RED & 0x00FFFFFF), d(20)));
+            request.setContentDescription(t(alreadyRequested ? "Ya solicitado" : "Pedir contenido"));
+            applyTvFocusStyle(request, false);
+            request.setEnabled(!alreadyRequested);
+            FrameLayout.LayoutParams requestParams = new FrameLayout.LayoutParams(d(36), d(36),
+                    Gravity.TOP | Gravity.RIGHT);
+            requestParams.setMargins(0, d(6), d(6), 0);
+            posterFrame.addView(request, requestParams);
+            if (!alreadyRequested)
+                request.setOnClickListener(v -> confirmRecommendationRequest(item, request));
+        }
+        card.addView(posterFrame, new LinearLayout.LayoutParams(d(104), d(146)));
         TextView title = labelRaw(cleanDisplayText(item.optString("title", "")), 12, Color.WHITE, true);
         title.setMaxLines(2);
         LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(-1, -2);
@@ -5576,6 +5605,47 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(d(104), -2);
         cardParams.setMargins(0, 0, d(9), 0);
         state.cards.addView(card, cardParams);
+    }
+
+    void confirmRecommendationRequest(JSONObject item, Button requestButton) {
+        String contentType = "movie".equals(item.optString("kind")) ? "movie" : "tv";
+        String title = cleanDisplayText(item.optString("title", ""));
+        int year = item.optInt("year", 0);
+        String requestedTitle = title + (year > 0 ? " (" + year + ")" : "");
+        String mediaType = "movie".equals(contentType) ? t("Película") : t("Serie completa");
+        new AlertDialog.Builder(this)
+                .setTitle(t("Solicitar descarga"))
+                .setMessage(t("Vas a crear una solicitud de descarga para:") + "\n"
+                        + mediaType + "\n" + requestedTitle)
+                .setNegativeButton(t("Cancelar"), null)
+                .setPositiveButton(t("Enviar solicitud"), (dialog, which) -> {
+                    JSONObject payload = new JSONObject();
+                    try {
+                        payload.put("request_type", "new_content");
+                        payload.put("content_type", contentType);
+                        payload.put("tmdb_id", item.optLong("tmdb_id"));
+                    } catch (JSONException ignored) { return; }
+                    requestButton.setEnabled(false);
+                    requestButton.setText("…");
+                    io.execute(() -> {
+                        try {
+                            postJson("/api/v1/content-requests", payload);
+                            runOnUiThread(() -> {
+                                requestButton.setText("✓");
+                                requestButton.setContentDescription(t("Ya solicitado"));
+                                Toast.makeText(this, t("Solicitud enviada a administración."),
+                                        Toast.LENGTH_LONG).show();
+                            });
+                        } catch (Exception e) {
+                            runOnUiThread(() -> {
+                                requestButton.setEnabled(true);
+                                requestButton.setText("+");
+                                Toast.makeText(this, t("No se pudo enviar la solicitud: ")
+                                        + e.getMessage(), Toast.LENGTH_LONG).show();
+                            });
+                        }
+                    });
+                }).show();
     }
 
     void showMovieFileDetails(JSONObject node) {
