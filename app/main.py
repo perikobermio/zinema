@@ -27,7 +27,8 @@ from starlette.responses import FileResponse, Response, StreamingResponse
 from app.catalog import EPISODE_RE, VIDEO_EXTENSIONS, scan_catalog
 from app.telegram import send_telegram_message
 from app.tmdb import (apply_tmdb_id, enrich_pending, get_candidate_details,
-                      get_similar_content, search_content_requests, search_image_options, search_metadata_candidates,
+                      get_movie_age_limits, get_similar_content, search_content_requests,
+                      search_image_options, search_metadata_candidates,
                       _image_config, _save_image, normalize_genres)
 from app.video_thumbnails import extract_episode_thumbnails
 
@@ -2388,6 +2389,16 @@ def get_catalog_recommendations(
             (requested_content_type, *tmdb_ids),
         ).fetchall() if tmdb_ids else []
         requested_ids = {int(row["tmdb_id"]) for row in requested_rows}
+        if kind == "movie":
+            age_lookup_ids = (tmdb_ids if scope == "external" else [
+                tmdb_id for tmdb_id, row in catalog_by_tmdb.items()
+                if row["age_limit"] is None
+            ])
+            age_limits = get_movie_age_limits(
+                age_lookup_ids, TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, TMDB_KEY,
+            )
+        else:
+            age_limits = {}
 
         items: list[dict[str, object]] = []
         for result in results:
@@ -2405,7 +2416,8 @@ def get_catalog_recommendations(
                     "id": local["id"], "tmdb_id": result_id, "kind": kind,
                     "title": local["metadata_title"] or local["title"],
                     "year": local["year"], "genres": genres,
-                    "age_limit": local["age_limit"],
+                    "age_limit": (local["age_limit"] if local["age_limit"] is not None
+                                  else age_limits.get(result_id)),
                     "poster_url": (_artwork_url(local["id"], "poster", local["poster_file"])
                                    if local["poster_file"] else None),
                 })
@@ -2417,12 +2429,15 @@ def get_catalog_recommendations(
             year = int(date[:4]) if isinstance(date, str) and len(date) >= 4 and date[:4].isdigit() else None
             poster_path = result.get("poster_path")
             genre_ids = result.get("genre_ids") or []
+            age_limit = age_limits.get(result_id)
+            if result.get("adult") is True and (age_limit is None or age_limit < 18):
+                age_limit = 18
             items.append({
                 "id": f"tmdb-{kind}-{result_id}", "tmdb_id": result_id, "kind": kind,
                 "title": str(title or "").strip(), "year": year,
                 "genres": [TMDB_GENRE_NAMES[int(genre_id)] for genre_id in genre_ids
                            if str(genre_id).isdigit() and int(genre_id) in TMDB_GENRE_NAMES],
-                "age_limit": None,
+                "age_limit": age_limit,
                 "requested": result_id in requested_ids,
                 "poster_url": (f"https://image.tmdb.org/t/p/w342{poster_path}"
                                if isinstance(poster_path, str) and poster_path.startswith("/") else None),

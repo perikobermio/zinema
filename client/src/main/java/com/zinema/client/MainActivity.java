@@ -1300,6 +1300,8 @@ public class MainActivity extends Activity {
         if (!isActiveKidProfile()) return true;
         if (node == null) return false;
         String kind = node.optString("kind", "");
+        if ("movie".equals(kind) && node.optInt("age_limit", 0) >= 16
+                && !hasFamilyGenre(node)) return false;
         if ("collection".equals(kind)) {
             JSONArray genres = node.optJSONArray("genres");
             return genres == null || genres.length() == 0 || isKidAllowedByGenres(node);
@@ -1311,6 +1313,16 @@ public class MainActivity extends Activity {
             return owner != null && isKidAllowedByGenres(owner);
         }
         return isKidAllowedByGenres(node);
+    }
+
+    boolean hasFamilyGenre(JSONObject node) {
+        JSONArray genres = node == null ? null : node.optJSONArray("genres");
+        if (genres == null) return false;
+        for (int i = 0; i < genres.length(); i++) {
+            String genre = normalizeGenre(genres.optString(i, ""));
+            if ("familia".equals(genre) || "family".equals(genre)) return true;
+        }
+        return false;
     }
 
     boolean isKidAllowedByGenres(JSONObject node) {
@@ -5001,6 +5013,8 @@ public class MainActivity extends Activity {
             case "Cargando sugerencias…": return "Iradokizunak kargatzen…";
             case "Abrir detalle": return "Xehetasunak ireki";
             case "Solicitar descarga": return "Deskarga eskatu";
+            case "Pedir": return "Eskatu";
+            case "Solicitado": return "Eskatuta";
             case "Vas a crear una solicitud de descarga para:":
                 return "Deskarga eskaria sortuko duzu honetarako:";
             case "Solicitud enviada": return "Eskaera bidalita";
@@ -5560,6 +5574,9 @@ public class MainActivity extends Activity {
                         if (state.hasMore && cards != null && cards.getWidth() <= state.horizontal.getWidth())
                             requestRecommendationsIfVisible(state.horizontal, true);
                     });
+                } else if (state.cards.getChildCount() > 0) {
+                    state.status.setVisibility(View.GONE);
+                    state.status.setOnClickListener(null);
                 } else if (state.hasMore && readCount >= 5) {
                     state.status.setText(t("No se encontraron sugerencias visibles. Pulsa para seguir buscando."));
                     state.status.setVisibility(View.VISIBLE);
@@ -5579,13 +5596,11 @@ public class MainActivity extends Activity {
             card.setClickable(true);
             card.setOnClickListener(v -> openNode(item));
         }
-        FrameLayout posterFrame = new FrameLayout(this);
-        posterFrame.setBackground(round(PANEL, d(8)));
-        posterFrame.setClipToOutline(true);
         ImageView poster = new ImageView(this);
         poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        poster.setBackground(round(PANEL, d(8)));
+        poster.setClipToOutline(true);
         showPoster(item.optString("poster_url", ""), poster, true);
-        posterFrame.addView(poster, new FrameLayout.LayoutParams(-1, -1));
         if (!inCatalog) {
             poster.setFocusable(isTelevision());
             poster.setClickable(true);
@@ -5595,29 +5610,28 @@ public class MainActivity extends Activity {
             applyTvFocusStyle(poster, true);
             poster.setFocusable(isTelevision());
         }
+        card.addView(poster, new LinearLayout.LayoutParams(d(104), d(146)));
         if (!inCatalog) {
             boolean alreadyRequested = item.optBoolean("requested", false);
             Button request = new Button(this);
-            request.setText(alreadyRequested ? "✓" : "+");
-            request.setTextSize(22);
+            request.setText(t(alreadyRequested ? "Solicitado" : "Pedir"));
+            request.setTextSize(11);
             request.setTextColor(Color.WHITE);
             request.setAllCaps(false);
-            request.setPadding(0, 0, 0, d(2));
+            request.setTypeface(activeProfileTypeface(true));
+            request.setPadding(d(4), 0, d(4), 0);
             request.setMinWidth(0);
             request.setMinHeight(0);
-            request.setBackground(round(alreadyRequested ? 0xE62E7654
-                    : 0xE6000000 | (RED & 0x00FFFFFF), d(20)));
+            request.setBackground(round(alreadyRequested ? 0xCC286B4C : RED, d(7)));
             request.setContentDescription(t(alreadyRequested ? "Ya solicitado" : "Pedir contenido"));
-            applyTvFocusStyle(request, false);
             request.setEnabled(!alreadyRequested);
-            FrameLayout.LayoutParams requestParams = new FrameLayout.LayoutParams(d(36), d(36),
-                    Gravity.TOP | Gravity.RIGHT);
-            requestParams.setMargins(0, d(6), d(6), 0);
-            posterFrame.addView(request, requestParams);
+            applyTvFocusStyle(request, false);
+            LinearLayout.LayoutParams requestParams = new LinearLayout.LayoutParams(-1, d(36));
+            requestParams.topMargin = d(5);
+            card.addView(request, requestParams);
             if (!alreadyRequested)
                 request.setOnClickListener(v -> confirmRecommendationRequest(item, request));
         }
-        card.addView(posterFrame, new LinearLayout.LayoutParams(d(104), d(146)));
         TextView title = labelRaw(cleanDisplayText(item.optString("title", "")), 12, Color.WHITE, true);
         title.setMaxLines(2);
         LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(-1, -2);

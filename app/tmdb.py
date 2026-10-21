@@ -5,6 +5,7 @@ import re
 import threading
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +20,9 @@ YEAR_RE = re.compile(r"\s*\(((?:19|20)\d{2})\)\s*$")
 SIMILAR_CACHE_TTL_SECONDS = 6 * 60 * 60
 SIMILAR_CACHE_LOCK = threading.Lock()
 SIMILAR_CACHE: dict[tuple[str, int, str, int], tuple[float, dict]] = {}
+AGE_RATING_CACHE_TTL_SECONDS = 24 * 60 * 60
+AGE_RATING_CACHE_LOCK = threading.Lock()
+AGE_RATING_CACHE: dict[tuple[int, str], tuple[float, int | None]] = {}
 
 
 def _normalise(value: str) -> str:
@@ -461,6 +465,65 @@ def get_similar_content(kind: str, tmdb_id: int, access_token: str, language: st
                 SIMILAR_CACHE.pop(next(iter(SIMILAR_CACHE)))
         SIMILAR_CACHE[cache_key] = (now + SIMILAR_CACHE_TTL_SECONDS, payload)
     return payload
+
+
+def _get_movie_age_limit(tmdb_id: int, access_token: str, language: str,
+                         api_key: str = "") -> int | None:
+    cache_key = (int(tmdb_id), language)
+    now = time.monotonic()
+    with AGE_RATING_CACHE_LOCK:
+        cached = AGE_RATING_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+
+    headers = {"accept": "application/json"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    with httpx.Client(headers=headers, timeout=httpx.Timeout(20.0), follow_redirects=True) as client:
+        details = _api_get(client, f"/movie/{int(tmdb_id)}", {
+            "language": language, "append_to_response": "release_dates",
+        }, api_key)
+    age_limit, _ = _spanish_age_rating(details, "movie")
+    with AGE_RATING_CACHE_LOCK:
+        if len(AGE_RATING_CACHE) >= 512:
+            expired = [key for key, (expiry, _) in AGE_RATING_CACHE.items() if expiry <= now]
+            for key in expired:
+                AGE_RATING_CACHE.pop(key, None)
+            if len(AGE_RATING_CACHE) >= 512:
+                AGE_RATING_CACHE.pop(next(iter(AGE_RATING_CACHE)))
+        AGE_RATING_CACHE[cache_key] = (now + AGE_RATING_CACHE_TTL_SECONDS, age_limit)
+    return age_limit
+
+
+def get_movie_age_limits(tmdb_ids: list[int], access_token: str, language: str,
+                         api_key: str = "") -> dict[int, int | None]:
+    """Fetch Spain age ratings for a batch of movies, reusing cached TMDb lookups."""
+    ids = list(dict.fromkeys(int(tmdb_id) for tmdb_id in tmdb_ids))
+    if not ids:
+        return {}
+    now = time.monotonic()
+    result: dict[int, int | None] = {}
+    missing: list[int] = []
+    with AGE_RATING_CACHE_LOCK:
+        for tmdb_id in ids:
+            cached = AGE_RATING_CACHE.get((tmdb_id, language))
+            if cached and cached[0] > now:
+                result[tmdb_id] = cached[1]
+            else:
+                missing.append(tmdb_id)
+    if missing:
+        with ThreadPoolExecutor(max_workers=min(4, len(missing))) as executor:
+            futures = {
+                executor.submit(_get_movie_age_limit, tmdb_id, access_token, language, api_key): tmdb_id
+                for tmdb_id in missing
+            }
+            for future in as_completed(futures):
+                tmdb_id = futures[future]
+                try:
+                    result[tmdb_id] = future.result()
+                except Exception:
+                    result[tmdb_id] = None
+    return result
 
 
 def get_candidate_details(kind: str, tmdb_id: int, access_token: str,
