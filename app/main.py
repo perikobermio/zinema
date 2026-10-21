@@ -3156,8 +3156,17 @@ def generate_incoming_destination(file_id: str,
             raise HTTPException(status_code=500, detail=f"Could not move incoming video: {exc}") from None
 
         request_matched = bool(entry["request_matched"])
-        sync_job_id = _start_sync_job() if request_matched else None
-        sync_queued = request_matched and sync_job_id is None and _schedule_sync_when_available()
+        sync_job_id = _start_sync_job()
+        sync_queued = False
+        previous_sync_job_id = ""
+        if sync_job_id is None:
+            sync_queued = _schedule_sync_when_available()
+            if sync_queued:
+                with closing(database()) as connection:
+                    latest = connection.execute(
+                        "SELECT id FROM sync_runs ORDER BY started_at DESC LIMIT 1"
+                    ).fetchone()
+                previous_sync_job_id = latest["id"] if latest else ""
         return {
             "moved": True,
             "destination_path": str(MEDIA_DISPLAY_ROOTS[library]
@@ -3165,6 +3174,7 @@ def generate_incoming_destination(file_id: str,
             "request_matched": request_matched,
             "catalog_sync_job_id": sync_job_id,
             "catalog_sync_queued": sync_queued,
+            "catalog_sync_previous_job_id": previous_sync_job_id,
         }
     finally:
         INCOMING_MOVE_LOCK.release()

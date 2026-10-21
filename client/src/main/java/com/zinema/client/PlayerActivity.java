@@ -50,6 +50,13 @@ public class PlayerActivity extends Activity {
             progressHandler.postDelayed(this, 1000L);
         }
     };
+    private final Runnable progressSaveTicker = new Runnable() {
+        @Override public void run() {
+            if (!internalPlayer || !prepared || playbackFinishing || videoView == null) return;
+            if (videoView.isPlaying()) saveCurrentProgress(false);
+            progressHandler.postDelayed(this, 15000L);
+        }
+    };
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -153,6 +160,8 @@ public class PlayerActivity extends Activity {
             videoView.requestFocus();
             progressHandler.removeCallbacks(nextEpisodeTicker);
             progressHandler.postDelayed(nextEpisodeTicker, 1000L);
+            progressHandler.removeCallbacks(progressSaveTicker);
+            progressHandler.postDelayed(progressSaveTicker, 15000L);
         });
         videoView.setOnCompletionListener(player -> finishWithProgress(true));
         videoView.setOnErrorListener((player, what, extra) -> {
@@ -215,6 +224,12 @@ public class PlayerActivity extends Activity {
         super.onPause();
     }
 
+    @Override protected void onDestroy() {
+        progressHandler.removeCallbacks(nextEpisodeTicker);
+        progressHandler.removeCallbacks(progressSaveTicker);
+        super.onDestroy();
+    }
+
     private void finishWithProgress(boolean completed) {
         playbackFinishing = true;
         if (videoView == null) {
@@ -234,6 +249,7 @@ public class PlayerActivity extends Activity {
         result.putExtra("extra_duration", duration);
         setResult(RESULT_OK, result);
         progressHandler.removeCallbacks(nextEpisodeTicker);
+        progressHandler.removeCallbacks(progressSaveTicker);
         if (videoView.isPlaying()) videoView.pause();
         finish();
     }

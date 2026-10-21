@@ -105,6 +105,7 @@ public class MainActivity extends Activity {
         LinearLayout cards;
         HorizontalScrollView horizontal;
         TextView status;
+        ProgressBar progress;
         int nextPage = 1;
         boolean hasMore = true;
         boolean loading;
@@ -128,7 +129,11 @@ public class MainActivity extends Activity {
     final Handler contentRequestSearchHandler = new Handler(Looper.getMainLooper());
     Runnable contentRequestSearchTask;
     Runnable adminSyncPollTask;
+    Runnable incomingCatalogSyncPollTask;
     Runnable nasDownloadPollTask;
+    String incomingCatalogSyncJobId = "";
+    String incomingCatalogSyncPreviousJobId = "";
+    boolean incomingCatalogSyncAwaitingJob;
     String incomingRefreshDownloadId = "";
     final LruCache<String, Bitmap> imageCache = new LruCache<String, Bitmap>(bitmapCacheBytes()) {
         @Override protected int sizeOf(String key, Bitmap value) {
@@ -157,12 +162,16 @@ public class MainActivity extends Activity {
     String selectedSection = "home";
     String lastSearchQuery;
     String detailNodeId = "";
+    String detailReturnFocusTag = "";
+    String pendingFocusRestoreTag = "";
     JSONObject currentDetailNode;
     String catalogVersion = "";
     int detailReturnScrollY;
     JSONObject externalRecommendationReturnNode;
     int externalRecommendationReturnScrollY;
     String loadingExternalRecommendationId = "";
+    String externalRecommendationReturnFocusTag = "";
+    final List<String> breadcrumbFocusTags = new ArrayList<>();
     int pendingListingRestoreY = -1;
     long lastCatalogVersionCheckMs;
     long lastProfileSyncMs;
@@ -639,6 +648,30 @@ public class MainActivity extends Activity {
             }
         }
         return null;
+    }
+
+    String focusedTagWithPrefix(String prefix) {
+        View focused = getCurrentFocus();
+        while (focused != null) {
+            Object tag = focused.getTag();
+            if (tag instanceof String && ((String) tag).startsWith(prefix)) return (String) tag;
+            if (!(focused.getParent() instanceof View)) break;
+            focused = (View) focused.getParent();
+        }
+        return "";
+    }
+
+    void restorePendingFocus() {
+        if (pendingFocusRestoreTag.isEmpty() || content == null) return;
+        String tag = pendingFocusRestoreTag;
+        content.post(() -> {
+            View target = findTaggedView(content, tag);
+            View focus = firstFocusable(target);
+            if (focus != null) {
+                pendingFocusRestoreTag = "";
+                focus.requestFocus();
+            }
+        });
     }
 
     TextView label(String text, int size, int color, boolean bold) {
@@ -1241,7 +1274,10 @@ public class MainActivity extends Activity {
                         }
                         else applyProfileState(activeId, stateResult.optJSONObject("state"));
                     }
-                    if (readProfiles().isEmpty()) openProfileManager();
+                    if (readProfiles().isEmpty()) {
+                        if (showingProfiles) renderProfileManager();
+                        else openProfileManager();
+                    }
                     else if (showingProfiles && !profileEditorVisible) renderProfileManager();
                     else if (!showingDetail && !showingAdmin && !showingProfiles && "home".equals(selectedSection)) {
                         renderHome();
@@ -1250,6 +1286,7 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 runOnUiThread(() -> {
                     profileSyncRunning = false;
+                    if (showingProfiles && !profileEditorVisible) renderProfileManager();
                     if (notifyError) Toast.makeText(MainActivity.this,
                             "No se pudieron sincronizar los perfiles: " + e.getMessage(), Toast.LENGTH_LONG).show();
                 });
@@ -1590,6 +1627,11 @@ public class MainActivity extends Activity {
         screen.addView(query, new LinearLayout.LayoutParams(-1, d(48)));
         LinearLayout results = new LinearLayout(this);
         results.setOrientation(LinearLayout.VERTICAL);
+        ProgressBar searchProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleSmall);
+        searchProgress.setVisibility(View.GONE);
+        LinearLayout.LayoutParams searchProgressParams = new LinearLayout.LayoutParams(d(24), d(24));
+        searchProgressParams.topMargin = d(8);
+        screen.addView(searchProgress, searchProgressParams);
         LinearLayout.LayoutParams resultsParams = new LinearLayout.LayoutParams(-1, -2);
         resultsParams.topMargin = d(8);
         screen.addView(results, resultsParams);
@@ -1707,6 +1749,7 @@ public class MainActivity extends Activity {
                 payload.put("items", items);
             } catch (JSONException ignored) { return; }
             submit.setEnabled(false);
+            submit.setText(t("Enviando solicitudes…"));
             io.execute(() -> {
                 try {
                     postJson("/api/v1/content-requests", payload);
@@ -1720,6 +1763,7 @@ public class MainActivity extends Activity {
                 } catch (Exception e) {
                     runOnUiThread(() -> {
                         submit.setEnabled(!requestItems.isEmpty());
+                        submit.setText(t("Enviar solicitudes") + " · " + requestItems.size());
                         Toast.makeText(this, t("No se pudo enviar la solicitud: ") + e.getMessage(),
                                 Toast.LENGTH_LONG).show();
                     });
@@ -1736,14 +1780,18 @@ public class MainActivity extends Activity {
                 String searchTerm = editable.toString().trim();
                 searchResults[0] = new JSONArray();
                 results.removeAllViews();
+                searchProgress.setVisibility(View.GONE);
                 if (searchTerm.length() < 2) return;
-                contentRequestSearchTask = () -> io.execute(() -> {
+                contentRequestSearchTask = () -> {
+                    searchProgress.setVisibility(View.VISIBLE);
+                    io.execute(() -> {
                     try {
                         JSONArray found = getJson("/api/v1/content-requests/search?q=" + enc(searchTerm))
                                 .optJSONArray("results");
                         runOnUiThread(() -> {
                             if (!showingAdmin || results.getParent() == null
                                     || !searchTerm.equals(query.getText().toString().trim())) return;
+                            searchProgress.setVisibility(View.GONE);
                             if (found == null || found.length() == 0) {
                                 results.removeAllViews();
                                 results.addView(label(t("No se encontraron resultados."), 13, MUTED, false));
@@ -1756,12 +1804,14 @@ public class MainActivity extends Activity {
                         runOnUiThread(() -> {
                             if (!showingAdmin || results.getParent() == null
                                     || !searchTerm.equals(query.getText().toString().trim())) return;
+                            searchProgress.setVisibility(View.GONE);
                             results.removeAllViews();
                             results.addView(label(t("No se pudo buscar en TMDb: ") + e.getMessage(),
                                     13, MUTED, false));
                         });
                     }
-                });
+                    });
+                };
                 contentRequestSearchHandler.postDelayed(contentRequestSearchTask, 350L);
             }
         });
@@ -2023,6 +2073,9 @@ public class MainActivity extends Activity {
         showingProfiles = true;
         profileEditorVisible = false;
         buildShell("Perfiles");
+        if (readProfiles().isEmpty()) showLoading(t("Cargando perfiles…"));
+        lastProfileSyncMs = 0L;
+        synchronizeProfilesFromServer(true);
         renderProfileManager();
     }
 
@@ -2041,6 +2094,19 @@ public class MainActivity extends Activity {
         body.addView(back, backParams);
         back.setOnClickListener(v -> onBackPressed());
         body.addView(label(t("¿Quién está viendo?"), 26, Color.WHITE, true));
+        if (profileSyncRunning) {
+            LinearLayout loading = new LinearLayout(this);
+            loading.setGravity(Gravity.CENTER_VERTICAL);
+            ProgressBar progress = new ProgressBar(this);
+            loading.addView(progress, new LinearLayout.LayoutParams(d(20), d(20)));
+            TextView loadingLabel = label(t("Sincronizando perfiles…"), 12, MUTED, false);
+            LinearLayout.LayoutParams loadingTextParams = new LinearLayout.LayoutParams(-2, -2);
+            loadingTextParams.leftMargin = d(9);
+            loading.addView(loadingLabel, loadingTextParams);
+            LinearLayout.LayoutParams loadingParams = new LinearLayout.LayoutParams(-1, -2);
+            loadingParams.topMargin = d(8);
+            body.addView(loading, loadingParams);
+        }
         TextView hint = label(t("Cada perfil conserva su lista y su progreso de reproducción."), 14, MUTED, false);
         hint.setPadding(0, d(6), 0, d(18));
         body.addView(hint);
@@ -2630,6 +2696,7 @@ public class MainActivity extends Activity {
             content.addView(empty);
         }
         restoreListingScrollIfPending();
+        restorePendingFocus();
         backfillMissingSeriesSuggestions();
     }
 
@@ -2660,7 +2727,7 @@ public class MainActivity extends Activity {
 
     void sortPendingHomeItems(List<JSONObject> nodes) {
         java.text.Collator collator = java.text.Collator.getInstance(
-                java.util.Locale.forLanguageTag("eu".equals(prefs.getString("language", "es")) ? "eu" : "es"));
+                java.util.Locale.forLanguageTag("eu".equals(prefs.getString("language", "eu")) ? "eu" : "es"));
         collator.setStrength(java.text.Collator.PRIMARY);
         Collections.sort(nodes, (left, right) -> {
             String leftTitle = left.optString("series_title", "") + " " + displayTitle(left);
@@ -2684,7 +2751,7 @@ public class MainActivity extends Activity {
         }
         List<String> result = new ArrayList<>(unique.values());
         java.text.Collator collator = java.text.Collator.getInstance(
-                java.util.Locale.forLanguageTag("eu".equals(prefs.getString("language", "es")) ? "eu" : "es"));
+                java.util.Locale.forLanguageTag("eu".equals(prefs.getString("language", "eu")) ? "eu" : "es"));
         collator.setStrength(java.text.Collator.PRIMARY);
         Collections.sort(result, (left, right) -> collator.compare(genreLabel(left), genreLabel(right)));
         return result;
@@ -3517,6 +3584,7 @@ public class MainActivity extends Activity {
                     : "No hay títulos en esta sección.");
         }
         restoreListingScrollIfPending();
+        restorePendingFocus();
     }
 
     void toggleAlphabet() {
@@ -3746,15 +3814,19 @@ public class MainActivity extends Activity {
             return;
         }
         String kind = node.optString("kind");
+        String sourceFocusTag = focusedTagWithPrefix("catalog-node:");
+        if (sourceFocusTag.isEmpty()) sourceFocusTag = focusedTagWithPrefix("recommendation:");
         if (kind.equals("collection")) {
             showingDetail = false;
             if (backButton != null) backButton.setVisibility(View.VISIBLE);
             breadcrumbScrollPositions.add(contentScroller == null ? 0 : contentScroller.getScrollY());
+            breadcrumbFocusTags.add(sourceFocusTag);
             breadcrumbs.add(node);
             currentLibrary = node.optString("library", currentLibrary);
             showCollectionContents(node);
         } else {
             detailReturnScrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
+            detailReturnFocusTag = sourceFocusTag;
             showingDetail = true;
             if (backButton != null) backButton.setVisibility(View.VISIBLE);
             io.execute(() -> {
@@ -4938,6 +5010,7 @@ public class MainActivity extends Activity {
         if (!externalRecommendation && (files == null || files.length() == 0)
                 && (children == null || children.length() == 0)
                 && !node.optString("kind").equals("movie")) addEmpty("No se encontraron episodios.");
+        restorePendingFocus();
     }
 
     String join(JSONArray values) {
@@ -4950,7 +5023,7 @@ public class MainActivity extends Activity {
     }
 
     String genreLabel(String genre) {
-        if (prefs == null || !"eu".equals(prefs.getString("language", "es"))) return genre;
+        if (prefs == null || !"eu".equals(prefs.getString("language", "eu"))) return genre;
         switch (genre) {
             case "Acción": return "Ekintza";
             case "Aventura": return "Abentura";
@@ -4983,7 +5056,7 @@ public class MainActivity extends Activity {
     }
 
     String kindLabel(String kind) {
-        if ("eu".equals(prefs.getString("language", "es"))) {
+        if ("eu".equals(prefs.getString("language", "eu"))) {
             if ("movie".equals(kind)) return "FILMA";
             if ("series".equals(kind)) return "TELESAILA";
             if ("season".equals(kind)) return "DENBORALDIA";
@@ -4999,7 +5072,7 @@ public class MainActivity extends Activity {
     }
 
     String t(String text) {
-        if (text == null || prefs == null || !"eu".equals(prefs.getString("language", "es"))) return text;
+        if (text == null || prefs == null || !"eu".equals(prefs.getString("language", "eu"))) return text;
         switch (text) {
             case "INCOMPLETA": return "OSATUGABEA";
             case "Serie incompleta": return "Telesaila osatu gabe";
@@ -5115,6 +5188,7 @@ public class MainActivity extends Activity {
             case "Añadir a la petición": return "Gehitu eskaerara";
             case "Elementos en la petición": return "Eskaerako elementuak";
             case "Enviar solicitudes": return "Eskaerak bidali";
+            case "Enviando solicitudes…": return "Eskaerak bidaltzen…";
             case "Quitar": return "Kendu";
             case "Ese contenido ya está en la petición.": return "Eduki hori dagoeneko eskaeran dago.";
             case "Puedes añadir hasta 20 elementos.": return "Gehienez 20 elementu gehi ditzakezu.";
@@ -5201,6 +5275,8 @@ public class MainActivity extends Activity {
             case "No hay títulos que coincidan con los géneros seleccionados.":
                 return "Ez dago hautatutako generoekin bat datorren izenbururik.";
             case "Cargando catálogo…": return "Katalogoa kargatzen…";
+            case "Cargando perfiles…": return "Profilak kargatzen…";
+            case "Sincronizando perfiles…": return "Profilak sinkronizatzen…";
             case "Cargando ficha…": return "Fitxa kargatzen…";
             case "Conectando con tu biblioteca…": return "Zure liburutegira konektatzen…";
             case "Buscar coincidencias en TMDb…": return "TMDb-n bat-etortzeak bilatzen…";
@@ -5290,6 +5366,10 @@ public class MainActivity extends Activity {
             case "No se encontró el detalle de este elemento.": return "Ez da elementu honen xehetasunik aurkitu.";
             case "No se pudo identificar el vídeo para reproducirlo.": return "Ezin izan da erreproduzitzeko bideoa identifikatu.";
             case "Preparando reproducción…": return "Erreprodukzioa prestatzen…";
+            case "Continuar viendo": return "Ikusten jarraitu";
+            case "¿Quieres continuar desde": return "Hemendik jarraitu nahi duzu";
+            case "Continuar": return "Jarraitu";
+            case "Empezar desde el principio": return "Hasieratik hasi";
             case "No se pudo buscar el siguiente capítulo: ": return "Ezin izan da hurrengo atala bilatu: ";
             case "No se pudo actualizar la cuenta.": return "Ezin izan da kontua eguneratu.";
             case "La descarga no coincide con la versión publicada.":
@@ -5476,9 +5556,16 @@ public class MainActivity extends Activity {
         title.setPadding(d(20), d(14), d(20), d(4));
         state.section.addView(title);
 
+        LinearLayout statusLine = new LinearLayout(this);
+        statusLine.setGravity(Gravity.CENTER_VERTICAL);
+        statusLine.setPadding(d(20), 0, d(20), d(6));
+        state.progress = new ProgressBar(this, null, android.R.attr.progressBarStyleSmall);
+        statusLine.addView(state.progress, new LinearLayout.LayoutParams(d(18), d(18)));
         state.status = label(t("Cargando sugerencias…"), 11, MUTED, false);
-        state.status.setPadding(d(20), 0, d(20), d(6));
-        state.section.addView(state.status);
+        LinearLayout.LayoutParams statusTextParams = new LinearLayout.LayoutParams(-1, -2);
+        statusTextParams.leftMargin = d(8);
+        statusLine.addView(state.status, statusTextParams);
+        state.section.addView(statusLine);
         state.status.setOnClickListener(v -> requestRecommendationsIfVisible(state.horizontal, true));
 
         state.horizontal = new HorizontalScrollView(this);
@@ -5514,6 +5601,7 @@ public class MainActivity extends Activity {
         if (state.nextPage > 1 && !loadNext) return;
 
         state.loading = true;
+        state.progress.setVisibility(View.VISIBLE);
         if (state.cards.getChildCount() == 0) {
             state.status.setText(t("Cargando sugerencias…"));
             state.status.setVisibility(View.VISIBLE);
@@ -5546,6 +5634,7 @@ public class MainActivity extends Activity {
             final String loadError = error;
             runOnUiThread(() -> {
                 state.loading = false;
+                state.progress.setVisibility(View.GONE);
                 if (!showingDetail || !state.nodeId.equals(detailNodeId)
                         || state.horizontal.getParent() == null) return;
                 state.nextPage = followingPage;
@@ -5591,6 +5680,8 @@ public class MainActivity extends Activity {
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(0, 0, 0, d(4));
         boolean inCatalog = "library".equals(state.scope);
+        String focusTag = "recommendation:" + state.scope + ":" + item.optString("id", "");
+        card.setTag(focusTag);
         if (inCatalog) {
             card.setFocusable(isTelevision());
             card.setClickable(true);
@@ -5645,6 +5736,7 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(d(104), -2);
         cardParams.setMargins(0, 0, d(9), 0);
         state.cards.addView(card, cardParams);
+        if (focusTag.equals(pendingFocusRestoreTag)) restorePendingFocus();
     }
 
     void openExternalRecommendation(JSONObject item) {
@@ -5655,6 +5747,7 @@ public class MainActivity extends Activity {
         if (tmdbId <= 0) return;
         externalRecommendationReturnNode = currentDetailNode;
         externalRecommendationReturnScrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
+        externalRecommendationReturnFocusTag = focusedTagWithPrefix("recommendation:");
         detailReturnScrollY = externalRecommendationReturnScrollY;
         loadingExternalRecommendationId = contentType + ":" + tmdbId;
         showingDetail = true;
@@ -6412,7 +6505,10 @@ public class MainActivity extends Activity {
             clearCatalogCache();
             catalogVersion = "";
             lastCatalogVersionCheckMs = 0L;
-            if (notifyCompletion) Toast.makeText(this, t("Sincronización completada"), Toast.LENGTH_LONG).show();
+            if (notifyCompletion) {
+                Toast.makeText(this, t("Sincronización completada"), Toast.LENGTH_LONG).show();
+                refreshCatalogAfterSync();
+            }
         } else if ("failed".equals(state)) {
             String error = job.optString("error", "");
             status.setText(t("Sincronización fallida") + (error.isEmpty() ? "" : ": " + error));
@@ -6426,6 +6522,84 @@ public class MainActivity extends Activity {
             status.setText(t("Estado") + ": " + state);
         }
         return active;
+    }
+
+    void refreshCatalogAfterSync() {
+        io.execute(() -> {
+            try {
+                List<JSONObject> updatedMovies = toList(getArray(catalogListingPath("movies", null)));
+                List<JSONObject> updatedSeries = toList(getArray(catalogListingPath("series", null)));
+                sortNewestFirst(updatedMovies);
+                sortNewestFirst(updatedSeries);
+                String version = fetchCatalogVersionSafely();
+                runOnUiThread(() -> {
+                    clearCatalogCache();
+                    movies = updatedMovies;
+                    series = updatedSeries;
+                    putCatalogList("movies", null, movies);
+                    putCatalogList("series", null, series);
+                    if (!version.isEmpty()) catalogVersion = version;
+                    lastCatalogVersionCheckMs = System.currentTimeMillis();
+                    if (!showingAdmin && !showingDetail && !showingProfiles
+                            && !libraryMode && "home".equals(selectedSection)) {
+                        int scrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
+                        renderHome();
+                        if (contentScroller != null)
+                            contentScroller.post(() -> contentScroller.scrollTo(0, scrollY));
+                    }
+                });
+            } catch (Exception ignored) { }
+        });
+    }
+
+    void monitorIncomingCatalogSync(String jobId, String previousJobId, boolean queued) {
+        incomingCatalogSyncJobId = jobId == null ? "" : jobId;
+        incomingCatalogSyncPreviousJobId = previousJobId == null ? "" : previousJobId;
+        incomingCatalogSyncAwaitingJob = incomingCatalogSyncJobId.isEmpty() && queued;
+        if (incomingCatalogSyncJobId.isEmpty() && !incomingCatalogSyncAwaitingJob) return;
+        scheduleIncomingCatalogSyncPoll(0L);
+    }
+
+    void scheduleIncomingCatalogSyncPoll(long delayMs) {
+        if (incomingCatalogSyncPollTask != null)
+            adminSyncHandler.removeCallbacks(incomingCatalogSyncPollTask);
+        incomingCatalogSyncPollTask = () -> {
+            incomingCatalogSyncPollTask = null;
+            io.execute(() -> {
+                try {
+                    JSONObject job = incomingCatalogSyncAwaitingJob
+                            ? getJson("/api/v1/admin/sync")
+                            : getJson("/api/v1/admin/sync/" + enc(incomingCatalogSyncJobId));
+                    String currentId = job.optString("id", "");
+                    if (incomingCatalogSyncAwaitingJob) {
+                        if (currentId.isEmpty() || currentId.equals(incomingCatalogSyncPreviousJobId)) {
+                            scheduleIncomingCatalogSyncPoll(2000L);
+                            return;
+                        }
+                        incomingCatalogSyncJobId = currentId;
+                        incomingCatalogSyncAwaitingJob = false;
+                    }
+                    String status = job.optString("status", "");
+                    if ("queued".equals(status) || "running".equals(status)) {
+                        scheduleIncomingCatalogSyncPoll(2000L);
+                    } else {
+                        runOnUiThread(() -> {
+                            if ("completed".equals(status)) {
+                                Toast.makeText(this, t("Sincronización completada"), Toast.LENGTH_LONG).show();
+                            } else if ("failed".equals(status)) {
+                                Toast.makeText(this, t("Sincronización fallida"), Toast.LENGTH_LONG).show();
+                            }
+                            refreshCatalogAfterSync();
+                        });
+                        incomingCatalogSyncJobId = "";
+                        incomingCatalogSyncPreviousJobId = "";
+                    }
+                } catch (Exception e) {
+                    scheduleIncomingCatalogSyncPoll(5000L);
+                }
+            });
+        };
+        adminSyncHandler.postDelayed(incomingCatalogSyncPollTask, delayMs);
     }
 
     void showSettings() {
@@ -6586,6 +6760,7 @@ public class MainActivity extends Activity {
 
     void renderAdminWindow() {
         content.removeAllViews();
+        boolean admin = canAccessAdminTools();
         LinearLayout screen = new LinearLayout(this);
         screen.setOrientation(LinearLayout.VERTICAL);
         screen.setPadding(d(20), d(14), d(20), d(24));
@@ -6599,6 +6774,7 @@ public class MainActivity extends Activity {
 
         LinearLayout topAdminRow = new LinearLayout(this);
         topAdminRow.setOrientation(LinearLayout.HORIZONTAL);
+        topAdminRow.setVisibility(admin ? View.VISIBLE : View.GONE);
         LinearLayout.LayoutParams topAdminRowParams = new LinearLayout.LayoutParams(-1, -2);
         screen.addView(topAdminRow, topAdminRowParams);
         LinearLayout downloadSlot = new LinearLayout(this);
@@ -6614,6 +6790,7 @@ public class MainActivity extends Activity {
 
         LinearLayout incomingSlot = new LinearLayout(this);
         incomingSlot.setOrientation(LinearLayout.VERTICAL);
+        incomingSlot.setVisibility(admin ? View.VISIBLE : View.GONE);
         LinearLayout.LayoutParams incomingSlotParams = new LinearLayout.LayoutParams(-1, -2);
         incomingSlotParams.topMargin = d(14);
         screen.addView(incomingSlot, incomingSlotParams);
@@ -6634,7 +6811,7 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams langButtonsP = new LinearLayout.LayoutParams(-1, -2);
         langButtonsP.topMargin = d(12);
         languageCard.addView(languageButtons, langButtonsP);
-        String activeLanguage = prefs.getString("language", "es");
+        String activeLanguage = prefs.getString("language", "eu");
         Button spanish = actionButton("Español", "es".equals(activeLanguage));
         languageButtons.addView(spanish, new LinearLayout.LayoutParams(0, d(46), 1));
         Button basque = actionButton("Euskara", "eu".equals(activeLanguage));
@@ -6678,10 +6855,12 @@ public class MainActivity extends Activity {
         attribution.setPadding(d(2), d(16), d(2), 0);
         screen.addView(attribution);
         content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
-        loadNasDownloadControls(downloadSlot);
-        loadAdminSyncControls(syncSlot);
-        loadIncomingControls(incomingSlot);
-        loadContentRequestControls(requestsSlot);
+        if (admin) {
+            loadNasDownloadControls(downloadSlot);
+            loadAdminSyncControls(syncSlot);
+            loadIncomingControls(incomingSlot);
+            loadContentRequestControls(requestsSlot);
+        }
     }
 
     void loadNasDownloadControls(LinearLayout slot) {
@@ -7031,16 +7210,17 @@ public class MainActivity extends Activity {
             try {
                 JSONObject result = postJson("/api/v1/admin/incoming/" + enc(fileId) + "/generate", payload);
                 runOnUiThread(() -> {
+                    String syncJobId = result.optString("catalog_sync_job_id", "");
+                    boolean syncQueued = result.optBoolean("catalog_sync_queued");
+                    monitorIncomingCatalogSync(syncJobId,
+                            result.optString("catalog_sync_previous_job_id", ""), syncQueued);
                     if (!showingAdmin) return;
-                    if (result.optBoolean("request_matched")) {
-                        String syncJobId = result.optString("catalog_sync_job_id", "");
-                        String message = !syncJobId.isEmpty()
-                                ? t("Fichero movido; sincronización del catálogo iniciada.")
-                                : result.optBoolean("catalog_sync_queued")
-                                    ? t("Fichero movido; sincronización del catálogo en cola.")
-                                    : t("Fichero movido; sincronización no disponible (configura TMDb).");
-                        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
-                    } else Toast.makeText(this, t("Fichero movido a su destino."), Toast.LENGTH_SHORT).show();
+                    String message = !syncJobId.isEmpty()
+                            ? t("Fichero movido; sincronización del catálogo iniciada.")
+                            : syncQueued
+                                ? t("Fichero movido; sincronización del catálogo en cola.")
+                                : t("Fichero movido; sincronización no disponible (configura TMDb).");
+                    Toast.makeText(this, message, Toast.LENGTH_LONG).show();
                     Button detect = (Button) ((ViewGroup) rows.getParent()).findViewWithTag("incoming-detect");
                     if (detect != null) detectIncomingVideos(rows, detect);
                     else rows.removeView((View) generate.getParent());
@@ -7706,7 +7886,7 @@ public class MainActivity extends Activity {
             return;
         }
         try {
-            Uri apkUri = Uri.parse("content://com.zinema.client.updates/zinema-prod.apk");
+            Uri apkUri = Uri.parse("content://" + getPackageName() + ".updates/zinema-prod.apk");
             Intent install = new Intent(Intent.ACTION_VIEW);
             install.setDataAndType(apkUri, "application/vnd.android.package-archive");
             install.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
@@ -7931,6 +8111,29 @@ public class MainActivity extends Activity {
         try { position = new JSONObject(prefs.getString(key, "{}")).optLong("position"); }
         catch (JSONException ignored) { }
         final long resumePosition = position;
+        if (resumePosition > 10000L) {
+            AlertDialog resumeDialog = new AlertDialog.Builder(this)
+                    .setTitle(t("Continuar viendo"))
+                    .setMessage(t("¿Quieres continuar desde") + " "
+                            + formatTime((int) Math.min(Integer.MAX_VALUE, resumePosition)) + "?")
+                    .setPositiveButton(t("Continuar"), (dialog, which) -> preparePlayback(
+                            path, title, posterUrl, ownerNodeId, resolvedItemId, ownerKind,
+                            key, resumePosition))
+                    .setNegativeButton(t("Empezar desde el principio"), (dialog, which) -> preparePlayback(
+                            path, title, posterUrl, ownerNodeId, resolvedItemId, ownerKind, key, 0L))
+                    .setNeutralButton(t("Cancelar"), null)
+                    .create();
+            resumeDialog.setOnShowListener(dialog -> {
+                if (isTelevision()) resumeDialog.getButton(AlertDialog.BUTTON_POSITIVE).requestFocus();
+            });
+            resumeDialog.show();
+            return;
+        }
+        preparePlayback(path, title, posterUrl, ownerNodeId, resolvedItemId, ownerKind, key, 0L);
+    }
+
+    void preparePlayback(String path, String title, String posterUrl, String ownerNodeId,
+                         String resolvedItemId, String ownerKind, String key, long resumePosition) {
         Toast.makeText(this, t("Preparando reproducción…"), Toast.LENGTH_SHORT).show();
         io.execute(() -> {
             try {
@@ -8174,6 +8377,8 @@ public class MainActivity extends Activity {
             int returnScrollY = externalRecommendationReturnScrollY;
             externalRecommendationReturnNode = null;
             loadingExternalRecommendationId = "";
+            pendingFocusRestoreTag = externalRecommendationReturnFocusTag;
+            externalRecommendationReturnFocusTag = "";
             renderDetail(returnNode);
             if (contentScroller != null)
                 contentScroller.post(() -> contentScroller.scrollTo(0, returnScrollY));
@@ -8181,6 +8386,8 @@ public class MainActivity extends Activity {
         }
         if (showingDetail) {
             showingDetail = false;
+            pendingFocusRestoreTag = detailReturnFocusTag;
+            detailReturnFocusTag = "";
             if (!breadcrumbs.isEmpty()) {
                 pendingListingRestoreY = detailReturnScrollY;
                 showCollectionContents(breadcrumbs.get(breadcrumbs.size() - 1));
@@ -8197,6 +8404,8 @@ public class MainActivity extends Activity {
         }
         if (!breadcrumbs.isEmpty()) {
             breadcrumbs.remove(breadcrumbs.size() - 1);
+            pendingFocusRestoreTag = breadcrumbFocusTags.isEmpty()
+                    ? "" : breadcrumbFocusTags.remove(breadcrumbFocusTags.size() - 1);
             int returnScrollY = breadcrumbScrollPositions.isEmpty()
                     ? 0 : breadcrumbScrollPositions.remove(breadcrumbScrollPositions.size() - 1);
             pendingListingRestoreY = returnScrollY;

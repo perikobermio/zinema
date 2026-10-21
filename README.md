@@ -167,7 +167,7 @@ El código del cliente está en [`client/`](client/). Para compilar el APK de de
 ./client/build-apk.sh
 ```
 
-El archivo queda en `client/build/outputs/apk/debug/zinema-client-debug.apk`. El cliente se conecta al dominio público configurado en la app y permite cambiarlo desde ajustes.
+El archivo queda en `client/build/outputs/apk/debug/debug.apk`. La versión debug usa un identificador de paquete propio y puede instalarse al lado de producción.
 
 ## Fuentes y acceso
 

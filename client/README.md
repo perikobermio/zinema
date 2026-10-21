@@ -34,7 +34,7 @@ Necesitas un JDK, Android SDK Platform 35 y Android Build Tools 36.0.0. Ejecuta:
 
 Define `ZINEMA_SERVER_URL` en el `.env` antes de compilar. El valor queda integrado en el APK; después de cambiarlo, vuelve a compilar.
 
-El APK firmado para depuración queda en `build/outputs/apk/debug/zinema-client-debug.apk`. El script compila y firma el paquete, pero no instala nada. La clave local de depuración se conserva en `.debug.keystore` (ignorada por Git) para que las compilaciones siguientes puedan instalarse como actualización. Puedes indicar otra ubicación del SDK con `ANDROID_SDK_ROOT`.
+El APK firmado para depuración queda en `build/outputs/apk/debug/debug.apk` y usa el paquete independiente `com.zinema.client.debug`, por lo que puede instalarse junto a producción. El script compila y firma el paquete, pero no instala nada. La clave local de depuración se conserva en `.debug.keystore` (ignorada por Git) para que las compilaciones siguientes puedan instalarse como actualización. Puedes indicar otra ubicación del SDK con `ANDROID_SDK_ROOT`.
 
 ## Publicar una actualización de producción
 

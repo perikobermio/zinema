@@ -43,11 +43,28 @@ mkdir -p "$BUILD_DIR/generated" "$BUILD_DIR/classes" "$BUILD_DIR/dex"
 mkdir -p "$BUILD_DIR/outputs/apk/debug"
 python3 "$CLIENT_DIR/generate_server_config.py" "$REPO_DIR/.env" \
     "$BUILD_DIR/generated/com/zinema/client/ServerConfig.java"
+python3 - "$CLIENT_DIR/src/main/AndroidManifest.xml" "$BUILD_DIR/AndroidManifest.xml" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+source = source.replace('package="com.zinema.client"', 'package="com.zinema.client.debug"', 1)
+source = source.replace('authorities="com.zinema.client.updates"',
+                        'authorities="com.zinema.client.debug.updates"', 1)
+source = source.replace('android:name=".UpdateApkProvider"',
+                        'android:name="com.zinema.client.UpdateApkProvider"')
+source = source.replace('android:name=".PlayerActivity"',
+                        'android:name="com.zinema.client.PlayerActivity"')
+source = source.replace('android:name=".MainActivity"',
+                        'android:name="com.zinema.client.MainActivity"')
+source = source.replace('android:label="Zinema"', 'android:label="Zinema Debug"', 1)
+Path(sys.argv[2]).write_text(source, encoding="utf-8")
+PY
 
 "$TOOLS/aapt2" compile --dir "$CLIENT_DIR/src/main/res" -o "$BUILD_DIR/resources.zip"
 "$TOOLS/aapt2" link \
     -o "$BUILD_DIR/unsigned.apk" \
-    --manifest "$CLIENT_DIR/src/main/AndroidManifest.xml" \
+    --manifest "$BUILD_DIR/AndroidManifest.xml" \
     -I "$ANDROID_JAR" \
     -A "$CLIENT_DIR/src/main/assets" \
     --java "$BUILD_DIR/generated" \
@@ -84,7 +101,7 @@ fi
     --ks "$DEBUG_KEYSTORE" \
     --ks-key-alias androiddebugkey \
     --ks-pass pass:android --key-pass pass:android \
-    --out "$BUILD_DIR/outputs/apk/debug/zinema-client-debug.apk" \
+    --out "$BUILD_DIR/outputs/apk/debug/debug.apk" \
     "$BUILD_DIR/aligned.apk"
-"$TOOLS/apksigner" verify "$BUILD_DIR/outputs/apk/debug/zinema-client-debug.apk"
-printf 'APK compilado: %s\n' "$BUILD_DIR/outputs/apk/debug/zinema-client-debug.apk"
+"$TOOLS/apksigner" verify "$BUILD_DIR/outputs/apk/debug/debug.apk"
+printf 'APK compilado: %s\n' "$BUILD_DIR/outputs/apk/debug/debug.apk"
