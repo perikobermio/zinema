@@ -4348,15 +4348,16 @@ public class MainActivity extends Activity {
                 }).show();
     }
 
-    void requestSeason(JSONObject seriesNode, JSONObject season) {
-        requestSeasonContent(seriesNode, season, true);
+    void requestSeason(JSONObject seriesNode, JSONObject season, TextView requestBadge) {
+        requestSeasonContent(seriesNode, season, true, requestBadge);
     }
 
-    void requestMissingSeasonEpisodes(JSONObject seriesNode, JSONObject season) {
-        requestSeasonContent(seriesNode, season, false);
+    void requestMissingSeasonEpisodes(JSONObject seriesNode, JSONObject season, TextView requestBadge) {
+        requestSeasonContent(seriesNode, season, false, requestBadge);
     }
 
-    void requestSeasonContent(JSONObject seriesNode, JSONObject season, boolean wholeSeason) {
+    void requestSeasonContent(JSONObject seriesNode, JSONObject season, boolean wholeSeason,
+                              TextView requestBadge) {
         String seriesId = seriesNode == null ? "" : seriesNode.optString("id", "");
         int seasonNumber = season == null ? 0 : season.optInt("season_number");
         if (seriesId.isEmpty() || seasonNumber <= 0) return;
@@ -4385,6 +4386,14 @@ public class MainActivity extends Activity {
                             runOnUiThread(() -> {
                                 try { season.put("request_status", "pending"); }
                                 catch (JSONException ignored) { }
+                                if (requestBadge != null) {
+                                    if (season.optBoolean("is_placeholder")) {
+                                        requestBadge.setText(t("Solicitada"));
+                                        requestBadge.setBackground(round(0xDD477A55, d(6)));
+                                    } else {
+                                        requestBadge.setVisibility(View.VISIBLE);
+                                    }
+                                }
                                 Toast.makeText(this, t("Solicitud enviada a administración."),
                                         Toast.LENGTH_LONG).show();
                             });
@@ -5486,6 +5495,7 @@ public class MainActivity extends Activity {
             List<TextView> seasonSelectionMarks = new ArrayList<>();
             List<TextView> seasonNumbers = new ArrayList<>();
             List<ImageView> seasonPosters = new ArrayList<>();
+            List<TextView> seasonRequestBadges = new ArrayList<>();
             for (JSONObject season : allSeasons) {
                 LinearLayout tile = new LinearLayout(this);
                 tile.setOrientation(LinearLayout.VERTICAL);
@@ -5512,6 +5522,7 @@ public class MainActivity extends Activity {
                 poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 posterFrame.addView(poster, new FrameLayout.LayoutParams(-1, -1));
                 seasonPosters.add(poster);
+                TextView requestBadge = null;
                 if (missingSeason) {
                     View shade = new View(this);
                     shade.setBackgroundColor(0xB8000000);
@@ -5525,6 +5536,7 @@ public class MainActivity extends Activity {
                             Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
                     missingParams.setMargins(d(4), 0, d(4), d(5));
                     posterFrame.addView(missing, missingParams);
+                    requestBadge = missing;
                 } else if (incomplete) {
                     TextView incompleteFlag = label("⚠", 15, 0xFF211600, true);
                     incompleteFlag.setGravity(Gravity.CENTER);
@@ -5535,15 +5547,18 @@ public class MainActivity extends Activity {
                     incompleteParams.setMargins(0, d(4), d(4), 0);
                     posterFrame.addView(incompleteFlag, incompleteParams);
                 }
-                if (!missingSeason && alreadyRequested) {
+                if (!missingSeason && incomplete) {
                     TextView requestedFlag = label(t("Solicitada"), 9, Color.WHITE, true);
                     requestedFlag.setPadding(d(5), d(4), d(5), d(4));
                     requestedFlag.setBackground(round(0xDD477A55, d(6)));
+                    requestedFlag.setVisibility(alreadyRequested ? View.VISIBLE : View.GONE);
                     FrameLayout.LayoutParams requestedParams = new FrameLayout.LayoutParams(
                             -2, -2, Gravity.BOTTOM | Gravity.LEFT);
                     requestedParams.setMargins(d(4), 0, 0, d(4));
                     posterFrame.addView(requestedFlag, requestedParams);
+                    requestBadge = requestedFlag;
                 }
+                seasonRequestBadges.add(requestBadge);
                 TextView selectedMark = label("✓", 16, 0xFF241A00, true);
                 selectedMark.setGravity(Gravity.CENTER);
                 selectedMark.setBackground(round(0xFFFFC857, d(20)));
@@ -5593,6 +5608,7 @@ public class MainActivity extends Activity {
             for (int i = 0; i < allSeasons.size(); i++) {
                 final JSONObject season = allSeasons.get(i);
                 final View tile = seasonTiles.get(i);
+                final TextView requestBadge = seasonRequestBadges.get(i);
                 final boolean missingSeason = season.optBoolean("is_placeholder");
                 final boolean incomplete = season.optBoolean("incomplete")
                         || season.optInt("missing_episode_count") > 0;
@@ -5611,9 +5627,9 @@ public class MainActivity extends Activity {
                             Toast.makeText(this, t("Esta temporada ya tiene una solicitud."),
                                     Toast.LENGTH_LONG).show();
                         } else if (missingSeason) {
-                            requestSeason(seriesNode, season);
+                            requestSeason(seriesNode, season, requestBadge);
                         } else {
-                            requestMissingSeasonEpisodes(seriesNode, season);
+                            requestMissingSeasonEpisodes(seriesNode, season, requestBadge);
                         }
                         return true;
                     });
