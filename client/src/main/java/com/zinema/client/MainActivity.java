@@ -5955,6 +5955,10 @@ public class MainActivity extends Activity {
             case "Solicitudes de contenido": return "Eduki-eskaerak";
             case "pendientes": return "zain";
             case "No hay solicitudes de contenido.": return "Ez dago eduki-eskaerarik.";
+            case "Descargar": return "Deskargatu";
+            case "Selecciona el archivo": return "Hautatu fitxategia";
+            case "Iniciando…": return "Hasten…";
+            case "Descarga iniciada en Incoming.": return "Deskarga Incoming karpetan hasi da.";
             case "Temporadas restantes": return "Gainerako denboraldiak";
             case "Solicitó": return "Eskatzailea";
             case "Aprobada": return "Onartuta";
@@ -8175,6 +8179,32 @@ public class MainActivity extends Activity {
                         LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(-1, -2);
                         actionsParams.topMargin = d(7);
                         detailsColumn.addView(actions, actionsParams);
+                        JSONArray telegramDownloads = request.optJSONArray("telegram_downloads");
+                        if (telegramDownloads != null && telegramDownloads.length() > 0) {
+                            Button download = actionButton(t("Descargar"), false);
+                            actions.addView(download, new LinearLayout.LayoutParams(-2, d(40)));
+                            download.setOnClickListener(v -> {
+                                if (telegramDownloads.length() == 1) {
+                                    startContentRequestDownload(request, telegramDownloads.optJSONObject(0), download);
+                                    return;
+                                }
+                                String[] choices = new String[telegramDownloads.length()];
+                                for (int j = 0; j < telegramDownloads.length(); j++) {
+                                    JSONObject candidate = telegramDownloads.optJSONObject(j);
+                                    String filename = candidate == null ? "" : candidate.optString("filename", "");
+                                    int season = candidate == null ? 0 : candidate.optInt("season_number");
+                                    int episode = candidate == null ? 0 : candidate.optInt("episode_number");
+                                    String episodeLabel = season > 0 && episode > 0
+                                            ? String.format(java.util.Locale.ROOT, " · S%02dE%02d", season, episode)
+                                            : "";
+                                    choices[j] = filename + episodeLabel;
+                                }
+                                new AlertDialog.Builder(this).setTitle(t("Selecciona el archivo"))
+                                        .setItems(choices, (dialog, which) -> startContentRequestDownload(
+                                                request, telegramDownloads.optJSONObject(which), download))
+                                        .setNegativeButton(t("Cancelar"), null).show();
+                            });
+                        }
                         if ("pending".equals(requestStatus)) {
                             Button approve = actionButton(t("Validar"), true);
                             actions.addView(approve, new LinearLayout.LayoutParams(-2, d(40)));
@@ -8201,6 +8231,35 @@ public class MainActivity extends Activity {
                 });
             } catch (Exception ignored) {
                 // The protected endpoint stays hidden for non-administrator accounts.
+            }
+        });
+    }
+
+    void startContentRequestDownload(JSONObject request, JSONObject candidate, Button button) {
+        if (request == null || candidate == null) return;
+        String requestId = request.optString("id", "");
+        int messageId = candidate.optInt("message_id");
+        if (requestId.isEmpty() || messageId <= 0) return;
+        String initialText = button.getText().toString();
+        button.setEnabled(false);
+        button.setText(t("Iniciando…"));
+        io.execute(() -> {
+            try {
+                JSONObject payload = new JSONObject();
+                payload.put("message_id", messageId);
+                postJson("/api/v1/admin/content-requests/" + enc(requestId) + "/download", payload);
+                runOnUiThread(() -> {
+                    button.setText(t("Descarga en curso…"));
+                    Toast.makeText(this, t("Descarga iniciada en Incoming."), Toast.LENGTH_LONG).show();
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> {
+                    button.setEnabled(true);
+                    button.setText(initialText);
+                    String message = error.getMessage() == null ? "" : error.getMessage();
+                    Toast.makeText(this, t("No se pudo iniciar la descarga: ") + message,
+                            Toast.LENGTH_LONG).show();
+                });
             }
         });
     }

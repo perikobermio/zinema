@@ -37,6 +37,8 @@ NAS_SCRIPTS_PATH=${NAS_SCRIPTS_PATH:-/d/NAS/scripts}
 [ -w "$NAS_SCRIPTS_PATH" ] || fail "Docker/este usuario no puede escribir en: $NAS_SCRIPTS_PATH"
 [ -f "$NAS_SCRIPTS_PATH/telegram_download.py" ] || fail "No existe $NAS_SCRIPTS_PATH/telegram_download.py"
 [ -r "$NAS_SCRIPTS_PATH/telegram_download.py" ] || fail "No se puede leer $NAS_SCRIPTS_PATH/telegram_download.py"
+[ -f "$NAS_SCRIPTS_PATH/telegram_download_scan.py" ] || fail "No existe $NAS_SCRIPTS_PATH/telegram_download_scan.py"
+[ -r "$NAS_SCRIPTS_PATH/telegram_download_scan.py" ] || fail "No se puede leer $NAS_SCRIPTS_PATH/telegram_download_scan.py"
 if [ -z "${TMDB_ACCESS_TOKEN:-}" ]; then
     printf 'AVISO: falta TMDB_ACCESS_TOKEN; el escaneo funcionará, pero la sincronización de metadata no.\n'
 fi

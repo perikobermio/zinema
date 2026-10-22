@@ -9,6 +9,7 @@ import secrets
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import unicodedata
@@ -46,6 +47,7 @@ MEDIA_DISPLAY_ROOTS = {
 INCOMING_DISPLAY_ROOT = Path(os.getenv("INCOMING_DISPLAY_ROOT", "/d/NAS/Incoming")).resolve()
 NAS_SCRIPTS_ROOT = Path(os.getenv("NAS_SCRIPTS_ROOT", "/d/NAS/scripts")).resolve()
 NAS_DOWNLOADER_SCRIPT = NAS_SCRIPTS_ROOT / "telegram_download.py"
+NAS_DOWNLOAD_SCANNER_SCRIPT = NAS_SCRIPTS_ROOT / "telegram_download_scan.py"
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/zinema.sqlite3"))
 TMDB_ACCESS_TOKEN = os.getenv("TMDB_ACCESS_TOKEN", "")
 TMDB_KEY = os.getenv("TMDB_KEY", "") if not TMDB_ACCESS_TOKEN else ""
@@ -62,6 +64,9 @@ SYNC_RETRY_LOCK = threading.Lock()
 SYNC_RETRY_SCHEDULED = False
 INCOMING_MOVE_LOCK = threading.Lock()
 NAS_DOWNLOAD_LOCK = threading.Lock()
+TELEGRAM_SCAN_LOCK = threading.Lock()
+TELEGRAM_SCAN_CACHE: dict[str, object] = {"checked_at": 0.0, "media": []}
+TELEGRAM_SCAN_CACHE_SECONDS = 60.0
 INCOMING_SCAN_LOCK = threading.Lock()
 INCOMING_ACTIVITY_LOCK = threading.Lock()
 INCOMING_MONITOR_WAKE = threading.Event()
@@ -163,6 +168,10 @@ class ContentRequestCreate(BaseModel):
 
 class IncomingGenerateRequest(BaseModel):
     destination_path: str = Field(min_length=1, max_length=2000)
+
+
+class ContentRequestDownload(BaseModel):
+    message_id: int = Field(gt=0)
 
 
 class UserProfileRequest(BaseModel):
@@ -1778,10 +1787,13 @@ def _record_nas_download_output(line: str) -> None:
     _update_nas_download_state(**values)
 
 
-def _run_nas_download(job_id: str) -> None:
+def _run_nas_download(job_id: str, message_id: int | None = None) -> None:
     try:
+        command = [sys.executable, "-u", str(NAS_DOWNLOADER_SCRIPT), "--force"]
+        if message_id is not None:
+            command.extend(["--message-id", str(message_id)])
         process = subprocess.Popen(
-            ["python", "-u", str(NAS_DOWNLOADER_SCRIPT), "--force"],
+            command,
             cwd=str(NAS_SCRIPTS_ROOT),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -3189,6 +3201,109 @@ def create_content_request(request: ContentRequestCreate,
             "status": "pending", "created_at": now}
 
 
+def _telegram_saved_media() -> list[dict[str, object]]:
+    now = time.monotonic()
+    if (now - float(TELEGRAM_SCAN_CACHE.get("checked_at") or 0.0)
+            < TELEGRAM_SCAN_CACHE_SECONDS):
+        return list(TELEGRAM_SCAN_CACHE.get("media") or [])
+    # Avoid opening Telethon's SQLite session while the downloader is using it.
+    with NAS_DOWNLOAD_LOCK:
+        if NAS_DOWNLOAD_STATE["status"] in {"starting", "running"}:
+            return list(TELEGRAM_SCAN_CACHE.get("media") or [])
+    with TELEGRAM_SCAN_LOCK:
+        now = time.monotonic()
+        if (now - float(TELEGRAM_SCAN_CACHE.get("checked_at") or 0.0)
+                < TELEGRAM_SCAN_CACHE_SECONDS):
+            return list(TELEGRAM_SCAN_CACHE.get("media") or [])
+        media: list[dict[str, object]] = []
+        if NAS_DOWNLOAD_SCANNER_SCRIPT.is_file():
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(NAS_DOWNLOAD_SCANNER_SCRIPT), "--limit", "1000"],
+                    cwd=str(NAS_SCRIPTS_ROOT), capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=45, check=False,
+                )
+                if result.returncode == 0:
+                    parsed = json.loads(result.stdout)
+                    if isinstance(parsed, list):
+                        media = [item for item in parsed if isinstance(item, dict)]
+            except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+                media = []
+        TELEGRAM_SCAN_CACHE.update({"checked_at": time.monotonic(), "media": media})
+        return media
+
+
+def _download_match_tokens(value: object) -> list[str]:
+    text = unicodedata.normalize("NFKD", str(value or "")).encode(
+        "ascii", "ignore",
+    ).decode("ascii").lower()
+    ignored = {"the", "and", "el", "la", "los", "las", "de", "del", "a", "an", "of"}
+    return [token for token in re.findall(r"[a-z0-9]+", text)
+            if len(token) > 1 and token not in ignored]
+
+
+def _request_telegram_downloads(request: dict[str, object],
+                                media: list[dict[str, object]]) -> list[dict[str, object]]:
+    details = request.get("details") or {}
+    if not isinstance(details, dict):
+        details = {}
+    required_tokens = _download_match_tokens(request.get("title"))
+    if not required_tokens:
+        return []
+    request_type = str(request.get("request_type") or "")
+    content_type = str(request.get("content_type") or "")
+    request_season = int(request.get("season_number") or details.get("season_number") or 0)
+    requested_episodes = {int(value) for value in details.get("missing_episode_numbers") or []}
+    episode_map = {
+        int(value["season_number"]): {int(number) for number in value.get("episode_numbers") or []}
+        for value in details.get("missing_episodes") or []
+        if isinstance(value, dict) and value.get("season_number") is not None
+    }
+    if request_type == "remaining_seasons" and not request_season and details.get("missing_seasons"):
+        target_seasons = {int(value) for value in details.get("missing_seasons") or []}
+    else:
+        target_seasons = {request_season} if request_season else set(episode_map)
+
+    matches = []
+    for item in media:
+        filename = str(item.get("filename") or "")
+        haystack = _download_match_tokens(" ".join((
+            filename, str(item.get("title") or ""), str(item.get("caption") or ""),
+        )))
+        haystack_set = set(haystack)
+        overlap = sum(1 for token in required_tokens if token in haystack_set)
+        if overlap / len(required_tokens) < (0.75 if len(required_tokens) > 1 else 1.0):
+            continue
+
+        item_season = int(item["season_number"]) if item.get("season_number") is not None else None
+        item_episode = int(item["episode_number"]) if item.get("episode_number") is not None else None
+        if content_type == "movie" and item_season is not None:
+            continue
+        if target_seasons:
+            if item_season is None or item_season not in target_seasons:
+                continue
+            wanted = (requested_episodes if request_season
+                      else episode_map.get(item_season, set()))
+            if wanted and (item_episode is None or item_episode not in wanted):
+                continue
+
+        request_year = request.get("year")
+        if request_year:
+            found_years = {int(year) for year in re.findall(r"\b(?:19|20|21)\d{2}\b", " ".join((
+                filename, str(item.get("caption") or ""),
+            )))}
+            if found_years and int(request_year) not in found_years:
+                continue
+        matches.append({
+            "message_id": int(item["message_id"]),
+            "filename": filename or str(item.get("title") or "Telegram media"),
+            "size_bytes": int(item.get("size_bytes") or 0),
+            "season_number": item_season,
+            "episode_number": item_episode,
+        })
+    return matches
+
+
 @app.get("/api/v1/admin/content-requests", dependencies=[Depends(require_admin)])
 def list_content_requests() -> list[dict[str, object]]:
     with closing(database()) as connection:
@@ -3206,18 +3321,54 @@ def list_content_requests() -> list[dict[str, object]]:
         except HTTPException:
             pass
     results = []
+    saved_media = _telegram_saved_media() if rows else []
     for row in rows:
         if row["status"] == "approved" and row["id"] in incoming_request_ids:
             continue
         details = json.loads(row["details_json"] or "{}")
-        results.append({**{key: row[key] for key in (
+        request_payload = {**{key: row[key] for key in (
         "id", "requester_name", "request_type", "content_type", "tmdb_id",
         "title", "year", "season_number", "catalog_node_id", "status", "created_at",
         "telegram_sent_at",
         )}, "details": details,
         "poster_path": details.get("poster_path"),
-        "poster_url": details.get("poster_url")})
+        "poster_url": details.get("poster_url")}
+        request_payload["telegram_downloads"] = _request_telegram_downloads(
+            request_payload, saved_media,
+        )
+        results.append(request_payload)
     return results
+
+
+@app.post("/api/v1/admin/content-requests/{request_id}/download", status_code=202,
+          dependencies=[Depends(require_admin)])
+def start_content_request_download(request_id: str,
+                                  request: ContentRequestDownload) -> dict[str, object]:
+    with closing(database()) as connection:
+        row = connection.execute(
+            "SELECT * FROM content_requests WHERE id=?", (request_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Content request not found")
+    request_payload = {key: row[key] for key in (
+        "id", "requester_name", "request_type", "content_type", "tmdb_id", "title",
+        "year", "season_number", "catalog_node_id",
+    )}
+    try:
+        request_payload["details"] = json.loads(row["details_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        request_payload["details"] = {}
+    downloads = _request_telegram_downloads(request_payload, _telegram_saved_media())
+    if not any(int(item["message_id"]) == request.message_id for item in downloads):
+        # Force a fresh scan once to avoid rejecting a file that appeared after the
+        # cached request list was rendered, while still validating the requested ID.
+        with TELEGRAM_SCAN_LOCK:
+            TELEGRAM_SCAN_CACHE["checked_at"] = 0.0
+        downloads = _request_telegram_downloads(request_payload, _telegram_saved_media())
+    if not any(int(item["message_id"]) == request.message_id for item in downloads):
+        raise HTTPException(status_code=409,
+                            detail="No se encontró ese archivo descargable para esta solicitud")
+    return _start_nas_download(request.message_id)
 
 
 def content_request_thumbnail(connection: sqlite3.Connection, request: sqlite3.Row,
@@ -3493,9 +3644,7 @@ def list_incoming_videos() -> list[dict[str, object]]:
         return _incoming_entries(connection)
 
 
-@app.post("/api/v1/admin/incoming-download", status_code=202,
-          dependencies=[Depends(require_admin)])
-def start_nas_catalog_download() -> dict[str, object]:
+def _start_nas_download(message_id: int | None = None) -> dict[str, object]:
     if not NAS_DOWNLOADER_SCRIPT.is_file():
         raise HTTPException(status_code=503, detail="NAS downloader script is not mounted")
     _scan_incoming_download_activity()
@@ -3512,9 +3661,15 @@ def start_nas_catalog_download() -> dict[str, object]:
             "exit_code": None, "error": None, "_awaiting_file_settle": False,
         })
     INCOMING_MONITOR_WAKE.set()
-    threading.Thread(target=_run_nas_download, args=(job_id,), daemon=True,
+    threading.Thread(target=_run_nas_download, args=(job_id, message_id), daemon=True,
                      name=f"nas-download-{job_id[:8]}").start()
     return {"id": job_id, "status": "starting"}
+
+
+@app.post("/api/v1/admin/incoming-download", status_code=202,
+          dependencies=[Depends(require_admin)])
+def start_nas_catalog_download() -> dict[str, object]:
+    return _start_nas_download()
 
 
 @app.get("/api/v1/admin/incoming-download", dependencies=[Depends(require_admin)])
