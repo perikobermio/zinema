@@ -46,8 +46,8 @@ MEDIA_DISPLAY_ROOTS = {
 }
 INCOMING_DISPLAY_ROOT = Path(os.getenv("INCOMING_DISPLAY_ROOT", "/d/NAS/Incoming")).resolve()
 NAS_SCRIPTS_ROOT = Path(os.getenv("NAS_SCRIPTS_ROOT", "/d/NAS/scripts")).resolve()
-NAS_DOWNLOADER_SCRIPT = NAS_SCRIPTS_ROOT / "telegram_download.py"
-NAS_DOWNLOAD_SCANNER_SCRIPT = NAS_SCRIPTS_ROOT / "telegram_download_scan.py"
+NAS_DOWNLOADER_SCRIPT = NAS_SCRIPTS_ROOT / "telegram_download_zinema.py"
+NAS_DOWNLOAD_SCANNER_SCRIPT = NAS_SCRIPTS_ROOT / "telegram_download_scan_zinema.py"
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/zinema.sqlite3"))
 TMDB_ACCESS_TOKEN = os.getenv("TMDB_ACCESS_TOKEN", "")
 TMDB_KEY = os.getenv("TMDB_KEY", "") if not TMDB_ACCESS_TOKEN else ""

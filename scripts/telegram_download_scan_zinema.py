@@ -11,7 +11,7 @@ from pathlib import Path
 
 from telethon import TelegramClient
 
-from telegram_download import (
+from telegram_download_zinema import (
     API_HASH,
     API_ID,
     CHAT_ID,
