@@ -975,8 +975,10 @@ def _media_titles_similar(left: str, right: str) -> bool:
                 count += 1
                 distinctive = distinctive or min(len(word), len(candidate)) >= 5
                 break
-    return (distinctive and count >= 2 and count / len(left_words) >= 0.8
-            and count / len(right_words) >= 0.5)
+    left_coverage = count / len(left_words)
+    right_coverage = count / len(right_words)
+    return (distinctive and count >= 2 and min(left_coverage, right_coverage) >= 0.5
+            and max(left_coverage, right_coverage) >= 0.8)
 
 
 def _incoming_guess(path: Path) -> dict[str, object]:
@@ -2275,6 +2277,8 @@ def list_catalog(
     library: str = Query(pattern="^(movies|series)$"),
     parent_id: str | None = None,
 ) -> list[dict]:
+    if parent_id is None:
+        _scan_incoming_download_activity()
     with closing(database()) as connection:
         if parent_id is not None:
             parent = connection.execute(
@@ -2928,8 +2932,18 @@ def list_content_requests() -> list[dict[str, object]]:
                ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'sending' THEN 1 ELSE 2 END,
                         created_at DESC"""
         ).fetchall()
+        incoming_request_ids: set[str] = set()
+        try:
+            incoming_request_ids = {
+                str(item["request_id"]) for item in _incoming_entries(connection)
+                if item.get("request_id")
+            }
+        except HTTPException:
+            pass
     results = []
     for row in rows:
+        if row["status"] == "approved" and row["id"] in incoming_request_ids:
+            continue
         details = json.loads(row["details_json"] or "{}")
         results.append({**{key: row[key] for key in (
         "id", "requester_name", "request_type", "content_type", "tmdb_id",

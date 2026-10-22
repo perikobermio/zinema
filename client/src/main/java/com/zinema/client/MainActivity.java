@@ -2762,11 +2762,17 @@ public class MainActivity extends Activity {
         List<JSONObject> visibleSeries = filterKidCatalog(series);
         if (!favorites.isEmpty()) addRow("Mi lista", favorites);
         List<JSONObject> pendingItems = new ArrayList<>();
+        List<JSONObject> incomingMoveItems = new ArrayList<>();
         Set<String> pendingIds = new HashSet<>();
         for (JSONObject node : visibleMovies)
             collectPendingHomeItems(node, "", pendingItems, pendingIds);
         for (JSONObject node : visibleSeries)
             collectPendingHomeItems(node, "", pendingItems, pendingIds);
+        Set<String> incomingMoveIds = new HashSet<>();
+        for (JSONObject node : visibleMovies)
+            collectIncomingHomeItems(node, incomingMoveItems, incomingMoveIds);
+        for (JSONObject node : visibleSeries)
+            collectIncomingHomeItems(node, incomingMoveItems, incomingMoveIds);
         List<JSONObject> catalogItems = new ArrayList<>();
         for (JSONObject node : visibleMovies)
             if (!node.optBoolean("is_placeholder") && "movie".equals(node.optString("kind")))
@@ -2778,6 +2784,8 @@ public class MainActivity extends Activity {
         addRow("Lo más nuevo", catalogItems);
         sortPendingHomeItems(pendingItems);
         addRow("Pendientes de añadir", pendingItems);
+        sortPendingHomeItems(incomingMoveItems);
+        addRow("Pendientes de mover", incomingMoveItems);
         for (String genre : homeGenres(catalogItems)) {
             List<JSONObject> genreItems = new ArrayList<>();
             for (JSONObject node : catalogItems) {
@@ -2806,6 +2814,7 @@ public class MainActivity extends Activity {
     void collectPendingHomeItems(JSONObject node, String parentSeriesTitle,
                                  List<JSONObject> output, Set<String> includedIds) {
         if (node == null) return;
+        if (node.optBoolean("is_incoming_pending")) return;
         if (node.optBoolean("is_placeholder")) {
             String id = node.optString("id", "");
             if (!id.isEmpty() && includedIds.add(id)) {
@@ -2826,6 +2835,20 @@ public class MainActivity extends Activity {
         if (children == null) return;
         for (int i = 0; i < children.length(); i++)
             collectPendingHomeItems(children.optJSONObject(i), seriesTitle, output, includedIds);
+    }
+
+    void collectIncomingHomeItems(JSONObject node, List<JSONObject> output,
+                                  Set<String> includedIds) {
+        if (node == null) return;
+        if (node.optBoolean("is_incoming_pending")) {
+            String id = node.optString("id", "");
+            if (!id.isEmpty() && includedIds.add(id)) output.add(node);
+            return;
+        }
+        JSONArray children = node.optJSONArray("children");
+        if (children == null) return;
+        for (int i = 0; i < children.length(); i++)
+            collectIncomingHomeItems(children.optJSONObject(i), output, includedIds);
     }
 
     void sortPendingHomeItems(List<JSONObject> nodes) {
@@ -5660,6 +5683,7 @@ public class MainActivity extends Activity {
             case "Pendientes de añadir": return "Gehitzeko zain";
             case "A la espera de ser añadido": return "Gehitzeko zain";
             case "Pendiente de mover": return "Mugitzeko zain";
+            case "Pendientes de mover": return "Mugitzeko zain";
             case "Temporadas pendientes": return "Gehitzeko zain dauden denboraldiak";
             case "Cargando episodios…": return "Atalak kargatzen…";
             case "No se pudieron cargar los episodios: ": return "Ezin izan dira atalak kargatu: ";
