@@ -180,6 +180,7 @@ public class MainActivity extends Activity {
     Runnable catalogDownloadStatusTask;
     boolean catalogDownloadStatusRequestRunning;
     JSONObject catalogDownloadStatus = new JSONObject();
+    LinearLayout adminContentRequestsSlot;
     String incomingCatalogSyncJobId = "";
     String incomingCatalogSyncPreviousJobId = "";
     boolean incomingCatalogSyncAwaitingJob;
@@ -5957,6 +5958,10 @@ public class MainActivity extends Activity {
             case "No hay solicitudes de contenido.": return "Ez dago eduki-eskaerarik.";
             case "Descargar": return "Deskargatu";
             case "Selecciona el archivo": return "Hautatu fitxategia";
+            case "Capítulos disponibles": return "Atal eskuragarriak";
+            case "Expandir capítulos": return "Zabaldu atalak";
+            case "Contraer capítulos": return "Tolestu atalak";
+            case "Descarga capítulo": return "Atala deskargatu";
             case "Iniciando…": return "Hasten…";
             case "Descarga iniciada en Incoming.": return "Deskarga Incoming karpetan hasi da.";
             case "Temporadas restantes": return "Gainerako denboraldiak";
@@ -6893,6 +6898,22 @@ public class MainActivity extends Activity {
         return button;
     }
 
+    Button iconActionButton(int iconResource, String accessibilityLabel, boolean primary,
+                            int iconSizeDp, boolean transparentBackground) {
+        Button button = actionButton("", primary);
+        button.setPadding(0, 0, 0, 0);
+        button.setMinWidth(d(44));
+        android.graphics.drawable.Drawable icon = getDrawable(iconResource);
+        if (icon != null) {
+            int iconSize = d(iconSizeDp);
+            icon.setBounds(0, 0, iconSize, iconSize);
+            button.setCompoundDrawables(null, icon, null, null);
+        }
+        if (transparentBackground) button.setBackgroundColor(Color.TRANSPARENT);
+        button.setContentDescription(t(accessibilityLabel));
+        return button;
+    }
+
     void showSearch() {
         leaveStartupHomeWait();
         showingDetail = false;
@@ -7607,6 +7628,7 @@ public class MainActivity extends Activity {
         screen.addView(incomingSlot, incomingSlotParams);
 
         LinearLayout requestsSlot = new LinearLayout(this);
+        adminContentRequestsSlot = requestsSlot;
         requestsSlot.setOrientation(LinearLayout.VERTICAL);
         requestsSlot.setVisibility(View.GONE);
         LinearLayout.LayoutParams requestsSlotParams = new LinearLayout.LayoutParams(-1, -2);
@@ -7841,6 +7863,7 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     if (!showingAdmin || status.getParent() == null) return;
                     applyNasDownloadState(state, status, progress, start, true);
+                    refreshContentRequestDownloadIndicators(state);
                     scheduleNasDownloadPoll(state.optString("id", ""), status, progress, start);
                 });
             } catch (Exception e) {
@@ -8089,6 +8112,10 @@ public class MainActivity extends Activity {
         io.execute(() -> {
             try {
                 JSONArray requests = getArray("/api/v1/admin/content-requests");
+                JSONObject downloadState = null;
+                try { downloadState = getJson("/api/v1/admin/incoming-download"); }
+                catch (Exception ignored) { }
+                JSONObject activeDownloadState = downloadState;
                 runOnUiThread(() -> {
                     if (!showingAdmin || slot.getParent() == null) return;
                     slot.removeAllViews();
@@ -8112,7 +8139,7 @@ public class MainActivity extends Activity {
                         JSONObject request = requests.optJSONObject(i);
                         if (request == null) continue;
                         LinearLayout row = new LinearLayout(this);
-                        row.setGravity(Gravity.CENTER_VERTICAL);
+                        row.setGravity(Gravity.TOP);
                         LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, -2);
                         rowParams.topMargin = d(14);
                         card.addView(row, rowParams);
@@ -8174,15 +8201,120 @@ public class MainActivity extends Activity {
                         LinearLayout.LayoutParams infoParams = new LinearLayout.LayoutParams(-1, -2);
                         infoParams.topMargin = d(4);
                         detailsColumn.addView(info, infoParams);
+                        JSONArray telegramDownloads = request.optJSONArray("telegram_downloads");
+                        boolean hasTelegramDownloads = telegramDownloads != null
+                                && telegramDownloads.length() > 0;
+                        boolean isSeriesRequest = "tv".equals(request.optString("content_type"));
+                        if (hasTelegramDownloads && isSeriesRequest) {
+                            LinearLayout episodesHeader = new LinearLayout(this);
+                            episodesHeader.setGravity(Gravity.CENTER_VERTICAL);
+                            LinearLayout.LayoutParams episodesHeaderParams =
+                                    new LinearLayout.LayoutParams(-1, -2);
+                            episodesHeaderParams.topMargin = d(6);
+                            detailsColumn.addView(episodesHeader, episodesHeaderParams);
+                            TextView episodesLabel = label(t("Capítulos disponibles") + " · "
+                                    + telegramDownloads.length(), 12, MUTED, true);
+                            episodesHeader.addView(episodesLabel,
+                                    new LinearLayout.LayoutParams(0, -2, 1));
+                            LinearLayout episodesPanel = new LinearLayout(this);
+                            episodesPanel.setOrientation(LinearLayout.VERTICAL);
+                            episodesPanel.setVisibility(View.GONE);
+                            episodesPanel.setTag("request-download-episodes-panel:"
+                                    + request.optString("id", ""));
+                            LinearLayout.LayoutParams episodesPanelParams =
+                                    new LinearLayout.LayoutParams(-1, -2);
+                            episodesPanelParams.topMargin = d(4);
+                            detailsColumn.addView(episodesPanel, episodesPanelParams);
+                            for (int j = 0; j < telegramDownloads.length(); j++) {
+                                JSONObject candidate = telegramDownloads.optJSONObject(j);
+                                if (candidate == null) continue;
+                                LinearLayout episodeRow = new LinearLayout(this);
+                                episodeRow.setGravity(Gravity.CENTER_VERTICAL);
+                                episodeRow.setPadding(d(8), d(3), d(4), d(3));
+                                episodeRow.setBackground(round(0x6622252C, d(6)));
+                                int messageId = candidate.optInt("message_id");
+                                episodeRow.setTag("request-download-episode:" + messageId);
+                                LinearLayout.LayoutParams episodeRowParams =
+                                        new LinearLayout.LayoutParams(-1, -2);
+                                episodeRowParams.topMargin = d(3);
+                                episodesPanel.addView(episodeRow, episodeRowParams);
+                                String filename = candidate.optString("filename", "");
+                                int season = candidate.optInt("season_number");
+                                int episode = candidate.optInt("episode_number");
+                                String episodeLabel = season > 0 && episode > 0
+                                        ? String.format(java.util.Locale.ROOT, "S%02dE%02d · ", season, episode)
+                                        : "";
+                                TextView episodeName = labelRaw(episodeLabel + filename, 12,
+                                        Color.WHITE, false);
+                                episodeName.setMaxLines(2);
+                                episodeName.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                                LinearLayout episodeInfo = new LinearLayout(this);
+                                episodeInfo.setOrientation(LinearLayout.VERTICAL);
+                                episodeRow.addView(episodeInfo,
+                                        new LinearLayout.LayoutParams(0, -2, 1));
+                                episodeInfo.addView(episodeName);
+                                LinearLayout episodeProgressRow = new LinearLayout(this);
+                                episodeProgressRow.setGravity(Gravity.CENTER_VERTICAL);
+                                episodeProgressRow.setVisibility(View.GONE);
+                                episodeProgressRow.setTag("request-download-progress-row:" + messageId);
+                                LinearLayout.LayoutParams episodeProgressRowParams =
+                                        new LinearLayout.LayoutParams(-1, d(12));
+                                episodeProgressRowParams.topMargin = d(3);
+                                episodeInfo.addView(episodeProgressRow, episodeProgressRowParams);
+                                ProgressBar episodeProgress = new ProgressBar(this, null,
+                                        android.R.attr.progressBarStyleHorizontal);
+                                episodeProgress.setMax(100);
+                                episodeProgress.setProgressTintList(
+                                        android.content.res.ColorStateList.valueOf(Color.WHITE));
+                                episodeProgress.setProgressBackgroundTintList(
+                                        android.content.res.ColorStateList.valueOf(0x66FFFFFF));
+                                episodeProgress.setTag("request-download-progress:" + messageId);
+                                episodeProgressRow.addView(episodeProgress,
+                                        new LinearLayout.LayoutParams(0, d(4), 1));
+                                TextView episodePercent = label("", 10, Color.WHITE, true);
+                                episodePercent.setTag("request-download-percent:" + messageId);
+                                episodePercent.setPadding(d(6), 0, d(2), 0);
+                                episodeProgressRow.addView(episodePercent,
+                                        new LinearLayout.LayoutParams(-2, -2));
+                                Button episodeDownload = iconActionButton(
+                                        R.drawable.ic_request_download, "Descarga capítulo", false, 22, false);
+                                episodeDownload.setTag("request-download-button:" + messageId);
+                                LinearLayout.LayoutParams episodeDownloadParams =
+                                        new LinearLayout.LayoutParams(d(44), d(40));
+                                episodeDownloadParams.leftMargin = d(5);
+                                episodeRow.addView(episodeDownload, episodeDownloadParams);
+                                episodeDownload.setOnClickListener(v ->
+                                        startContentRequestDownload(request, candidate, episodeDownload));
+                            }
+                            Button expandEpisodes = iconActionButton(
+                                    R.drawable.ic_expand_more, "Expandir capítulos", false, 34, true);
+                            expandEpisodes.setTag("request-download-expander:"
+                                    + request.optString("id", ""));
+                            episodesHeader.addView(expandEpisodes,
+                                    new LinearLayout.LayoutParams(d(48), d(48)));
+                            expandEpisodes.setOnClickListener(v -> {
+                                boolean expanded = episodesPanel.getVisibility() != View.VISIBLE;
+                                episodesPanel.setVisibility(expanded ? View.VISIBLE : View.GONE);
+                                android.graphics.drawable.Drawable arrow = getDrawable(expanded
+                                        ? R.drawable.ic_expand_less : R.drawable.ic_expand_more);
+                                if (arrow != null) {
+                                    int arrowSize = d(34);
+                                    arrow.setBounds(0, 0, arrowSize, arrowSize);
+                                    expandEpisodes.setCompoundDrawables(null, arrow, null, null);
+                                }
+                                expandEpisodes.setContentDescription(t(expanded
+                                        ? "Contraer capítulos" : "Expandir capítulos"));
+                            });
+                        }
                         LinearLayout actions = new LinearLayout(this);
                         actions.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
                         LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(-1, -2);
                         actionsParams.topMargin = d(7);
                         detailsColumn.addView(actions, actionsParams);
-                        JSONArray telegramDownloads = request.optJSONArray("telegram_downloads");
-                        if (telegramDownloads != null && telegramDownloads.length() > 0) {
-                            Button download = actionButton(t("Descargar"), false);
-                            actions.addView(download, new LinearLayout.LayoutParams(-2, d(40)));
+                        if (hasTelegramDownloads && !isSeriesRequest) {
+                            Button download = iconActionButton(
+                                    R.drawable.ic_request_download, "Descargar", false, 22, false);
+                            actions.addView(download, new LinearLayout.LayoutParams(d(44), d(40)));
                             download.setOnClickListener(v -> {
                                 if (telegramDownloads.length() == 1) {
                                     startContentRequestDownload(request, telegramDownloads.optJSONObject(0), download);
@@ -8206,18 +8338,21 @@ public class MainActivity extends Activity {
                             });
                         }
                         if ("pending".equals(requestStatus)) {
-                            Button approve = actionButton(t("Validar"), true);
-                            actions.addView(approve, new LinearLayout.LayoutParams(-2, d(40)));
+                            Button approve = iconActionButton(
+                                    R.drawable.ic_request_approve, "Validar", true, 22, false);
+                            actions.addView(approve, new LinearLayout.LayoutParams(d(44), d(40)));
                             approve.setOnClickListener(v -> updateContentRequest(
                                     request.optString("id"), "approve", approve, slot));
                         } else if ("approved".equals(requestStatus)) {
-                            Button resend = actionButton(t("Reenviar a Telegram"), true);
-                            actions.addView(resend, new LinearLayout.LayoutParams(-2, d(40)));
+                            Button resend = iconActionButton(
+                                    R.drawable.ic_request_resend, "Reenviar a Telegram", true, 22, false);
+                            actions.addView(resend, new LinearLayout.LayoutParams(d(44), d(40)));
                             resend.setOnClickListener(v -> updateContentRequest(
                                     request.optString("id"), "resend", resend, slot));
                         }
-                        Button delete = actionButton(t("Borrar"), false);
-                        LinearLayout.LayoutParams deleteParams = new LinearLayout.LayoutParams(-2, d(40));
+                        Button delete = iconActionButton(
+                                R.drawable.ic_request_delete, "Borrar", false, 22, false);
+                        LinearLayout.LayoutParams deleteParams = new LinearLayout.LayoutParams(d(44), d(40));
                         deleteParams.leftMargin = d(8);
                         actions.addView(delete, deleteParams);
                         delete.setOnClickListener(v -> new AlertDialog.Builder(this)
@@ -8228,11 +8363,89 @@ public class MainActivity extends Activity {
                                         updateContentRequest(request.optString("id"), "delete", delete, slot))
                                 .show());
                     }
+                    refreshContentRequestDownloadIndicators(activeDownloadState);
                 });
             } catch (Exception ignored) {
                 // The protected endpoint stays hidden for non-administrator accounts.
             }
         });
+    }
+
+    void refreshContentRequestDownloadIndicators(JSONObject state) {
+        if (state == null || adminContentRequestsSlot == null) return;
+        String downloadStatus = state.optString("status", "idle");
+        boolean active = "starting".equals(downloadStatus) || "running".equals(downloadStatus);
+        int currentMessageId = state.optInt("current_message_id", 0);
+        double percent = downloadPercentFromState(state);
+        updateContentRequestDownloadIndicators(adminContentRequestsSlot, active,
+                currentMessageId, percent);
+    }
+
+    void updateContentRequestDownloadIndicators(View view, boolean active,
+                                                 int currentMessageId, double percent) {
+        if (view == null) return;
+        Object tagValue = view.getTag();
+        if (tagValue instanceof String) {
+            String tag = (String) tagValue;
+            if (tag.startsWith("request-download-episode:")) {
+                int messageId = parseTaggedMessageId(tag);
+                View progressRow = view.findViewWithTag("request-download-progress-row:" + messageId);
+                View progressView = view.findViewWithTag("request-download-progress:" + messageId);
+                View percentView = view.findViewWithTag("request-download-percent:" + messageId);
+                boolean episodeActive = active && messageId > 0 && messageId == currentMessageId;
+                if (episodeActive && view.getParent() instanceof View) {
+                    View episodePanel = (View) view.getParent();
+                    episodePanel.setVisibility(View.VISIBLE);
+                    Object panelTag = episodePanel.getTag();
+                    if (panelTag instanceof String
+                            && ((String) panelTag).startsWith("request-download-episodes-panel:")) {
+                        String requestId = ((String) panelTag).substring(
+                                "request-download-episodes-panel:".length());
+                        View expander = adminContentRequestsSlot.findViewWithTag(
+                                "request-download-expander:" + requestId);
+                        if (expander instanceof Button) {
+                            android.graphics.drawable.Drawable arrow = getDrawable(R.drawable.ic_expand_less);
+                            if (arrow != null) {
+                                int arrowSize = d(34);
+                                arrow.setBounds(0, 0, arrowSize, arrowSize);
+                                ((Button) expander).setCompoundDrawables(null, arrow, null, null);
+                            }
+                            expander.setContentDescription(t("Contraer capítulos"));
+                        }
+                    }
+                }
+                if (progressRow != null) progressRow.setVisibility(episodeActive ? View.VISIBLE : View.GONE);
+                if (progressView instanceof ProgressBar && episodeActive) {
+                    ProgressBar bar = (ProgressBar) progressView;
+                    bar.setIndeterminate(percent < 0.0);
+                    if (percent >= 0.0) bar.setProgress((int) Math.round(percent));
+                }
+                if (percentView instanceof TextView && episodeActive)
+                    ((TextView) percentView).setText(percent >= 0.0
+                            ? String.format(java.util.Locale.US, "%.0f%%", percent) : "…");
+            } else if (tag.startsWith("request-download-button:")) {
+                int messageId = parseTaggedMessageId(tag);
+                boolean episodeActive = active && messageId > 0 && messageId == currentMessageId;
+                Button button = (Button) view;
+                button.setEnabled(!episodeActive);
+                button.setText("");
+                button.setContentDescription(t(episodeActive
+                        ? "Descarga en curso…" : "Descarga capítulo"));
+            }
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++)
+                updateContentRequestDownloadIndicators(group.getChildAt(i), active,
+                        currentMessageId, percent);
+        }
+    }
+
+    int parseTaggedMessageId(String tag) {
+        int separator = tag.lastIndexOf(':');
+        if (separator < 0 || separator == tag.length() - 1) return 0;
+        try { return Integer.parseInt(tag.substring(separator + 1)); }
+        catch (NumberFormatException ignored) { return 0; }
     }
 
     void startContentRequestDownload(JSONObject request, JSONObject candidate, Button button) {
@@ -8241,21 +8454,25 @@ public class MainActivity extends Activity {
         int messageId = candidate.optInt("message_id");
         if (requestId.isEmpty() || messageId <= 0) return;
         String initialText = button.getText().toString();
+        CharSequence initialDescription = button.getContentDescription();
         button.setEnabled(false);
-        button.setText(t("Iniciando…"));
+        button.setText("…");
+        button.setContentDescription(t("Iniciando…"));
         io.execute(() -> {
             try {
                 JSONObject payload = new JSONObject();
                 payload.put("message_id", messageId);
                 postJson("/api/v1/admin/content-requests/" + enc(requestId) + "/download", payload);
                 runOnUiThread(() -> {
-                    button.setText(t("Descarga en curso…"));
+                    button.setText("…");
+                    button.setContentDescription(t("Descarga en curso…"));
                     Toast.makeText(this, t("Descarga iniciada en Incoming."), Toast.LENGTH_LONG).show();
                 });
             } catch (Exception error) {
                 runOnUiThread(() -> {
                     button.setEnabled(true);
                     button.setText(initialText);
+                    button.setContentDescription(initialDescription);
                     String message = error.getMessage() == null ? "" : error.getMessage();
                     Toast.makeText(this, t("No se pudo iniciar la descarga: ") + message,
                             Toast.LENGTH_LONG).show();

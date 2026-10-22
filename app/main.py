@@ -78,7 +78,7 @@ INCOMING_MONITOR_IDLE_INTERVAL_SECONDS = 60.0
 INCOMING_MONITOR_ACTIVE_INTERVAL_SECONDS = 1.0
 NAS_DOWNLOAD_STATE: dict[str, object] = {
     "id": None, "status": "idle", "progress": "", "current_file": None, "started_at": None,
-    "current_title": None, "current_percent": None, "downloaded_bytes": 0,
+    "current_title": None, "current_message_id": None, "current_percent": None, "downloaded_bytes": 0,
     "total_bytes": 0, "current_bytes": 0, "current_path": None, "source": None,
     "completed_at": None, "exit_code": None, "error": None,
 }
@@ -1771,6 +1771,9 @@ def _record_nas_download_output(line: str) -> None:
     if title_match:
         values["current_title"] = title_match.group(1).strip()
         values["total_bytes"] = int(float(title_match.group(2)) * 1024 * 1024)
+    message_match = re.search(r"(?i)\b(?:mensaje|message)\s+(\d+)\b", text)
+    if message_match:
+        values["current_message_id"] = int(message_match.group(1))
     size_match = re.search(r"([\d.]+)\s*/\s*([\d.]+)\s*MB", text, re.IGNORECASE)
     if size_match:
         values["downloaded_bytes"] = int(float(size_match.group(1)) * 1024 * 1024)
@@ -3654,7 +3657,8 @@ def _start_nas_download(message_id: int | None = None) -> dict[str, object]:
         job_id = uuid4().hex
         NAS_DOWNLOAD_STATE.update({
             "id": job_id, "status": "starting", "progress": "Iniciando descarga…",
-            "current_file": None, "current_title": None, "current_percent": None,
+            "current_file": None, "current_title": None, "current_message_id": message_id,
+            "current_percent": None,
             "downloaded_bytes": 0, "total_bytes": 0,
             "current_bytes": 0, "current_path": None, "source": "app",
             "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": None,
