@@ -3242,12 +3242,12 @@ public class MainActivity extends Activity {
             art.addView(collectionIcon, collectionParams);
         }
         if ("series".equals(node.optString("kind")) && node.optBoolean("incomplete")) {
-            TextView incomplete = label(t("INCOMPLETA"), 9, 0xFF211600, true);
+            TextView incomplete = label("⚠", 17, 0xFF211600, true);
             incomplete.setGravity(Gravity.CENTER);
-            incomplete.setPadding(d(8), d(6), d(8), d(6));
-            incomplete.setBackground(round(0xFFFFC857, d(9)));
+            incomplete.setContentDescription(t("Serie incompleta"));
+            incomplete.setBackground(round(0xFFFFC857, d(18)));
             FrameLayout.LayoutParams incompleteParams = new FrameLayout.LayoutParams(
-                    -2, -2, Gravity.TOP | Gravity.RIGHT);
+                    d(32), d(32), Gravity.TOP | Gravity.RIGHT);
             incompleteParams.setMargins(0, d(7), d(7), 0);
             art.addView(incomplete, incompleteParams);
         }
@@ -5526,12 +5526,12 @@ public class MainActivity extends Activity {
                     missingParams.setMargins(d(4), 0, d(4), d(5));
                     posterFrame.addView(missing, missingParams);
                 } else if (incomplete) {
-                    TextView incompleteFlag = label(t("INCOMPLETA"), 9, 0xFF211600, true);
+                    TextView incompleteFlag = label("⚠", 15, 0xFF211600, true);
                     incompleteFlag.setGravity(Gravity.CENTER);
-                    incompleteFlag.setPadding(d(5), d(4), d(5), d(4));
-                    incompleteFlag.setBackground(round(0xFFFFC857, d(6)));
+                    incompleteFlag.setContentDescription(t("Temporada incompleta"));
+                    incompleteFlag.setBackground(round(0xFFFFC857, d(16)));
                     FrameLayout.LayoutParams incompleteParams = new FrameLayout.LayoutParams(
-                            -2, -2, Gravity.TOP | Gravity.RIGHT);
+                            d(28), d(28), Gravity.TOP | Gravity.RIGHT);
                     incompleteParams.setMargins(0, d(4), d(4), 0);
                     posterFrame.addView(incompleteFlag, incompleteParams);
                 }
@@ -5798,6 +5798,7 @@ public class MainActivity extends Activity {
         switch (text) {
             case "INCOMPLETA": return "OSATUGABEA";
             case "Serie incompleta": return "Telesaila osatu gabe";
+            case "Temporada incompleta": return "Denboraldia osatu gabe";
             case "Faltan": return "Falta dira";
             case "capítulo": return "atal";
             case "capítulos": return "atal";

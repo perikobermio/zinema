@@ -858,32 +858,22 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
                 targeted.add(int(request_row["season_number"]))
             else:
                 explicit = details.get("season_number") or request_row["season_number"]
-                if explicit is not None:
-                    targeted.add(int(explicit))
+                # Legacy series-wide requests do not reliably describe which
+                # individual seasons were intended. They may contain stale
+                # completion data, so only season-scoped requests set a badge.
+                if explicit is None:
+                    continue
                 current_missing = {
                     int(value["season_number"]): {int(number) for number in value["episode_numbers"]}
                     for value in node.get("missing_episodes", [])
                 }
-                if explicit is not None:
-                    requested_numbers = {int(number) for number in
-                                         details.get("missing_episode_numbers") or []}
-                    if requested_numbers & current_missing.get(int(explicit), set()):
-                        targeted.add(int(explicit))
-                else:
-                    # Old series-wide requests can contain episodes that metadata
-                    # no longer considers missing (for example, special episodes).
-                    # Keep a season marked only while its requested episodes remain missing.
-                    for value in details.get("missing_episodes") or []:
-                        number = value.get("season_number")
-                        if number is None:
-                            continue
-                        requested_numbers = {int(episode) for episode in
-                                             value.get("episode_numbers") or []}
-                        if requested_numbers & current_missing.get(int(number), set()):
-                            targeted.add(int(number))
-                    targeted.update(int(value) for value in details.get("missing_seasons") or [])
-                    if not details.get("missing_episodes") and int(details.get("missing_episode_count") or 0) > 0:
-                        targeted.update(current_missing)
+                current_missing_seasons = {int(value) for value in node.get("missing_seasons", [])}
+                requested_numbers = {int(number) for number in
+                                     details.get("missing_episode_numbers") or []}
+                if requested_numbers & current_missing.get(int(explicit), set()):
+                    targeted.add(int(explicit))
+                if int(explicit) in current_missing_seasons:
+                    targeted.add(int(explicit))
             for number in targeted:
                 season_request_statuses[number] = request_row["status"]
         node["season_request_statuses"] = {
