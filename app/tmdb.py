@@ -263,10 +263,13 @@ def _write_season_artwork(connection: sqlite3.Connection, node: sqlite3.Row, det
         for episode in episodes:
             episode_number = episode.get("episode_number")
             air_date = (episode.get("air_date") or "")[:10]
+            episode_type = str(episode.get("episode_type") or "").strip().lower()
             if (season_number > 0 and episode_number is not None and int(episode_number) > 0
-                    and air_date and air_date <= today):
+                    and air_date and air_date <= today
+                    and episode_type not in {"special", "reunion"}):
                 aired_episodes.append({"season_number": season_number,
-                                       "episode_number": int(episode_number)})
+                                       "episode_number": int(episode_number),
+                                       "episode_type": episode_type})
             episode_title = (episode.get("name") or "").strip()
             if episode_number is not None and episode_title:
                 connection.execute(

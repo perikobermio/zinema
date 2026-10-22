@@ -385,6 +385,17 @@ def database() -> sqlite3.Connection:
         connection.execute(
             "INSERT INTO app_settings(key, value) VALUES ('episode_still_artwork_v1', '1')"
         )
+    episode_type_migration = connection.execute(
+        "SELECT value FROM app_settings WHERE key='episode_type_completion_v1'"
+    ).fetchone()
+    if episode_type_migration is None:
+        connection.execute(
+            "UPDATE catalog_nodes SET episode_metadata_checked_at=NULL "
+            "WHERE kind='series' AND tmdb_id IS NOT NULL"
+        )
+        connection.execute(
+            "INSERT INTO app_settings(key, value) VALUES ('episode_type_completion_v1', '1')"
+        )
     approval_migration = connection.execute(
         "SELECT value FROM app_settings WHERE key='account_approval_enforced_v1'"
     ).fetchone()
@@ -697,6 +708,8 @@ def _series_completion(connection: sqlite3.Connection, series_id: str,
                    for item in present_rows}
         missing_by_season: dict[int, list[int]] = {}
         for episode in expected:
+            if str(episode.get("episode_type") or "").strip().lower() in {"special", "reunion"}:
+                continue
             season_number = int(episode["season_number"])
             episode_number = int(episode["episode_number"])
             if (season_number, episode_number) not in present:
@@ -796,13 +809,30 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
                 explicit = details.get("season_number") or request_row["season_number"]
                 if explicit is not None:
                     targeted.add(int(explicit))
-                targeted.update(int(value) for value in details.get("missing_seasons") or [])
-                targeted.update(int(value["season_number"])
-                                for value in details.get("missing_episodes") or []
-                                if value.get("season_number") is not None)
-                if explicit is None and int(details.get("missing_episode_count") or 0) > 0:
-                    targeted.update(int(value["season_number"])
-                                    for value in node.get("missing_episodes", []))
+                current_missing = {
+                    int(value["season_number"]): {int(number) for number in value["episode_numbers"]}
+                    for value in node.get("missing_episodes", [])
+                }
+                if explicit is not None:
+                    requested_numbers = {int(number) for number in
+                                         details.get("missing_episode_numbers") or []}
+                    if requested_numbers & current_missing.get(int(explicit), set()):
+                        targeted.add(int(explicit))
+                else:
+                    # Old series-wide requests can contain episodes that metadata
+                    # no longer considers missing (for example, special episodes).
+                    # Keep a season marked only while its requested episodes remain missing.
+                    for value in details.get("missing_episodes") or []:
+                        number = value.get("season_number")
+                        if number is None:
+                            continue
+                        requested_numbers = {int(episode) for episode in
+                                             value.get("episode_numbers") or []}
+                        if requested_numbers & current_missing.get(int(number), set()):
+                            targeted.add(int(number))
+                    targeted.update(int(value) for value in details.get("missing_seasons") or [])
+                    if not details.get("missing_episodes") and int(details.get("missing_episode_count") or 0) > 0:
+                        targeted.update(current_missing)
             for number in targeted:
                 season_request_statuses[number] = request_row["status"]
         node["season_request_statuses"] = {
