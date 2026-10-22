@@ -46,6 +46,8 @@ import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.content.Context;
 import android.widget.Button;
+import android.widget.ArrayAdapter;
+import android.widget.AdapterView;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -57,6 +59,7 @@ import android.widget.PopupMenu;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.webkit.JavascriptInterface;
@@ -101,6 +104,7 @@ public class MainActivity extends Activity {
     static class RecommendationRowState {
         String nodeId;
         String scope;
+        String kind;
         LinearLayout section;
         LinearLayout cards;
         HorizontalScrollView horizontal;
@@ -110,6 +114,48 @@ public class MainActivity extends Activity {
         boolean hasMore = true;
         boolean loading;
         final Set<String> seen = new HashSet<>();
+    }
+
+    final class DownloadProgressOverlay extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private double percent;
+
+        DownloadProgressOverlay(double value) {
+            super(MainActivity.this);
+            setClickable(false);
+            setFocusable(false);
+            setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
+            setProgress(value);
+        }
+
+        void setProgress(double value) {
+            percent = Math.max(0.0, Math.min(100.0, value));
+            setContentDescription(t("Descarga en curso") + ": "
+                    + Math.round(percent) + "%");
+            invalidate();
+        }
+
+        @Override protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float width = getWidth();
+            float height = getHeight();
+            float revealedHeight = (float) (height * percent / 100.0);
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(0xB8000000);
+            canvas.drawRect(0, 0, width, height - revealedHeight, paint);
+            float barHeight = d(25);
+            float barTop = height - barHeight;
+            paint.setColor(0xCC080A0E);
+            canvas.drawRect(0, barTop, width, height, paint);
+            paint.setColor(RED);
+            canvas.drawRect(0, barTop, width * (float) (percent / 100.0), height, paint);
+            paint.setColor(Color.WHITE);
+            paint.setTextSize(d(12));
+            paint.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
+            String text = Math.round(percent) + "%";
+            canvas.drawText(text, Math.max(d(5), width - paint.measureText(text) - d(7)),
+                    barTop + barHeight * 0.69f, paint);
+        }
     }
 
     static final Pattern EPISODE_MARKER_PATTERN = Pattern.compile(
@@ -126,11 +172,15 @@ public class MainActivity extends Activity {
     final ExecutorService io = Executors.newFixedThreadPool(4);
     final Handler adminSyncHandler = new Handler(Looper.getMainLooper());
     final Handler nasDownloadHandler = new Handler(Looper.getMainLooper());
+    final Handler downloadProgressHandler = new Handler(Looper.getMainLooper());
     final Handler contentRequestSearchHandler = new Handler(Looper.getMainLooper());
     Runnable contentRequestSearchTask;
     Runnable adminSyncPollTask;
     Runnable incomingCatalogSyncPollTask;
     Runnable nasDownloadPollTask;
+    Runnable catalogDownloadStatusTask;
+    boolean catalogDownloadStatusRequestRunning;
+    JSONObject catalogDownloadStatus = new JSONObject();
     String incomingCatalogSyncJobId = "";
     String incomingCatalogSyncPreviousJobId = "";
     boolean incomingCatalogSyncAwaitingJob;
@@ -180,6 +230,7 @@ public class MainActivity extends Activity {
     boolean profileStateSyncRunning;
     boolean profileStateSyncPending;
     boolean hasResumedOnce;
+    boolean activityResumed;
     boolean playerLaunched;
     boolean seriesSuggestionBackfillRunning;
     boolean libraryMode;
@@ -2607,6 +2658,54 @@ public class MainActivity extends Activity {
         });
     }
 
+    boolean isCatalogDownloadScreenVisible() {
+        return activityResumed && page != null && content != null && !showingAdmin
+                && !showingDetail && !showingProfiles && !metadataEditorMode
+                && ("home".equals(selectedSection)
+                || (libraryMode && ("movies".equals(selectedSection)
+                || "series".equals(selectedSection))));
+    }
+
+    void startCatalogDownloadStatusPolling() {
+        if (!isCatalogDownloadScreenVisible() || catalogDownloadStatusTask != null
+                || catalogDownloadStatusRequestRunning) return;
+        requestCatalogDownloadStatus();
+    }
+
+    void requestCatalogDownloadStatus() {
+        if (!isCatalogDownloadScreenVisible() || catalogDownloadStatusRequestRunning) return;
+        catalogDownloadStatusRequestRunning = true;
+        io.execute(() -> {
+            JSONObject state = null;
+            try {
+                state = getJson("/api/v1/download-status");
+            } catch (Exception ignored) { }
+            JSONObject result = state;
+            runOnUiThread(() -> {
+                catalogDownloadStatusRequestRunning = false;
+                if (!isCatalogDownloadScreenVisible()) return;
+                if (result != null) {
+                    catalogDownloadStatus = result;
+                    refreshVisibleDownloadPosters(content);
+                }
+                boolean active = result != null && ("starting".equals(result.optString("status"))
+                        || "running".equals(result.optString("status")));
+                scheduleCatalogDownloadStatusPolling(active ? 2000L : 30000L);
+            });
+        });
+    }
+
+    void scheduleCatalogDownloadStatusPolling(long delayMs) {
+        if (!isCatalogDownloadScreenVisible()) return;
+        if (catalogDownloadStatusTask != null)
+            downloadProgressHandler.removeCallbacks(catalogDownloadStatusTask);
+        catalogDownloadStatusTask = () -> {
+            catalogDownloadStatusTask = null;
+            requestCatalogDownloadStatus();
+        };
+        downloadProgressHandler.postDelayed(catalogDownloadStatusTask, delayMs);
+    }
+
     String collectionSubtitle(List<JSONObject> items) {
         int movieCount = 0;
         int collectionCount = 0;
@@ -2698,6 +2797,7 @@ public class MainActivity extends Activity {
         restoreListingScrollIfPending();
         restorePendingFocus();
         backfillMissingSeriesSuggestions();
+        startCatalogDownloadStatusPolling();
     }
 
     void collectPendingHomeItems(JSONObject node, String parentSeriesTitle,
@@ -3150,12 +3250,122 @@ public class MainActivity extends Activity {
             seenParams.setMargins(d(7), 0, 0, d(7));
             art.addView(seen, seenParams);
         }
+        art.setTag(node);
+        updatePosterDownloadOverlay(art, node);
         LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(width, -2);
         cp.setMargins(0, 0, d(12), 0);
         if (!placeholder) card.setOnClickListener(v -> openNode(node));
         View wrapped = wrap(card, cp);
         wrapped.setTag("catalog-node:" + node.optString("id", ""));
         return wrapped;
+    }
+
+    String normalizedDownloadMatch(String value) {
+        if (value == null) return "";
+        String normalized = Normalizer.normalize(value, Normalizer.Form.NFD)
+                .replaceAll("\\p{M}+", "").toLowerCase(java.util.Locale.ROOT)
+                .replaceAll("[^a-z0-9]+", "");
+        return normalized;
+    }
+
+    String normalizedDownloadPhrase(String value) {
+        if (value == null) return "";
+        return Normalizer.normalize(value, Normalizer.Form.NFD)
+                .replaceAll("\\p{M}+", "").toLowerCase(java.util.Locale.ROOT)
+                .replaceAll("[^a-z0-9]+", " ").trim().replaceAll("\\s+", " ");
+    }
+
+    boolean matchesDownloadName(String nodeKey, String candidateKey,
+                                String nodePhrase, String candidatePhrase,
+                                boolean series) {
+        if (nodeKey.isEmpty() || candidateKey.isEmpty()) return false;
+        if (candidateKey.equals(nodeKey)) return true;
+        if (!candidateKey.startsWith(nodeKey)) return false;
+        String suffix = candidateKey.substring(nodeKey.length());
+        if (suffix.matches("^(19|20)\\d{2}.*")) return true;
+        return series && (EPISODE_MARKER_PATTERN.matcher(suffix).find()
+                || (!nodePhrase.isEmpty() && candidatePhrase.startsWith(nodePhrase + " ")
+                && EPISODE_MARKER_PATTERN.matcher(candidatePhrase).find()));
+    }
+
+    boolean downloadMatchesNode(JSONObject state, JSONObject node) {
+        if (node == null || node.optBoolean("is_placeholder")) return false;
+        String kind = node.optString("kind", "");
+        if (!"movie".equals(kind) && !"series".equals(kind)) return false;
+        String currentFile = new File(state.optString("current_file", "")).getName();
+        String currentTitle = state.optString("current_title", "");
+        String fileKey = normalizedDownloadMatch(currentFile);
+        String titleKey = normalizedDownloadMatch(currentTitle);
+        String filePhrase = normalizedDownloadPhrase(currentFile);
+        String titlePhrase = normalizedDownloadPhrase(currentTitle);
+        List<String> nodeKeys = new ArrayList<>();
+        nodeKeys.add(normalizedDownloadMatch(displayTitle(node)));
+        nodeKeys.add(normalizedDownloadMatch(node.optString("metadata_title", "")));
+        nodeKeys.add(normalizedDownloadMatch(node.optString("original_title", "")));
+        List<String> nodePhrases = new ArrayList<>();
+        nodePhrases.add(normalizedDownloadPhrase(displayTitle(node)));
+        nodePhrases.add(normalizedDownloadPhrase(node.optString("metadata_title", "")));
+        nodePhrases.add(normalizedDownloadPhrase(node.optString("original_title", "")));
+        for (int index = 0; index < nodeKeys.size(); index++) {
+            String nodeKey = nodeKeys.get(index);
+            String nodePhrase = nodePhrases.get(index);
+            if (nodeKey.length() < 5) continue;
+            boolean series = "series".equals(kind);
+            if (matchesDownloadName(nodeKey, titleKey, nodePhrase, titlePhrase, series)
+                    || matchesDownloadName(nodeKey, fileKey, nodePhrase, filePhrase, series))
+                return true;
+        }
+        JSONArray files = node.optJSONArray("files");
+        if (files != null) {
+            for (int i = 0; i < files.length(); i++) {
+                JSONObject file = files.optJSONObject(i);
+                if (file == null) continue;
+                String known = normalizedDownloadMatch(
+                        new File(file.optString("filename", "")).getName());
+                if (known.equals(fileKey) || known.equals(titleKey)) return true;
+            }
+        }
+        return false;
+    }
+
+    void updatePosterDownloadOverlay(FrameLayout art, JSONObject node) {
+        if (art == null) return;
+        View existing = null;
+        for (int i = 0; i < art.getChildCount(); i++) {
+            View child = art.getChildAt(i);
+            if ("telegram-download-progress".equals(child.getTag())) {
+                existing = child;
+                break;
+            }
+        }
+        JSONObject state = catalogDownloadStatus;
+        String downloadState = state.optString("status", "idle");
+        double percent = state.optDouble("current_percent", -1.0);
+        boolean show = ("running".equals(downloadState) || "starting".equals(downloadState))
+                && percent >= 0.0 && downloadMatchesNode(state, node);
+        if (!show) {
+            if (existing != null) art.removeView(existing);
+            return;
+        }
+        if (existing instanceof DownloadProgressOverlay) {
+            ((DownloadProgressOverlay) existing).setProgress(percent);
+            return;
+        }
+        DownloadProgressOverlay overlay = new DownloadProgressOverlay(percent);
+        overlay.setTag("telegram-download-progress");
+        art.addView(overlay, new FrameLayout.LayoutParams(-1, -1));
+    }
+
+    void refreshVisibleDownloadPosters(View view) {
+        if (view == null) return;
+        if (view instanceof FrameLayout && view.getTag() instanceof JSONObject) {
+            updatePosterDownloadOverlay((FrameLayout) view, (JSONObject) view.getTag());
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++)
+                refreshVisibleDownloadPosters(group.getChildAt(i));
+        }
     }
 
     View wrap(View view, LinearLayout.LayoutParams params) {
@@ -3585,6 +3795,8 @@ public class MainActivity extends Activity {
         }
         restoreListingScrollIfPending();
         restorePendingFocus();
+        refreshVisibleDownloadPosters(content);
+        startCatalogDownloadStatusPolling();
     }
 
     void toggleAlphabet() {
@@ -4945,9 +5157,35 @@ public class MainActivity extends Activity {
         if (!overviewText.isEmpty()) {
             TextView overview = labelRaw(overviewText, 14, 0xFFE0E1E6, false);
             overview.setMaxLines(4);
+            overview.setEllipsize(android.text.TextUtils.TruncateAt.END);
             LinearLayout.LayoutParams op = new LinearLayout.LayoutParams(-1, -2);
             op.topMargin = d(10);
             info.addView(overview, op);
+            TextView readMore = label("Leer más", 13, 0xFFFF6B73, true);
+            readMore.setVisibility(View.GONE);
+            readMore.setPadding(0, d(5), d(12), d(5));
+            readMore.setFocusable(true);
+            readMore.setClickable(true);
+            readMore.setContentDescription(t("Leer más"));
+            applyTvFocusStyle(readMore, false);
+            LinearLayout.LayoutParams readMoreParams = new LinearLayout.LayoutParams(-2, -2);
+            readMoreParams.topMargin = d(2);
+            info.addView(readMore, readMoreParams);
+            final boolean[] expandedOverview = {false};
+            readMore.setOnClickListener(v -> {
+                expandedOverview[0] = !expandedOverview[0];
+                overview.setMaxLines(expandedOverview[0] ? Integer.MAX_VALUE : 4);
+                readMore.setText(t(expandedOverview[0] ? "Leer menos" : "Leer más"));
+                readMore.setContentDescription(t(expandedOverview[0] ? "Leer menos" : "Leer más"));
+            });
+            overview.post(() -> {
+                android.text.Layout layout = overview.getLayout();
+                if (layout == null || layout.getLineCount() == 0) return;
+                int lastVisibleLine = layout.getLineCount() - 1;
+                if (layout.getEllipsisCount(lastVisibleLine) > 0) {
+                    readMore.setVisibility(View.VISIBLE);
+                }
+            });
         }
         JSONArray files = node.optJSONArray("files");
         LinearLayout controls = new LinearLayout(this);
@@ -4970,9 +5208,23 @@ public class MainActivity extends Activity {
         if (externalRecommendation) {
             primaryAction.setOnClickListener(v -> confirmRecommendationRequest(node, primaryAction));
         } else {
-            primaryAction.setOnClickListener(v -> {
-                if ("series".equals(node.optString("kind"))) playNextSeriesEpisode(node);
-                else playFirst(node);
+            primaryAction.setOnClickListener(v -> playDetailItem(node, false));
+            primaryAction.setOnLongClickListener(v -> {
+                String[] options = {
+                        t("Reproducir normalmente"),
+                        t("Empezar desde el principio")
+                };
+                AlertDialog playbackOptions = new AlertDialog.Builder(this)
+                        .setTitle(t("Opciones de reproducción"))
+                        .setItems(options, (dialog, which) -> playDetailItem(node, which == 1))
+                        .setNegativeButton(t("Cancelar"), null)
+                        .create();
+                playbackOptions.setOnShowListener(dialog -> {
+                    if (isTelevision() && playbackOptions.getListView().getChildCount() > 0)
+                        playbackOptions.getListView().getChildAt(0).requestFocus();
+                });
+                playbackOptions.show();
+                return true;
             });
         }
         banner.addView(info, new FrameLayout.LayoutParams(-1, -1));
@@ -4990,8 +5242,7 @@ public class MainActivity extends Activity {
 
         JSONArray children = node.optJSONArray("children");
         if ("series".equals(node.optString("kind")) && children != null && children.length() > 0) {
-            addSectionHeader("Temporadas", "Selecciona para continuar");
-            addGrid(toList(children));
+            addSeasonNavigator(node, children);
         }
         if ("movie".equals(node.optString("kind")) || "series".equals(node.optString("kind")))
             addCastSection(node.optJSONArray("cast"));
@@ -5011,6 +5262,118 @@ public class MainActivity extends Activity {
                 && (children == null || children.length() == 0)
                 && !node.optString("kind").equals("movie")) addEmpty("No se encontraron episodios.");
         restorePendingFocus();
+    }
+
+    void addSeasonNavigator(JSONObject seriesNode, JSONArray children) {
+        List<JSONObject> availableSeasons = new ArrayList<>();
+        List<JSONObject> pendingSeasons = new ArrayList<>();
+        for (int i = 0; i < children.length(); i++) {
+            JSONObject child = children.optJSONObject(i);
+            if (child == null || !"season".equals(child.optString("kind"))) continue;
+            if (child.optBoolean("is_placeholder")) pendingSeasons.add(child);
+            else availableSeasons.add(child);
+        }
+        Collections.sort(availableSeasons,
+                Comparator.comparingInt(value -> value.optInt("season_number")));
+        if (!availableSeasons.isEmpty()) {
+            LinearLayout section = new LinearLayout(this);
+            section.setOrientation(LinearLayout.VERTICAL);
+            section.setPadding(d(20), d(15), d(20), d(8));
+            TextView heading = label("Temporadas", 22, Color.WHITE, true);
+            section.addView(heading);
+            LinearLayout pickerRow = new LinearLayout(this);
+            pickerRow.setGravity(Gravity.CENTER_VERTICAL);
+            TextView pickerLabel = label("Temporada", 14, MUTED, false);
+            pickerRow.addView(pickerLabel, new LinearLayout.LayoutParams(-2, d(48)));
+            Spinner seasonPicker = new Spinner(this, Spinner.MODE_DROPDOWN);
+            ArrayAdapter<JSONObject> adapter = new ArrayAdapter<JSONObject>(
+                    this, android.R.layout.simple_spinner_item, availableSeasons) {
+                private TextView seasonText(JSONObject item, boolean dropdown) {
+                    TextView text = label(displayTitle(item), 15, Color.WHITE, true);
+                    text.setGravity(Gravity.CENTER_VERTICAL);
+                    text.setPadding(d(12), d(5), d(12), d(5));
+                    text.setMinHeight(d(44));
+                    if (dropdown) text.setBackgroundColor(PANEL);
+                    else text.setBackground(round(PANEL, d(8)));
+                    return text;
+                }
+                @Override public View getView(int position, View convertView, ViewGroup parent) {
+                    return seasonText(getItem(position), false);
+                }
+                @Override public View getDropDownView(int position, View convertView, ViewGroup parent) {
+                    return seasonText(getItem(position), true);
+                }
+            };
+            seasonPicker.setAdapter(adapter);
+            seasonPicker.setContentDescription(t("Seleccionar temporada"));
+            seasonPicker.setFocusable(true);
+            LinearLayout.LayoutParams pickerParams = new LinearLayout.LayoutParams(
+                    Math.max(d(180), d(availableSeasons.size() > 1 ? 220 : 180)), d(48));
+            pickerParams.leftMargin = d(12);
+            pickerRow.addView(seasonPicker, pickerParams);
+            section.addView(pickerRow);
+            LinearLayout episodes = new LinearLayout(this);
+            episodes.setOrientation(LinearLayout.VERTICAL);
+            section.addView(episodes, new LinearLayout.LayoutParams(-1, -2));
+            content.addView(section, new LinearLayout.LayoutParams(-1, -2));
+            seasonPicker.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                    JSONObject season = adapter.getItem(position);
+                    if (season != null) loadSeasonEpisodes(seriesNode, season, episodes);
+                }
+                @Override public void onNothingSelected(AdapterView<?> parent) { }
+            });
+        }
+        if (!pendingSeasons.isEmpty()) {
+            addSectionHeader("Temporadas pendientes", "A la espera de ser añadido");
+            addGrid(pendingSeasons);
+        }
+    }
+
+    void loadSeasonEpisodes(JSONObject seriesNode, JSONObject seasonStub, LinearLayout target) {
+        String seasonId = seasonStub.optString("id", "");
+        if (seasonId.isEmpty()) return;
+        target.removeAllViews();
+        target.setTag("season-content:" + seasonId);
+        LinearLayout loading = new LinearLayout(this);
+        loading.setGravity(Gravity.CENTER_VERTICAL);
+        loading.setPadding(0, d(12), 0, d(12));
+        ProgressBar indicator = new ProgressBar(this, null, android.R.attr.progressBarStyleSmall);
+        loading.addView(indicator, new LinearLayout.LayoutParams(d(20), d(20)));
+        TextView loadingText = label("Cargando episodios…", 13, MUTED, false);
+        LinearLayout.LayoutParams loadingTextParams = new LinearLayout.LayoutParams(-2, -2);
+        loadingTextParams.leftMargin = d(9);
+        loading.addView(loadingText, loadingTextParams);
+        target.addView(loading);
+        io.execute(() -> {
+            try {
+                JSONObject season = getJson("/api/v1/catalog/" + enc(seasonId));
+                runOnUiThread(() -> {
+                    if (!showingDetail || !seriesNode.optString("id").equals(detailNodeId)
+                            || !("season-content:" + seasonId).equals(target.getTag())) return;
+                    target.removeAllViews();
+                    JSONArray files = season.optJSONArray("files");
+                    if (files == null || files.length() == 0) {
+                        TextView empty = label("No se encontraron episodios.", 13, MUTED, false);
+                        empty.setPadding(0, d(12), 0, d(12));
+                        target.addView(empty);
+                    } else {
+                        addEpisodeList(files, season.optString("poster_url",
+                                seriesNode.optString("poster_url", "")), season, target);
+                    }
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (!showingDetail || !seriesNode.optString("id").equals(detailNodeId)
+                            || !("season-content:" + seasonId).equals(target.getTag())) return;
+                    target.removeAllViews();
+                    TextView error = label(t("No se pudieron cargar los episodios: ") + e.getMessage(),
+                            13, MUTED, false);
+                    error.setPadding(0, d(12), 0, d(12));
+                    target.addView(error);
+                });
+            }
+        });
     }
 
     String join(JSONArray values) {
@@ -5083,6 +5446,13 @@ public class MainActivity extends Activity {
             case "Lo más nuevo": return "Eduki berrienak";
             case "Más como esto en tu catálogo": return "Antzeko gehiago zure katalogoan";
             case "Más sugerencias de TMDb": return "TMDb-ko iradokizun gehiago";
+            case "Reproducir normalmente": return "Erreproduzitu normalean";
+            case "Opciones de reproducción": return "Erreprodukzio-aukerak";
+            case "Vídeo en curso": return "Abian dagoen bideoa";
+            case "Este vídeo está en curso. ¿Quieres continuar desde %s?":
+                return "Bideo hau abian dago. Hemendik jarraitu nahi duzu: %s?";
+            case "Leer más": return "Irakurri gehiago";
+            case "Leer menos": return "Irakurri gutxiago";
             case "Cargando sugerencias…": return "Iradokizunak kargatzen…";
             case "Abrir detalle": return "Xehetasunak ireki";
             case "Solicitar descarga": return "Deskarga eskatu";
@@ -5184,6 +5554,7 @@ public class MainActivity extends Activity {
             case "No se pudo cargar la selección: ": return "Ezin izan da hautapena kargatu: ";
             case "Serie completa": return "Telesail osoa";
             case "Selecciona una temporada": return "Hautatu denboraldi bat";
+            case "Seleccionar temporada": return "Hautatu denboraldia";
             case "Enviar solicitud": return "Eskaera bidali";
             case "Añadir a la petición": return "Gehitu eskaerara";
             case "Elementos en la petición": return "Eskaerako elementuak";
@@ -5208,6 +5579,9 @@ public class MainActivity extends Activity {
             case "Pendiente de añadir": return "Gehitzeko zain";
             case "Pendientes de añadir": return "Gehitzeko zain";
             case "A la espera de ser añadido": return "Gehitzeko zain";
+            case "Temporadas pendientes": return "Gehitzeko zain dauden denboraldiak";
+            case "Cargando episodios…": return "Atalak kargatzen…";
+            case "No se pudieron cargar los episodios: ": return "Ezin izan dira atalak kargatu: ";
             case "Capítulos pendientes": return "Atalak gehitzeko zain";
             case "SOLICITUD VALIDADA": return "ESKAERA BALIOZTATUTA";
             case "Pendiente": return "Zain";
@@ -5250,6 +5624,8 @@ public class MainActivity extends Activity {
             case "Cerrar": return "Itxi";
             case "Selecciona para continuar": return "Hautatu jarraitzeko";
             case "No se encontraron episodios.": return "Ez da atalik aurkitu.";
+            case "vídeo": return "bideo";
+            case "vídeos": return "bideo";
             case "temporada": return "denboraldi";
             case "temporadas": return "denboraldi";
             case "título": return "izenburu";
@@ -5415,6 +5791,7 @@ public class MainActivity extends Activity {
             case "Listo para descargar.": return "Deskargatzeko prest.";
             case "Iniciando descarga…": return "Deskarga hasten…";
             case "Descarga en curso…": return "Deskarga martxan…";
+            case "Descarga en curso": return "Deskarga martxan";
             case "Descargando archivo: ": return "Fitxategia deskargatzen: ";
             case "Descarga detectada en Incoming…": return "Deskarga bat detektatu da Incoming-en…";
             case "Descarga finalizada.": return "Deskarga amaitu da.";
@@ -5547,6 +5924,7 @@ public class MainActivity extends Activity {
         RecommendationRowState state = new RecommendationRowState();
         state.nodeId = nodeId;
         state.scope = scope;
+        state.kind = node.optString("kind", "");
         state.section = new LinearLayout(this);
         state.section.setOrientation(LinearLayout.VERTICAL);
 
@@ -5642,7 +6020,9 @@ public class MainActivity extends Activity {
                 int added = 0;
                 for (JSONObject item : fetched) {
                     String itemId = item.optString("id", "");
-                    if (itemId.isEmpty() || state.seen.contains(itemId) || !isKidAllowedNode(item)) continue;
+                    if (itemId.isEmpty() || state.seen.contains(itemId)
+                            || !state.kind.equals(item.optString("kind", ""))
+                            || !isKidAllowedNode(item)) continue;
                     state.seen.add(itemId);
                     addRecommendationCard(state, item);
                     added++;
@@ -5867,7 +6247,18 @@ public class MainActivity extends Activity {
     }
 
     void addEpisodeList(JSONArray files, String fallbackPoster, JSONObject owner) {
-        addSectionHeader("Episodios", files.length() + (files.length() == 1 ? " vídeo" : " vídeos"));
+        addEpisodeList(files, fallbackPoster, owner, content);
+    }
+
+    void addEpisodeList(JSONArray files, String fallbackPoster, JSONObject owner,
+                       LinearLayout parent) {
+        TextView heading = label("Episodios", 22, Color.WHITE, true);
+        heading.setPadding(d(20), d(16), d(20), d(4));
+        parent.addView(heading);
+        TextView subtitle = labelRaw(files.length() + " "
+                + t(files.length() == 1 ? "vídeo" : "vídeos"), 14, MUTED, false);
+        subtitle.setPadding(d(20), 0, d(20), d(12));
+        parent.addView(subtitle);
         for (int i = 0; i < files.length(); i++) {
             JSONObject file = files.optJSONObject(i);
             if (file == null) continue;
@@ -5920,7 +6311,7 @@ public class MainActivity extends Activity {
             item.addView(texts, new LinearLayout.LayoutParams(0, -2, 1));
             LinearLayout.LayoutParams ip = new LinearLayout.LayoutParams(-1, -2);
             ip.setMargins(d(16), 0, d(16), d(8));
-            content.addView(item, ip);
+            parent.addView(item, ip);
             item.setOnClickListener(v -> launchPlayer(file.optString("stream_url"),
                     file.optString("title", "Zinema"), file.optString("poster_url", fallbackPoster),
                     owner.optString("id", ""), file.optString("id", ""), owner.optString("kind", "")));
@@ -5961,6 +6352,17 @@ public class MainActivity extends Activity {
     }
 
     void playFirst(JSONObject node) {
+        playFirst(node, false);
+    }
+
+    void playDetailItem(JSONObject node, boolean fromBeginning) {
+        if ("series".equals(node.optString("kind")))
+            playNextSeriesEpisode(node, fromBeginning);
+        else
+            playFirst(node, fromBeginning);
+    }
+
+    void playFirst(JSONObject node, boolean fromBeginning) {
         if (!isKidAllowedNode(node)) {
             Toast.makeText(this, t("Este contenido no está disponible en un perfil infantil."), Toast.LENGTH_LONG).show();
             return;
@@ -5970,7 +6372,8 @@ public class MainActivity extends Activity {
             JSONObject file = files.optJSONObject(0);
             if (file != null) launchPlayer(file.optString("stream_url"),
                     file.optString("title", displayTitle(node)), file.optString("poster_url", node.optString("poster_url", "")),
-                    node.optString("id", ""), file.optString("id", ""), node.optString("kind", ""));
+                    node.optString("id", ""), file.optString("id", ""), node.optString("kind", ""),
+                    fromBeginning);
             return;
         }
         JSONArray children = node.optJSONArray("children");
@@ -5979,6 +6382,10 @@ public class MainActivity extends Activity {
     }
 
     void playNextSeriesEpisode(JSONObject seriesNode) {
+        playNextSeriesEpisode(seriesNode, false);
+    }
+
+    void playNextSeriesEpisode(JSONObject seriesNode, boolean fromBeginning) {
         if (!isKidAllowedNode(seriesNode)) {
             Toast.makeText(this, t("Este contenido no está disponible en un perfil infantil."), Toast.LENGTH_LONG).show();
             return;
@@ -6050,7 +6457,7 @@ public class MainActivity extends Activity {
                             nextEpisode.optString("title", displayTitle(seriesNode)),
                             nextEpisode.optString("poster_url", seriesNode.optString("poster_url", "")),
                             nextEpisode.optString("owner_node_id", ""),
-                            nextEpisode.optString("id", ""), "season");
+                            nextEpisode.optString("id", ""), "season", fromBeginning);
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> Toast.makeText(this,
@@ -6930,7 +7337,10 @@ public class MainActivity extends Activity {
                 long bytes = state.optLong("current_bytes", 0);
                 String size = bytes > 0 ? String.format(java.util.Locale.US, " · %.1f MB",
                         bytes / (1024.0 * 1024.0)) : "";
-                status.setText(t("Descargando archivo: ") + currentFile + size);
+                double percent = state.optDouble("current_percent", -1.0);
+                String percentage = percent >= 0
+                        ? String.format(java.util.Locale.US, " · %.0f%%", percent) : "";
+                status.setText(t("Descargando archivo: ") + currentFile + size + percentage);
             } else if ("incoming".equals(state.optString("source")))
                 status.setText(t("Descarga detectada en Incoming…"));
             else status.setText(output.isEmpty() ? t("Descarga en curso…") : output);
@@ -8077,6 +8487,12 @@ public class MainActivity extends Activity {
 
     void launchPlayer(String path, String title, String posterUrl,
                       String ownerNodeId, String mediaId, String ownerKind) {
+        launchPlayer(path, title, posterUrl, ownerNodeId, mediaId, ownerKind, false);
+    }
+
+    void launchPlayer(String path, String title, String posterUrl,
+                      String ownerNodeId, String mediaId, String ownerKind,
+                      boolean fromBeginning) {
         if (isActiveKidProfile()) {
             JSONObject owner = findCatalogNodeById(ownerNodeId, movies);
             if (owner == null) owner = findCatalogNodeById(ownerNodeId, series);
@@ -8111,11 +8527,12 @@ public class MainActivity extends Activity {
         try { position = new JSONObject(prefs.getString(key, "{}")).optLong("position"); }
         catch (JSONException ignored) { }
         final long resumePosition = position;
-        if (resumePosition > 10000L) {
+        if (resumePosition > 10000L && !fromBeginning) {
             AlertDialog resumeDialog = new AlertDialog.Builder(this)
-                    .setTitle(t("Continuar viendo"))
-                    .setMessage(t("¿Quieres continuar desde") + " "
-                            + formatTime((int) Math.min(Integer.MAX_VALUE, resumePosition)) + "?")
+                    .setTitle(t("Vídeo en curso"))
+                    .setMessage(String.format(java.util.Locale.ROOT,
+                            t("Este vídeo está en curso. ¿Quieres continuar desde %s?"),
+                            formatTime((int) Math.min(Integer.MAX_VALUE, resumePosition))))
                     .setPositiveButton(t("Continuar"), (dialog, which) -> preparePlayback(
                             path, title, posterUrl, ownerNodeId, resolvedItemId, ownerKind,
                             key, resumePosition))
@@ -8257,6 +8674,7 @@ public class MainActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        activityResumed = true;
         checkForClientUpdate(false);
         if (installAfterPermission && Build.VERSION.SDK_INT >= 26 && getPackageManager().canRequestPackageInstalls()) {
             installAfterPermission = false;
@@ -8286,6 +8704,16 @@ public class MainActivity extends Activity {
             else maybeRefreshCatalogListing(currentLibrary,
                     breadcrumbs.get(breadcrumbs.size() - 1).optString("id"));
         }
+        startCatalogDownloadStatusPolling();
+    }
+
+    @Override protected void onPause() {
+        activityResumed = false;
+        if (catalogDownloadStatusTask != null) {
+            downloadProgressHandler.removeCallbacks(catalogDownloadStatusTask);
+            catalogDownloadStatusTask = null;
+        }
+        super.onPause();
     }
 
     void processPlayerReturn() {

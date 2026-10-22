@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import unicodedata
+import codecs
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -71,7 +72,8 @@ INCOMING_MONITOR_IDLE_INTERVAL_SECONDS = 60.0
 INCOMING_MONITOR_ACTIVE_INTERVAL_SECONDS = 1.0
 NAS_DOWNLOAD_STATE: dict[str, object] = {
     "id": None, "status": "idle", "progress": "", "current_file": None, "started_at": None,
-    "current_bytes": 0, "current_path": None, "source": None,
+    "current_title": None, "current_percent": None, "downloaded_bytes": 0,
+    "total_bytes": 0, "current_bytes": 0, "current_path": None, "source": None,
     "completed_at": None, "exit_code": None, "error": None,
 }
 METADATA_RETRY_LOCK = threading.Lock()
@@ -1389,6 +1391,8 @@ def _scan_incoming_download_activity_impl() -> dict[str, object] | None:
                 state.update({
                     "id": f"incoming-{uuid4().hex}", "status": "running",
                     "progress": "Descarga detectada en Incoming…",
+                    "current_title": None, "current_percent": None,
+                    "downloaded_bytes": 0, "total_bytes": 0,
                     "started_at": datetime.now(timezone.utc).isoformat(),
                     "completed_at": None, "exit_code": None, "error": None,
                     "source": "incoming",
@@ -1456,6 +1460,37 @@ def _settle_app_download_files() -> None:
             INCOMING_ACTIVE_PATHS.clear()
 
 
+def _record_nas_download_output(line: str) -> None:
+    text = line.strip()
+    if not text:
+        return
+    values: dict[str, object] = {"progress": text[-300:]}
+    filename = _download_filename_from_output(text)
+    if filename:
+        values["current_file"] = filename
+        values["current_title"] = Path(filename).stem
+    title_match = re.search(
+        r"(?i)últim[oa]\s+[^:]+:\s*(.+?)\s+\(([\d.]+)\s*MB\)", text,
+    )
+    if title_match:
+        values["current_title"] = title_match.group(1).strip()
+        values["total_bytes"] = int(float(title_match.group(2)) * 1024 * 1024)
+    size_match = re.search(r"([\d.]+)\s*/\s*([\d.]+)\s*MB", text, re.IGNORECASE)
+    if size_match:
+        values["downloaded_bytes"] = int(float(size_match.group(1)) * 1024 * 1024)
+        values["total_bytes"] = int(float(size_match.group(2)) * 1024 * 1024)
+    percent_match = re.search(r"(?<![\d.])(\d{1,3}(?:\.\d+)?)\s*%", text)
+    if percent_match:
+        values["current_percent"] = min(100.0, max(0.0, float(percent_match.group(1))))
+    elif values.get("total_bytes") and values.get("downloaded_bytes"):
+        total = int(values["total_bytes"])
+        if total > 0:
+            values["current_percent"] = min(
+                100.0, max(0.0, int(values["downloaded_bytes"]) * 100.0 / total),
+            )
+    _update_nas_download_state(**values)
+
+
 def _run_nas_download(job_id: str) -> None:
     try:
         process = subprocess.Popen(
@@ -1469,21 +1504,27 @@ def _run_nas_download(job_id: str) -> None:
         )
         _update_nas_download_state(status="running", started_at=datetime.now(timezone.utc).isoformat())
         if process.stdout is not None:
-            for line in process.stdout:
-                progress = line.strip()
-                if progress:
-                    values: dict[str, object] = {"progress": progress[-300:]}
-                    filename = _download_filename_from_output(progress)
-                    if filename:
-                        values["current_file"] = filename
-                    _update_nas_download_state(**values)
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            pending = ""
+            while True:
+                chunk = os.read(process.stdout.fileno(), 4096)
+                if not chunk:
+                    pending += decoder.decode(b"", final=True)
+                    if pending:
+                        _record_nas_download_output(pending)
+                    break
+                pending += decoder.decode(chunk)
+                lines = re.split(r"[\r\n]", pending)
+                pending = lines.pop()
+                for line in lines:
+                    _record_nas_download_output(line)
         exit_code = process.wait()
         _settle_app_download_files()
         completed_at = datetime.now(timezone.utc).isoformat()
         if exit_code == 0:
             _update_nas_download_state(
                 status="completed", completed_at=completed_at, exit_code=exit_code,
-                error=None, progress="Descarga finalizada.",
+                error=None, progress="Descarga finalizada.", current_percent=100.0,
             )
         else:
             _update_nas_download_state(
@@ -3070,7 +3111,8 @@ def start_nas_catalog_download() -> dict[str, object]:
         job_id = uuid4().hex
         NAS_DOWNLOAD_STATE.update({
             "id": job_id, "status": "starting", "progress": "Iniciando descarga…",
-            "current_file": None,
+            "current_file": None, "current_title": None, "current_percent": None,
+            "downloaded_bytes": 0, "total_bytes": 0,
             "current_bytes": 0, "current_path": None, "source": "app",
             "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": None,
             "exit_code": None, "error": None, "_awaiting_file_settle": False,
@@ -3089,6 +3131,19 @@ def get_nas_catalog_download(refresh: bool = False) -> dict[str, object]:
         payload = {key: value for key, value in NAS_DOWNLOAD_STATE.items()
                    if not key.startswith("_")}
         return payload
+
+
+@app.get("/api/v1/download-status", dependencies=[Depends(require_client)])
+def get_catalog_download_status() -> dict[str, object]:
+    """Expose only the active download indicator to signed-in catalog clients."""
+    with NAS_DOWNLOAD_LOCK:
+        state = NAS_DOWNLOAD_STATE
+        return {
+            "status": state.get("status", "idle"),
+            "current_file": state.get("current_file"),
+            "current_title": state.get("current_title"),
+            "current_percent": state.get("current_percent"),
+        }
 
 
 @app.post("/api/v1/admin/incoming/{file_id}/generate", status_code=200,
