@@ -13,6 +13,7 @@ import threading
 import time
 import unicodedata
 import codecs
+from difflib import SequenceMatcher
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -945,6 +946,39 @@ def _normalize_media_title(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", normalized.casefold())
 
 
+def _media_titles_similar(left: str, right: str) -> bool:
+    if _normalize_media_title(left) == _normalize_media_title(right):
+        return True
+    ignored = {"and", "con", "de", "del", "el", "en", "la", "las", "los",
+               "of", "the", "un", "una", "y", "e"}
+    left_words = [word for word in re.findall(r"[a-z0-9]+", unicodedata.normalize(
+        "NFKD", left).encode("ascii", "ignore").decode("ascii").casefold())
+                  if len(word) >= 3 and word not in ignored]
+    right_words = [word for word in re.findall(r"[a-z0-9]+", unicodedata.normalize(
+        "NFKD", right).encode("ascii", "ignore").decode("ascii").casefold())
+                   if len(word) >= 3 and word not in ignored]
+    if len(left_words) < 2 or len(right_words) < 2:
+        return False
+    matched: set[int] = set()
+    count = 0
+    distinctive = False
+    for word in left_words:
+        for index, candidate in enumerate(right_words):
+            if index in matched:
+                continue
+            same = word == candidate or (
+                min(len(word), len(candidate)) >= 5
+                and SequenceMatcher(None, word, candidate).ratio() >= 0.8
+            )
+            if same:
+                matched.add(index)
+                count += 1
+                distinctive = distinctive or min(len(word), len(candidate)) >= 5
+                break
+    return (distinctive and count >= 2 and count / len(left_words) >= 0.8
+            and count / len(right_words) >= 0.5)
+
+
 def _incoming_guess(path: Path) -> dict[str, object]:
     stem = path.stem
     episode = EPISODE_RE.search(stem)
@@ -1000,7 +1034,7 @@ def _match_incoming_request(connection: sqlite3.Connection,
                 continue
         else:
             continue
-        if _normalize_media_title(request["title"]) != normalized_title:
+        if not _media_titles_similar(request["title"], str(guess["title"])):
             continue
         request_year = request["year"]
         guess_year = guess["year"]
@@ -1040,14 +1074,12 @@ def _incoming_poster_url(connection: sqlite3.Connection, guess: dict[str, object
         return None
     for node in connection.execute(
         """SELECT id, title, metadata_title, original_title, poster_file
-           FROM catalog_nodes WHERE library=? AND kind=? AND available=1 AND poster_file IS NOT NULL
-             AND (title=? COLLATE NOCASE OR metadata_title=? COLLATE NOCASE
-                  OR original_title=? COLLATE NOCASE)""",
-        (library, kind, str(guess["title"]), str(guess["title"]), str(guess["title"])),
+           FROM catalog_nodes WHERE library=? AND kind=? AND available=1
+             AND poster_file IS NOT NULL""",
+        (library, kind),
     ):
-        if title in {_normalize_media_title(node["title"] or ""),
-                     _normalize_media_title(node["metadata_title"] or ""),
-                     _normalize_media_title(node["original_title"] or "")}:
+        if any(_media_titles_similar(str(guess["title"]), str(candidate or ""))
+               for candidate in (node["title"], node["metadata_title"], node["original_title"])):
             return _artwork_url(node["id"], "poster", node["poster_file"])
     return None
 
@@ -1114,6 +1146,72 @@ def _incoming_entries(connection: sqlite3.Connection) -> list[dict[str, object]]
             "poster_url": _incoming_poster_url(connection, guess, request),
         })
     return entries
+
+
+def _incoming_catalog_placeholders(connection: sqlite3.Connection,
+                                   library: str) -> list[dict[str, object]]:
+    kind = "movie" if library == "movies" else "series"
+    items: list[dict[str, object]] = []
+    seen_titles: set[str] = set()
+    for entry in _incoming_entries(connection):
+        if entry["library"] != library:
+            continue
+        title = str(entry["title"] or "").strip()
+        normalized = _normalize_media_title(title)
+        dedupe_key = normalized if kind == "series" else f"{normalized}:{entry['year'] or ''}"
+        if not normalized or dedupe_key in seen_titles:
+            continue
+        seen_titles.add(dedupe_key)
+        catalog_match = None
+        for candidate in connection.execute(
+            """SELECT title, metadata_title, original_title, genres, age_limit, age_rating
+               FROM catalog_nodes WHERE library=? AND kind=? AND available=1""",
+            (library, kind),
+        ):
+            if any(_media_titles_similar(title, str(value or "")) for value in (
+                    candidate["title"], candidate["metadata_title"], candidate["original_title"])):
+                catalog_match = candidate
+                break
+        item: dict[str, object] = {
+            "id": f"incoming:{entry['file_id']}", "kind": kind, "library": library,
+            "title": title, "display_title": title, "year": entry["year"],
+            "poster_url": entry["poster_url"], "poster_available": bool(entry["poster_url"]),
+            "genres": json.loads(catalog_match["genres"] or "[]") if catalog_match else [],
+            "age_limit": catalog_match["age_limit"] if catalog_match else 0,
+            "age_rating": catalog_match["age_rating"] if catalog_match else None,
+            "is_placeholder": True, "is_incoming_pending": True,
+            "incoming_file_id": entry["file_id"], "incoming_filename": entry["filename"],
+            "children": [], "files": [],
+        }
+        request_id = entry.get("request_id")
+        if request_id:
+            request = connection.execute(
+                "SELECT tmdb_id FROM content_requests WHERE id=?", (request_id,),
+            ).fetchone()
+            if request is not None:
+                item["tmdb_id"] = request["tmdb_id"]
+        items.append(item)
+    return items
+
+
+def _incoming_catalog_signature() -> list[tuple[str, int, int]]:
+    signature: list[tuple[str, int, int]] = []
+    if not INCOMING_ROOT.is_dir():
+        return signature
+    try:
+        for path in INCOMING_ROOT.rglob("*"):
+            try:
+                if path.is_symlink() or not path.is_file() \
+                        or path.suffix.lower() not in VIDEO_EXTENSIONS:
+                    continue
+                stat = path.stat()
+                signature.append((path.relative_to(INCOMING_ROOT).as_posix(),
+                                  stat.st_size, stat.st_mtime_ns))
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        return []
+    return sorted(signature)
 
 
 def _remove_fulfilled_content_requests(connection: sqlite3.Connection) -> int:
@@ -1756,7 +1854,7 @@ def get_catalog_version() -> dict[str, str]:
         ).fetchall()
     state = json.dumps(
         [[tuple(row) for row in nodes], [tuple(row) for row in files],
-         [tuple(row) for row in requests]],
+         [tuple(row) for row in requests], _incoming_catalog_signature()],
         ensure_ascii=False, separators=(",", ":"),
     )
     return {"version": hashlib.sha256(state.encode("utf-8")).hexdigest()}
@@ -2227,6 +2325,16 @@ def list_catalog(
                     result.append(_catalog_request_placeholder(
                         request, "movie" if library == "movies" else "series",
                     ))
+            incoming_items = _incoming_catalog_placeholders(connection, library)
+            for incoming in incoming_items:
+                tmdb_id = incoming.get("tmdb_id")
+                result = [item for item in result if not (
+                    item.get("is_placeholder")
+                    and ((tmdb_id is not None and item.get("tmdb_id") == tmdb_id)
+                         or (tmdb_id is None and _media_titles_similar(
+                             str(item.get("display_title") or item.get("title") or ""),
+                             str(incoming.get("display_title") or "")))))]
+            result.extend(incoming_items)
         result.sort(key=lambda item: (
             {"collection": 0, "movie": 1, "series": 2, "season": 3}.get(item.get("kind"), 9),
             str(item.get("display_title") or item.get("title") or "").casefold(),

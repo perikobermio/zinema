@@ -82,6 +82,7 @@ import java.security.MessageDigest;
 import java.security.KeyStore;
 import java.text.Normalizer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -139,22 +140,20 @@ public class MainActivity extends Activity {
             super.onDraw(canvas);
             float width = getWidth();
             float height = getHeight();
-            float revealedHeight = (float) (height * percent / 100.0);
+            float revealedWidth = (float) (width * percent / 100.0);
             paint.setStyle(Paint.Style.FILL);
             paint.setColor(0xB8000000);
-            canvas.drawRect(0, 0, width, height - revealedHeight, paint);
-            float barHeight = d(25);
-            float barTop = height - barHeight;
-            paint.setColor(0xCC080A0E);
-            canvas.drawRect(0, barTop, width, height, paint);
-            paint.setColor(RED);
-            canvas.drawRect(0, barTop, width * (float) (percent / 100.0), height, paint);
+            canvas.drawRect(revealedWidth, 0, width, height, paint);
             paint.setColor(Color.WHITE);
-            paint.setTextSize(d(12));
+            paint.setTextAlign(Paint.Align.CENTER);
+            paint.setTextSize(d(34));
             paint.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
             String text = Math.round(percent) + "%";
-            canvas.drawText(text, Math.max(d(5), width - paint.measureText(text) - d(7)),
-                    barTop + barHeight * 0.69f, paint);
+            paint.setShadowLayer(d(4), 0, 0, Color.BLACK);
+            Paint.FontMetrics metrics = paint.getFontMetrics();
+            canvas.drawText(text, width / 2.0f,
+                    height / 2.0f - (metrics.ascent + metrics.descent) / 2.0f, paint);
+            paint.clearShadowLayer();
         }
     }
 
@@ -1387,6 +1386,10 @@ public class MainActivity extends Activity {
     boolean isKidAllowedNode(JSONObject node) {
         if (!isActiveKidProfile()) return true;
         if (node == null) return false;
+        if (node.optBoolean("is_incoming_pending")) {
+            JSONArray genres = node.optJSONArray("genres");
+            if (genres == null || genres.length() == 0) return false;
+        }
         String kind = node.optString("kind", "");
         if ("movie".equals(kind) && node.optInt("age_limit", 0) >= 16
                 && !hasFamilyGenre(node)) return false;
@@ -3189,7 +3192,9 @@ public class MainActivity extends Activity {
             art.addView(poster, new FrameLayout.LayoutParams(-1, -1));
             showPoster(node.optString("poster_url", ""), poster, lazyPosters);
         }
-        if (placeholder) {
+        boolean incomingPending = node.optBoolean("is_incoming_pending");
+        boolean downloading = isNodeDownloadActive(node);
+        if (placeholder && !incomingPending && !downloading) {
             View shade = new View(this);
             shade.setBackgroundColor(0x99090A0D);
             art.addView(shade, new FrameLayout.LayoutParams(-1, -1));
@@ -3203,6 +3208,15 @@ public class MainActivity extends Activity {
             art.addView(stampImage, stampParams);
             stampImage.setTranslationX(d(58));
             stampImage.setTranslationY(d(48));
+        }
+        if (incomingPending) {
+            TextView pendingMove = label(t("Pendiente de mover"), 9, Color.WHITE, true);
+            pendingMove.setPadding(d(7), d(5), d(7), d(5));
+            pendingMove.setBackground(round(0xDD9B4D00, d(7)));
+            FrameLayout.LayoutParams pendingMoveParams = new FrameLayout.LayoutParams(
+                    -2, -2, Gravity.TOP | Gravity.RIGHT);
+            pendingMoveParams.setMargins(0, d(7), d(7), 0);
+            art.addView(pendingMove, pendingMoveParams);
         }
         if (isCollection) {
             TextView collectionIcon = label("▦", 17, Color.WHITE, true);
@@ -3275,6 +3289,63 @@ public class MainActivity extends Activity {
                 .replaceAll("[^a-z0-9]+", " ").trim().replaceAll("\\s+", " ");
     }
 
+    boolean downloadTitlesAreSimilar(String catalogTitle, String downloadTitle) {
+        Set<String> ignored = new HashSet<>(Arrays.asList(
+                "a", "al", "and", "con", "de", "del", "el", "en", "la", "las",
+                "los", "of", "the", "un", "una", "y", "e"
+        ));
+        List<String> catalogWords = new ArrayList<>();
+        List<String> downloadWords = new ArrayList<>();
+        for (String word : normalizedDownloadPhrase(catalogTitle).split(" "))
+            if (word.length() >= 3 && !ignored.contains(word)) catalogWords.add(word);
+        for (String word : normalizedDownloadPhrase(downloadTitle).split(" "))
+            if (word.length() >= 3 && !ignored.contains(word)) downloadWords.add(word);
+        if (catalogWords.size() < 2 || downloadWords.size() < 2) return false;
+
+        int matches = 0;
+        boolean hasDistinctiveMatch = false;
+        boolean[] used = new boolean[catalogWords.size()];
+        for (String downloadWord : downloadWords) {
+            for (int i = 0; i < catalogWords.size(); i++) {
+                String catalogWord = catalogWords.get(i);
+                if (!used[i] && (catalogWord.equals(downloadWord)
+                        || (Math.min(catalogWord.length(), downloadWord.length()) >= 5
+                        && editDistanceAtMostOne(catalogWord, downloadWord)))) {
+                    used[i] = true;
+                    matches++;
+                    if (Math.min(catalogWord.length(), downloadWord.length()) >= 5)
+                        hasDistinctiveMatch = true;
+                    break;
+                }
+            }
+        }
+        return hasDistinctiveMatch && matches >= 2
+                && matches * 1.0 / downloadWords.size() >= 0.8
+                && matches * 1.0 / catalogWords.size() >= 0.5;
+    }
+
+    boolean editDistanceAtMostOne(String left, String right) {
+        if (Math.abs(left.length() - right.length()) > 1) return false;
+        int leftIndex = 0;
+        int rightIndex = 0;
+        int differences = 0;
+        while (leftIndex < left.length() && rightIndex < right.length()) {
+            if (left.charAt(leftIndex) == right.charAt(rightIndex)) {
+                leftIndex++;
+                rightIndex++;
+                continue;
+            }
+            if (++differences > 1) return false;
+            if (left.length() > right.length()) leftIndex++;
+            else if (right.length() > left.length()) rightIndex++;
+            else {
+                leftIndex++;
+                rightIndex++;
+            }
+        }
+        return differences + (leftIndex < left.length() || rightIndex < right.length() ? 1 : 0) <= 1;
+    }
+
     boolean matchesDownloadName(String nodeKey, String candidateKey,
                                 String nodePhrase, String candidatePhrase,
                                 boolean series) {
@@ -3289,7 +3360,7 @@ public class MainActivity extends Activity {
     }
 
     boolean downloadMatchesNode(JSONObject state, JSONObject node) {
-        if (node == null || node.optBoolean("is_placeholder")) return false;
+        if (node == null) return false;
         String kind = node.optString("kind", "");
         if (!"movie".equals(kind) && !"series".equals(kind)) return false;
         String currentFile = new File(state.optString("current_file", "")).getName();
@@ -3312,7 +3383,9 @@ public class MainActivity extends Activity {
             if (nodeKey.length() < 5) continue;
             boolean series = "series".equals(kind);
             if (matchesDownloadName(nodeKey, titleKey, nodePhrase, titlePhrase, series)
-                    || matchesDownloadName(nodeKey, fileKey, nodePhrase, filePhrase, series))
+                    || matchesDownloadName(nodeKey, fileKey, nodePhrase, filePhrase, series)
+                    || downloadTitlesAreSimilar(nodePhrase, titlePhrase)
+                    || downloadTitlesAreSimilar(nodePhrase, filePhrase))
                 return true;
         }
         JSONArray files = node.optJSONArray("files");
@@ -3326,6 +3399,12 @@ public class MainActivity extends Activity {
             }
         }
         return false;
+    }
+
+    boolean isNodeDownloadActive(JSONObject node) {
+        String state = catalogDownloadStatus.optString("status", "idle");
+        return ("running".equals(state) || "starting".equals(state))
+                && downloadMatchesNode(catalogDownloadStatus, node);
     }
 
     void updatePosterDownloadOverlay(FrameLayout art, JSONObject node) {
@@ -3374,6 +3453,7 @@ public class MainActivity extends Activity {
     }
 
     String cardSubtitle(JSONObject node) {
+        if (node.optBoolean("is_incoming_pending")) return t("Pendiente de mover");
         if (node.optBoolean("is_placeholder")) {
             if ("season".equals(node.optString("kind"))) {
                 String seriesTitle = node.optString("series_title", "");
@@ -5579,6 +5659,7 @@ public class MainActivity extends Activity {
             case "Pendiente de añadir": return "Gehitzeko zain";
             case "Pendientes de añadir": return "Gehitzeko zain";
             case "A la espera de ser añadido": return "Gehitzeko zain";
+            case "Pendiente de mover": return "Mugitzeko zain";
             case "Temporadas pendientes": return "Gehitzeko zain dauden denboraldiak";
             case "Cargando episodios…": return "Atalak kargatzen…";
             case "No se pudieron cargar los episodios: ": return "Ezin izan dira atalak kargatu: ";
@@ -7301,9 +7382,15 @@ public class MainActivity extends Activity {
         TextView status = label(t(loadError.isEmpty() ? "Listo para descargar." : "Descarga/script no disponible."),
                 11, MUTED, false);
         status.setTag("nas-download-status");
-        status.setMaxLines(3);
+        status.setMaxLines(2);
+        status.setEllipsize(android.text.TextUtils.TruncateAt.END);
         LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(-1, 0, 1);
         card.addView(status, statusParams);
+        TextView percentLabel = label("", 20, RED, true);
+        percentLabel.setTag("nas-download-percent");
+        percentLabel.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+        percentLabel.setVisibility(View.GONE);
+        card.addView(percentLabel, new LinearLayout.LayoutParams(-1, d(28)));
         Button start = actionButton(t("Iniciar descarga"), true);
         start.setTag("nas-download-start");
         LinearLayout.LayoutParams startParams = new LinearLayout.LayoutParams(-1, d(46));
@@ -7326,9 +7413,21 @@ public class MainActivity extends Activity {
                                   Button start, boolean notifyCompletion) {
         String stateName = state.optString("status", "idle");
         boolean active = "starting".equals(stateName) || "running".equals(stateName);
+        double percent = downloadPercentFromState(state);
         progress.setVisibility(active ? View.VISIBLE : View.GONE);
+        progress.setIndeterminate(active && percent < 0.0);
+        if (percent >= 0.0) progress.setProgress((int) Math.round(percent));
         start.setEnabled(!active);
         start.setText(t(active ? "Descarga en curso…" : "Iniciar descarga"));
+        ViewGroup parent = status.getParent() instanceof ViewGroup
+                ? (ViewGroup) status.getParent() : null;
+        TextView percentLabel = parent == null ? null
+                : parent.findViewWithTag("nas-download-percent");
+        if (percentLabel != null) {
+            percentLabel.setVisibility(active && percent >= 0.0 ? View.VISIBLE : View.GONE);
+            if (active && percent >= 0.0)
+                percentLabel.setText(String.format(java.util.Locale.US, "%.0f%%", percent));
+        }
         if ("starting".equals(stateName)) status.setText(t("Iniciando descarga…"));
         else if ("running".equals(stateName)) {
             String currentFile = state.optString("current_file", "").trim();
@@ -7337,10 +7436,7 @@ public class MainActivity extends Activity {
                 long bytes = state.optLong("current_bytes", 0);
                 String size = bytes > 0 ? String.format(java.util.Locale.US, " · %.1f MB",
                         bytes / (1024.0 * 1024.0)) : "";
-                double percent = state.optDouble("current_percent", -1.0);
-                String percentage = percent >= 0
-                        ? String.format(java.util.Locale.US, " · %.0f%%", percent) : "";
-                status.setText(t("Descargando archivo: ") + currentFile + size + percentage);
+                status.setText(t("Descargando archivo: ") + currentFile + size);
             } else if ("incoming".equals(state.optString("source")))
                 status.setText(t("Descarga detectada en Incoming…"));
             else status.setText(output.isEmpty() ? t("Descarga en curso…") : output);
@@ -7359,6 +7455,25 @@ public class MainActivity extends Activity {
             status.setText(t("Descarga fallida: ") + detail);
         } else status.setText(t("Listo para descargar."));
         return active;
+    }
+
+    double downloadPercentFromState(JSONObject state) {
+        double percent = state.optDouble("current_percent", -1.0);
+        if (percent < 0.0) {
+            long downloaded = state.optLong("downloaded_bytes", 0);
+            long total = state.optLong("total_bytes", 0);
+            if (downloaded > 0 && total > 0)
+                percent = downloaded * 100.0 / total;
+        }
+        if (percent < 0.0) {
+            Matcher match = Pattern.compile("(?<![\\d.])(\\d{1,3}(?:[.,]\\d+)?)\\s*%")
+                    .matcher(state.optString("progress", ""));
+            if (match.find()) {
+                try { percent = Double.parseDouble(match.group(1).replace(',', '.')); }
+                catch (NumberFormatException ignored) { percent = -1.0; }
+            }
+        }
+        return Math.max(-1.0, Math.min(100.0, percent));
     }
 
     void startNasDownload(TextView status, ProgressBar progress, Button start) {
