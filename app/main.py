@@ -396,6 +396,17 @@ def database() -> sqlite3.Connection:
         connection.execute(
             "INSERT INTO app_settings(key, value) VALUES ('episode_type_completion_v1', '1')"
         )
+    episode_completion_v2_migration = connection.execute(
+        "SELECT value FROM app_settings WHERE key='episode_batch_completion_v1'"
+    ).fetchone()
+    if episode_completion_v2_migration is None:
+        connection.execute(
+            "UPDATE catalog_nodes SET episode_metadata_checked_at=NULL "
+            "WHERE kind='series' AND tmdb_id IS NOT NULL"
+        )
+        connection.execute(
+            "INSERT INTO app_settings(key, value) VALUES ('episode_batch_completion_v1', '1')"
+        )
     approval_migration = connection.execute(
         "SELECT value FROM app_settings WHERE key='account_approval_enforced_v1'"
     ).fetchone()
@@ -706,14 +717,54 @@ def _series_completion(connection: sqlite3.Connection, series_id: str,
         ).fetchall()
         present = {(int(item["season_number"]), int(item["episode_number"]))
                    for item in present_rows}
-        missing_by_season: dict[int, list[int]] = {}
+        expected_by_season: dict[int, list[dict]] = {}
         for episode in expected:
             if str(episode.get("episode_type") or "").strip().lower() in {"special", "reunion"}:
                 continue
             season_number = int(episode["season_number"])
             episode_number = int(episode["episode_number"])
-            if (season_number, episode_number) not in present:
-                missing_by_season.setdefault(season_number, []).append(episode_number)
+            expected_by_season.setdefault(season_number, []).append({
+                "episode_number": episode_number,
+                "air_date": str(episode.get("air_date") or "")[:10],
+            })
+
+        # Some services add a one-off bonus after releasing a complete season as
+        # a batch (e.g. The Sandman S1E11). Do not make a fully present season
+        # incomplete solely because of that delayed, trailing episode.
+        trailing_bonus_episodes: set[tuple[int, int]] = set()
+        for season_number, episodes in expected_by_season.items():
+            episodes.sort(key=lambda value: value["episode_number"])
+            numbers = [value["episode_number"] for value in episodes]
+            if len(numbers) < 6 or numbers != list(range(1, numbers[-1] + 1)):
+                continue
+            final_number = numbers[-1]
+            if (season_number, final_number) in present or any(
+                    (season_number, number) not in present for number in numbers[:-1]):
+                continue
+            previous_dates = [value["air_date"] for value in episodes[:-1]
+                              if value["air_date"]]
+            final_date = episodes[-1]["air_date"]
+            if not final_date or len(previous_dates) < 5:
+                continue
+            common_date = max(set(previous_dates), key=previous_dates.count)
+            if previous_dates.count(common_date) < len(previous_dates) * 0.8:
+                continue
+            try:
+                delayed_days = (datetime.strptime(final_date, "%Y-%m-%d")
+                                - datetime.strptime(common_date, "%Y-%m-%d")).days
+            except ValueError:
+                continue
+            if delayed_days >= 7:
+                trailing_bonus_episodes.add((season_number, final_number))
+
+        missing_by_season: dict[int, list[int]] = {}
+        for season_number, episodes in expected_by_season.items():
+            for episode in episodes:
+                episode_number = episode["episode_number"]
+                if (season_number, episode_number) in trailing_bonus_episodes:
+                    continue
+                if (season_number, episode_number) not in present:
+                    missing_by_season.setdefault(season_number, []).append(episode_number)
         for season_number, episode_numbers in sorted(missing_by_season.items()):
             has_local_season = connection.execute(
                 """SELECT 1 FROM catalog_nodes WHERE parent_id=? AND kind='season'
