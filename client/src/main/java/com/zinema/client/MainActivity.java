@@ -1399,6 +1399,7 @@ public class MainActivity extends Activity {
         }
         if ("season".equals(kind)) return kidAllowedSeasonIds.contains(node.optString("id", ""));
         if ("episode".equals(kind)) {
+            if (node.optBoolean("is_incoming_pending")) return isKidAllowedByGenres(node);
             String seriesId = node.optString("series_id", "");
             JSONObject owner = seriesId.isEmpty() ? null : findCatalogNodeById(seriesId, series);
             return owner != null && isKidAllowedByGenres(owner);
@@ -3467,7 +3468,16 @@ public class MainActivity extends Activity {
     }
 
     String cardSubtitle(JSONObject node) {
-        if (node.optBoolean("is_incoming_pending")) return t("Pendiente de mover");
+        if (node.optBoolean("is_incoming_pending")) {
+            if ("episode".equals(node.optString("kind"))) {
+                String seriesTitle = node.optString("series_title", "");
+                String marker = String.format(java.util.Locale.ROOT, "S%02dE%02d",
+                        node.optInt("season_number"), node.optInt("episode_number"));
+                return (seriesTitle.isEmpty() ? marker : seriesTitle + " · " + marker)
+                        + " · " + t("Pendiente de mover");
+            }
+            return t("Pendiente de mover");
+        }
         if (node.optBoolean("is_placeholder")) {
             if ("season".equals(node.optString("kind"))) {
                 String seriesTitle = node.optString("series_title", "");
@@ -5375,48 +5385,118 @@ public class MainActivity extends Activity {
             section.setPadding(d(20), d(15), d(20), d(8));
             TextView heading = label("Temporadas", 22, Color.WHITE, true);
             section.addView(heading);
-            LinearLayout pickerRow = new LinearLayout(this);
-            pickerRow.setGravity(Gravity.CENTER_VERTICAL);
-            TextView pickerLabel = label("Temporada", 14, MUTED, false);
-            pickerRow.addView(pickerLabel, new LinearLayout.LayoutParams(-2, d(48)));
-            Spinner seasonPicker = new Spinner(this, Spinner.MODE_DROPDOWN);
-            ArrayAdapter<JSONObject> adapter = new ArrayAdapter<JSONObject>(
-                    this, android.R.layout.simple_spinner_item, availableSeasons) {
-                private TextView seasonText(JSONObject item, boolean dropdown) {
-                    TextView text = label(displayTitle(item), 15, Color.WHITE, true);
-                    text.setGravity(Gravity.CENTER_VERTICAL);
-                    text.setPadding(d(12), d(5), d(12), d(5));
-                    text.setMinHeight(d(44));
-                    if (dropdown) text.setBackgroundColor(PANEL);
-                    else text.setBackground(round(PANEL, d(8)));
-                    return text;
-                }
-                @Override public View getView(int position, View convertView, ViewGroup parent) {
-                    return seasonText(getItem(position), false);
-                }
-                @Override public View getDropDownView(int position, View convertView, ViewGroup parent) {
-                    return seasonText(getItem(position), true);
-                }
-            };
-            seasonPicker.setAdapter(adapter);
-            seasonPicker.setContentDescription(t("Seleccionar temporada"));
-            seasonPicker.setFocusable(true);
-            LinearLayout.LayoutParams pickerParams = new LinearLayout.LayoutParams(
-                    Math.max(d(180), d(availableSeasons.size() > 1 ? 220 : 180)), d(48));
-            pickerParams.leftMargin = d(12);
-            pickerRow.addView(seasonPicker, pickerParams);
-            section.addView(pickerRow);
+            HorizontalScrollView seasonScroll = new HorizontalScrollView(this);
+            seasonScroll.setHorizontalScrollBarEnabled(false);
+            seasonScroll.setClipChildren(false);
+            seasonScroll.setClipToPadding(false);
+            seasonScroll.setTag("zinema-lazy-posters");
+            LinearLayout seasonCards = new LinearLayout(this);
+            seasonCards.setOrientation(LinearLayout.HORIZONTAL);
+            seasonCards.setClipChildren(false);
+            seasonCards.setPadding(d(2), d(8), d(12), d(10));
+            seasonScroll.addView(seasonCards);
+            section.addView(seasonScroll, new LinearLayout.LayoutParams(-1, -2));
             LinearLayout episodes = new LinearLayout(this);
             episodes.setOrientation(LinearLayout.VERTICAL);
             section.addView(episodes, new LinearLayout.LayoutParams(-1, -2));
             content.addView(section, new LinearLayout.LayoutParams(-1, -2));
-            seasonPicker.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-                @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
-                    JSONObject season = adapter.getItem(position);
-                    if (season != null) loadSeasonEpisodes(seriesNode, season, episodes);
+            final JSONObject[] selectedSeason = {availableSeasons.get(0)};
+            final boolean[] userSelectedSeason = {false};
+            List<View> seasonTiles = new ArrayList<>();
+            for (JSONObject season : availableSeasons) {
+                LinearLayout tile = new LinearLayout(this);
+                tile.setOrientation(LinearLayout.VERTICAL);
+                tile.setGravity(Gravity.CENTER_HORIZONTAL);
+                tile.setFocusable(true);
+                tile.setClickable(true);
+                tile.setContentDescription(t("Temporada") + " "
+                        + String.format(java.util.Locale.ROOT, "%02d", season.optInt("season_number")));
+                applyTvFocusStyle(tile, true);
+                FrameLayout posterFrame = new FrameLayout(this);
+                GradientDrawable posterFrameBackground = new GradientDrawable();
+                posterFrameBackground.setColor(PANEL);
+                posterFrameBackground.setCornerRadius(d(7));
+                posterFrameBackground.setStroke(d(2), 0xFF626A78);
+                posterFrame.setBackground(posterFrameBackground);
+                ImageView poster = new ImageView(this);
+                poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                posterFrame.addView(poster, new FrameLayout.LayoutParams(-1, -1));
+                showPoster(season.optString("poster_url", seriesNode.optString("poster_url", "")),
+                        poster, true);
+                LinearLayout.LayoutParams posterParams = new LinearLayout.LayoutParams(d(72), d(102));
+                posterParams.setMargins(d(5), d(3), d(5), 0);
+                tile.addView(posterFrame, posterParams);
+                TextView number = label(String.format(java.util.Locale.ROOT, "T%02d",
+                        season.optInt("season_number")), 12, Color.WHITE, true);
+                number.setGravity(Gravity.CENTER);
+                number.setPadding(0, d(5), 0, 0);
+                tile.addView(number, new LinearLayout.LayoutParams(-1, -2));
+                LinearLayout.LayoutParams tileParams = new LinearLayout.LayoutParams(d(88), -2);
+                tileParams.rightMargin = d(4);
+                seasonCards.addView(tile, tileParams);
+                seasonTiles.add(tile);
+            }
+            Runnable updateSeasonSelection = () -> {
+                String selectedId = selectedSeason[0].optString("id", "");
+                for (int i = 0; i < seasonTiles.size(); i++) {
+                    JSONObject season = availableSeasons.get(i);
+                    FrameLayout frame = (FrameLayout) ((LinearLayout) seasonTiles.get(i)).getChildAt(0);
+                    GradientDrawable frameBackground = new GradientDrawable();
+                    frameBackground.setColor(PANEL);
+                    frameBackground.setCornerRadius(d(7));
+                    frameBackground.setStroke(d(2), selectedId.equals(season.optString("id", ""))
+                            ? 0xFFFFC857 : 0xFF626A78);
+                    frame.setBackground(frameBackground);
+                    seasonTiles.get(i).setSelected(selectedId.equals(season.optString("id", "")));
                 }
-                @Override public void onNothingSelected(AdapterView<?> parent) { }
-            });
+            };
+            for (int i = 0; i < availableSeasons.size(); i++) {
+                final JSONObject season = availableSeasons.get(i);
+                final View tile = seasonTiles.get(i);
+                tile.setOnClickListener(view -> {
+                    userSelectedSeason[0] = true;
+                    selectedSeason[0] = season;
+                    updateSeasonSelection.run();
+                    loadSeasonEpisodes(seriesNode, season, episodes);
+                });
+            }
+            updateSeasonSelection.run();
+            installLazyRowScroll(seasonScroll);
+            loadSeasonEpisodes(seriesNode, selectedSeason[0], episodes);
+            if (availableSeasons.size() > 1) {
+                io.execute(() -> {
+                    JSONObject lastSeenSeason = null;
+                    try {
+                        for (JSONObject seasonStub : availableSeasons) {
+                            String seasonId = seasonStub.optString("id", "");
+                            if (seasonId.isEmpty()) continue;
+                            JSONObject seasonDetail = getJson("/api/v1/catalog/" + enc(seasonId));
+                            JSONArray files = seasonDetail.optJSONArray("files");
+                            if (files == null) continue;
+                            boolean hasSeenEpisode = false;
+                            for (int i = 0; i < files.length(); i++) {
+                                JSONObject episode = files.optJSONObject(i);
+                                if (episode != null && isMediaSeen(episode)) {
+                                    hasSeenEpisode = true;
+                                    break;
+                                }
+                            }
+                            if (hasSeenEpisode) lastSeenSeason = seasonStub;
+                        }
+                    } catch (Exception ignored) { }
+                    JSONObject watchedSeason = lastSeenSeason;
+                    if (watchedSeason == null) return;
+                    runOnUiThread(() -> {
+                        if (!showingDetail || !seriesNode.optString("id").equals(detailNodeId)
+                                || userSelectedSeason[0]) return;
+                        selectedSeason[0] = watchedSeason;
+                        updateSeasonSelection.run();
+                        int index = availableSeasons.indexOf(watchedSeason);
+                        if (index >= 0) seasonScroll.smoothScrollTo(d(Math.max(0, index * 92)), 0);
+                        loadSeasonEpisodes(seriesNode, watchedSeason, episodes);
+                    });
+                });
+            }
         }
         if (!pendingSeasons.isEmpty()) {
             addSectionHeader("Temporadas pendientes", "A la espera de ser añadido");
@@ -6389,14 +6469,17 @@ public class MainActivity extends Activity {
             TextView name = labelRaw(episodeNumber + ". " + episodeTitleForDisplay(file, episodeNumber),
                     16, Color.WHITE, true);
             boolean watchedEpisode = isMediaSeen(file);
+            boolean incomingPending = file.optBoolean("is_incoming_pending");
             long position = mediaProgressPosition(file);
             boolean inProgress = !watchedEpisode && position > 10000L;
             String watched = watchedEpisode ? "   ·   ✓ " + t("VISTO")
                     : inProgress ? "   ·   " + t("EN CURSO") + " ·   "
                     + formatTime((int) Math.min(Integer.MAX_VALUE, position)) : "";
             String extension = file.optString("extension", "").replace(".", "").toUpperCase();
-            String subText = extension.isEmpty() ? formatSize(file.optLong("size_bytes"))
+            String subText = incomingPending ? t("Pendiente de mover")
+                    : extension.isEmpty() ? formatSize(file.optLong("size_bytes"))
                     : extension + "   ·   " + formatSize(file.optLong("size_bytes"));
+            if (incomingPending && !extension.isEmpty()) subText += "   ·   " + extension;
             TextView sub = label(subText + watched,
                     12, watchedEpisode ? 0xFF79E3B7 : inProgress ? 0xFFFFC078 : MUTED, false);
             texts.addView(name);
@@ -6407,13 +6490,26 @@ public class MainActivity extends Activity {
             LinearLayout.LayoutParams ip = new LinearLayout.LayoutParams(-1, -2);
             ip.setMargins(d(16), 0, d(16), d(8));
             parent.addView(item, ip);
-            item.setOnClickListener(v -> launchPlayer(file.optString("stream_url"),
-                    file.optString("title", "Zinema"), file.optString("poster_url", fallbackPoster),
-                    owner.optString("id", ""), file.optString("id", ""), owner.optString("kind", "")));
-            item.setOnLongClickListener(v -> {
-                showMediaActions(file, owner);
-                return true;
-            });
+            if (incomingPending) {
+                item.setFocusable(false);
+                item.setClickable(false);
+                item.setLongClickable(false);
+                TextView pending = label(t("Pendiente de mover"), 10, Color.WHITE, true);
+                pending.setPadding(d(7), d(4), d(7), d(4));
+                pending.setBackground(round(0xDD9B4D00, d(7)));
+                FrameLayout.LayoutParams pendingParams = new FrameLayout.LayoutParams(
+                        -2, -2, Gravity.RIGHT | Gravity.TOP);
+                pendingParams.setMargins(0, d(5), d(5), 0);
+                thumbnailFrame.addView(pending, pendingParams);
+            } else {
+                item.setOnClickListener(v -> launchPlayer(file.optString("stream_url"),
+                        file.optString("title", "Zinema"), file.optString("poster_url", fallbackPoster),
+                        owner.optString("id", ""), file.optString("id", ""), owner.optString("kind", "")));
+                item.setOnLongClickListener(v -> {
+                    showMediaActions(file, owner);
+                    return true;
+                });
+            }
         }
     }
 

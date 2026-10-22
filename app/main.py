@@ -832,6 +832,34 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
         node["files"].append({**media_payload,
                               "stream_url": f"/api/v1/items/{media['id']}/stream",
                               "poster_url": poster})
+    if node["kind"] == "season":
+        parent = connection.execute(
+            "SELECT title, metadata_title FROM catalog_nodes WHERE id=? AND available=1",
+            (node.get("parent_id"),),
+        ).fetchone()
+        if parent is not None:
+            series_title = str(parent["metadata_title"] or parent["title"])
+            for entry in _incoming_entries(connection):
+                if (entry["library"] != "series" or entry["content_kind"] != "episode"
+                        or int(entry["season_number"] or 0) != int(node.get("season_number") or 0)
+                        or not _media_titles_similar(series_title, str(entry["title"] or ""))):
+                    continue
+                episode_number = int(entry["episode_number"] or 0)
+                episode_title = str(entry["episode_title"] or "").strip()
+                title = episode_title or f"S{int(node.get('season_number') or 0):02d}E{episode_number:02d}"
+                node["files"].append({
+                    "id": f"incoming:{entry['file_id']}", "title": title,
+                    "filename": entry["filename"], "extension": Path(str(entry["filename"])).suffix,
+                    "size_bytes": entry["size_bytes"], "modified_at": entry["modified_at"],
+                    "season_number": node.get("season_number"), "episode_number": episode_number,
+                    "poster_url": entry["poster_url"] or node["poster_url"],
+                    "is_placeholder": True, "is_incoming_pending": True,
+                    "incoming_filename": entry["filename"],
+                })
+            node["files"].sort(key=lambda item: (
+                int(item.get("episode_number") or 0),
+                str(item.get("title") or "").casefold(),
+            ))
     node["mosaic_images"] = collection_artwork["mosaic_images"] if collection_artwork else []
     if collection_artwork:
         node["item_count"] = collection_artwork["item_count"]
@@ -1161,14 +1189,18 @@ def _incoming_catalog_placeholders(connection: sqlite3.Connection,
         if entry["library"] != library:
             continue
         title = str(entry["title"] or "").strip()
+        is_episode = library == "series" and entry["content_kind"] == "episode"
+        item_kind = "episode" if is_episode else kind
         normalized = _normalize_media_title(title)
-        dedupe_key = normalized if kind == "series" else f"{normalized}:{entry['year'] or ''}"
-        if not normalized or dedupe_key in seen_titles:
+        dedupe_key = (f"{entry['file_id']}" if is_episode else
+                      normalized if kind == "series" else f"{normalized}:{entry['year'] or ''}")
+        if not normalized or (not is_episode and dedupe_key in seen_titles):
             continue
-        seen_titles.add(dedupe_key)
+        if not is_episode:
+            seen_titles.add(dedupe_key)
         catalog_match = None
         for candidate in connection.execute(
-            """SELECT title, metadata_title, original_title, genres, age_limit, age_rating
+            """SELECT id, title, metadata_title, original_title, genres, age_limit, age_rating
                FROM catalog_nodes WHERE library=? AND kind=? AND available=1""",
             (library, kind),
         ):
@@ -1176,9 +1208,14 @@ def _incoming_catalog_placeholders(connection: sqlite3.Connection,
                     candidate["title"], candidate["metadata_title"], candidate["original_title"])):
                 catalog_match = candidate
                 break
+        episode_title = str(entry["episode_title"] or "").strip()
+        episode_number = int(entry["episode_number"] or 0)
+        season_number = int(entry["season_number"] or 0)
+        display_title = (episode_title or f"S{season_number:02d}E{episode_number:02d}") \
+            if is_episode else title
         item: dict[str, object] = {
-            "id": f"incoming:{entry['file_id']}", "kind": kind, "library": library,
-            "title": title, "display_title": title, "year": entry["year"],
+            "id": f"incoming:{entry['file_id']}", "kind": item_kind, "library": library,
+            "title": display_title, "display_title": display_title, "year": entry["year"],
             "added_at": entry["modified_at"],
             "poster_url": entry["poster_url"], "poster_available": bool(entry["poster_url"]),
             "genres": json.loads(catalog_match["genres"] or "[]") if catalog_match else [],
@@ -1188,6 +1225,11 @@ def _incoming_catalog_placeholders(connection: sqlite3.Connection,
             "incoming_file_id": entry["file_id"], "incoming_filename": entry["filename"],
             "children": [], "files": [],
         }
+        if is_episode:
+            item.update({"series_title": title, "season_number": season_number,
+                         "episode_number": episode_number})
+            if catalog_match is not None:
+                item["series_id"] = catalog_match["id"]
         request_id = entry.get("request_id")
         if request_id:
             request = connection.execute(
