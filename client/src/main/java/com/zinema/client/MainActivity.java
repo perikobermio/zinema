@@ -4348,6 +4348,55 @@ public class MainActivity extends Activity {
                 }).show();
     }
 
+    void requestSeason(JSONObject seriesNode, JSONObject season) {
+        requestSeasonContent(seriesNode, season, true);
+    }
+
+    void requestMissingSeasonEpisodes(JSONObject seriesNode, JSONObject season) {
+        requestSeasonContent(seriesNode, season, false);
+    }
+
+    void requestSeasonContent(JSONObject seriesNode, JSONObject season, boolean wholeSeason) {
+        String seriesId = seriesNode == null ? "" : seriesNode.optString("id", "");
+        int seasonNumber = season == null ? 0 : season.optInt("season_number");
+        if (seriesId.isEmpty() || seasonNumber <= 0) return;
+        String seasonLabel = t("Temporada") + " "
+                + String.format(java.util.Locale.ROOT, "%02d", seasonNumber);
+        String title = wholeSeason ? t("Pedir temporada completa") : t("Pedir capítulos restantes");
+        String message = wholeSeason
+                ? displayTitle(seriesNode) + " · " + seasonLabel
+                : displayTitle(seriesNode) + " · " + seasonLabel + " · "
+                    + season.optInt("missing_episode_count") + " "
+                    + t(season.optInt("missing_episode_count") == 1 ? "capítulo" : "capítulos");
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(message)
+                .setNegativeButton(t("Cancelar"), null)
+                .setPositiveButton(t("Enviar solicitud"), (dialog, which) -> {
+                    JSONObject payload = new JSONObject();
+                    try {
+                        payload.put("request_type", "remaining_seasons");
+                        payload.put("catalog_node_id", seriesId);
+                        payload.put("season_number", seasonNumber);
+                    } catch (JSONException ignored) { return; }
+                    io.execute(() -> {
+                        try {
+                            postJson("/api/v1/content-requests", payload);
+                            runOnUiThread(() -> {
+                                try { season.put("request_status", "pending"); }
+                                catch (JSONException ignored) { }
+                                Toast.makeText(this, t("Solicitud enviada a administración."),
+                                        Toast.LENGTH_LONG).show();
+                            });
+                        } catch (Exception e) {
+                            runOnUiThread(() -> Toast.makeText(this,
+                                    t("No se pudo enviar la solicitud: ") + e.getMessage(),
+                                    Toast.LENGTH_LONG).show());
+                        }
+                    });
+                }).show();
+    }
+
     String[] localizedOptions(List<String> options) {
         String[] result = new String[options.size()];
         for (int i = 0; i < options.size(); i++) result[i] = t(options.get(i));
@@ -5345,8 +5394,8 @@ public class MainActivity extends Activity {
             primaryAction.post(() -> primaryAction.requestFocus());
 
         JSONArray children = node.optJSONArray("children");
-        if ("series".equals(node.optString("kind")) && children != null && children.length() > 0) {
-            addSeasonNavigator(node, children);
+        if ("series".equals(node.optString("kind"))) {
+            addSeasonNavigator(node, children == null ? new JSONArray() : children);
         }
         if ("movie".equals(node.optString("kind")) || "series".equals(node.optString("kind")))
             addCastSection(node.optJSONArray("cast"));
@@ -5364,22 +5413,53 @@ public class MainActivity extends Activity {
         }
         if (!externalRecommendation && (files == null || files.length() == 0)
                 && (children == null || children.length() == 0)
+                && (node.optJSONArray("missing_seasons") == null
+                    || node.optJSONArray("missing_seasons").length() == 0)
                 && !node.optString("kind").equals("movie")) addEmpty("No se encontraron episodios.");
         restorePendingFocus();
     }
 
     void addSeasonNavigator(JSONObject seriesNode, JSONArray children) {
         List<JSONObject> availableSeasons = new ArrayList<>();
-        List<JSONObject> pendingSeasons = new ArrayList<>();
+        List<JSONObject> allSeasons = new ArrayList<>();
+        Map<Integer, JSONObject> seasonsByNumber = new HashMap<>();
         for (int i = 0; i < children.length(); i++) {
             JSONObject child = children.optJSONObject(i);
             if (child == null || !"season".equals(child.optString("kind"))) continue;
-            if (child.optBoolean("is_placeholder")) pendingSeasons.add(child);
-            else availableSeasons.add(child);
+            int number = child.optInt("season_number", -1);
+            if (number >= 0) seasonsByNumber.put(number, child);
+            allSeasons.add(child);
+            if (!child.optBoolean("is_placeholder")) availableSeasons.add(child);
         }
         Collections.sort(availableSeasons,
                 Comparator.comparingInt(value -> value.optInt("season_number")));
-        if (!availableSeasons.isEmpty()) {
+        JSONArray missingNumbers = seriesNode.optJSONArray("missing_seasons");
+        if (missingNumbers != null) {
+            for (int i = 0; i < missingNumbers.length(); i++) {
+                int number = missingNumbers.optInt(i, -1);
+                if (number < 0 || seasonsByNumber.containsKey(number)) continue;
+                JSONObject season = new JSONObject();
+                try {
+                    season.put("id", "missing-season:" + seriesNode.optString("id") + ":" + number);
+                    season.put("kind", "season");
+                    season.put("title", "Temporada " + String.format(java.util.Locale.ROOT, "%02d", number));
+                    season.put("display_title", season.optString("title"));
+                    season.put("season_number", number);
+                    season.put("poster_url", seriesNode.optString("poster_url", ""));
+                    season.put("is_placeholder", true);
+                    season.put("is_missing_season", true);
+                    JSONObject requestStatuses = seriesNode.optJSONObject("season_request_statuses");
+                    if (requestStatuses != null) {
+                        String status = requestStatuses.optString(String.valueOf(number), "");
+                        if (!status.isEmpty()) season.put("request_status", status);
+                    }
+                } catch (JSONException ignored) { }
+                allSeasons.add(season);
+                seasonsByNumber.put(number, season);
+            }
+        }
+        Collections.sort(allSeasons, Comparator.comparingInt(value -> value.optInt("season_number", Integer.MAX_VALUE)));
+        if (!allSeasons.isEmpty()) {
             LinearLayout section = new LinearLayout(this);
             section.setOrientation(LinearLayout.VERTICAL);
             section.setPadding(d(20), d(15), d(20), d(8));
@@ -5400,15 +5480,25 @@ public class MainActivity extends Activity {
             episodes.setOrientation(LinearLayout.VERTICAL);
             section.addView(episodes, new LinearLayout.LayoutParams(-1, -2));
             content.addView(section, new LinearLayout.LayoutParams(-1, -2));
-            final JSONObject[] selectedSeason = {availableSeasons.get(0)};
+            final JSONObject[] selectedSeason = {availableSeasons.isEmpty() ? null : availableSeasons.get(0)};
             final boolean[] userSelectedSeason = {false};
             List<View> seasonTiles = new ArrayList<>();
-            for (JSONObject season : availableSeasons) {
+            List<TextView> seasonSelectionMarks = new ArrayList<>();
+            List<TextView> seasonNumbers = new ArrayList<>();
+            List<ImageView> seasonPosters = new ArrayList<>();
+            for (JSONObject season : allSeasons) {
                 LinearLayout tile = new LinearLayout(this);
                 tile.setOrientation(LinearLayout.VERTICAL);
                 tile.setGravity(Gravity.CENTER_HORIZONTAL);
+                boolean missingSeason = season.optBoolean("is_placeholder");
+                boolean alreadyRequested = "pending".equals(season.optString("request_status"))
+                        || "sending".equals(season.optString("request_status"))
+                        || "approved".equals(season.optString("request_status"));
+                boolean incomplete = season.optBoolean("incomplete")
+                        || season.optInt("missing_episode_count") > 0;
                 tile.setFocusable(true);
-                tile.setClickable(true);
+                tile.setClickable(!missingSeason);
+                tile.setLongClickable(missingSeason || incomplete);
                 tile.setContentDescription(t("Temporada") + " "
                         + String.format(java.util.Locale.ROOT, "%02d", season.optInt("season_number")));
                 applyTvFocusStyle(tile, true);
@@ -5421,48 +5511,147 @@ public class MainActivity extends Activity {
                 ImageView poster = new ImageView(this);
                 poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 posterFrame.addView(poster, new FrameLayout.LayoutParams(-1, -1));
+                seasonPosters.add(poster);
+                if (missingSeason) {
+                    View shade = new View(this);
+                    shade.setBackgroundColor(0xB8000000);
+                    posterFrame.addView(shade, new FrameLayout.LayoutParams(-1, -1));
+                    TextView missing = label(alreadyRequested ? t("Solicitada") : t("Pendiente"),
+                            9, Color.WHITE, true);
+                    missing.setGravity(Gravity.CENTER);
+                    missing.setPadding(d(4), d(4), d(4), d(4));
+                    missing.setBackground(round(alreadyRequested ? 0xDD477A55 : 0xDD6C717A, d(6)));
+                    FrameLayout.LayoutParams missingParams = new FrameLayout.LayoutParams(-1, -2,
+                            Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+                    missingParams.setMargins(d(4), 0, d(4), d(5));
+                    posterFrame.addView(missing, missingParams);
+                } else if (incomplete) {
+                    TextView incompleteFlag = label(t("INCOMPLETA"), 9, 0xFF211600, true);
+                    incompleteFlag.setGravity(Gravity.CENTER);
+                    incompleteFlag.setPadding(d(5), d(4), d(5), d(4));
+                    incompleteFlag.setBackground(round(0xFFFFC857, d(6)));
+                    FrameLayout.LayoutParams incompleteParams = new FrameLayout.LayoutParams(
+                            -2, -2, Gravity.TOP | Gravity.RIGHT);
+                    incompleteParams.setMargins(0, d(4), d(4), 0);
+                    posterFrame.addView(incompleteFlag, incompleteParams);
+                }
+                if (!missingSeason && alreadyRequested) {
+                    TextView requestedFlag = label(t("Solicitada"), 9, Color.WHITE, true);
+                    requestedFlag.setPadding(d(5), d(4), d(5), d(4));
+                    requestedFlag.setBackground(round(0xDD477A55, d(6)));
+                    FrameLayout.LayoutParams requestedParams = new FrameLayout.LayoutParams(
+                            -2, -2, Gravity.BOTTOM | Gravity.LEFT);
+                    requestedParams.setMargins(d(4), 0, 0, d(4));
+                    posterFrame.addView(requestedFlag, requestedParams);
+                }
+                TextView selectedMark = label("✓", 16, 0xFF241A00, true);
+                selectedMark.setGravity(Gravity.CENTER);
+                selectedMark.setBackground(round(0xFFFFC857, d(20)));
+                selectedMark.setElevation(d(3));
+                FrameLayout.LayoutParams markParams = new FrameLayout.LayoutParams(d(28), d(28),
+                        Gravity.TOP | Gravity.RIGHT);
+                markParams.setMargins(0, d(5), d(5), 0);
+                posterFrame.addView(selectedMark, markParams);
+                seasonSelectionMarks.add(selectedMark);
                 showPoster(season.optString("poster_url", seriesNode.optString("poster_url", "")),
                         poster, true);
                 LinearLayout.LayoutParams posterParams = new LinearLayout.LayoutParams(d(72), d(102));
                 posterParams.setMargins(d(5), d(3), d(5), 0);
                 tile.addView(posterFrame, posterParams);
                 TextView number = label(String.format(java.util.Locale.ROOT, "T%02d",
-                        season.optInt("season_number")), 12, Color.WHITE, true);
+                        season.optInt("season_number")), 12,
+                        missingSeason ? MUTED : Color.WHITE, true);
                 number.setGravity(Gravity.CENTER);
                 number.setPadding(0, d(5), 0, 0);
                 tile.addView(number, new LinearLayout.LayoutParams(-1, -2));
+                seasonNumbers.add(number);
                 LinearLayout.LayoutParams tileParams = new LinearLayout.LayoutParams(d(88), -2);
                 tileParams.rightMargin = d(4);
                 seasonCards.addView(tile, tileParams);
                 seasonTiles.add(tile);
             }
             Runnable updateSeasonSelection = () -> {
-                String selectedId = selectedSeason[0].optString("id", "");
+                String selectedId = selectedSeason[0] == null ? "" : selectedSeason[0].optString("id", "");
                 for (int i = 0; i < seasonTiles.size(); i++) {
-                    JSONObject season = availableSeasons.get(i);
+                    JSONObject season = allSeasons.get(i);
                     FrameLayout frame = (FrameLayout) ((LinearLayout) seasonTiles.get(i)).getChildAt(0);
                     GradientDrawable frameBackground = new GradientDrawable();
-                    frameBackground.setColor(PANEL);
+                    boolean selected = selectedId.equals(season.optString("id", ""));
+                    frameBackground.setColor(selected ? 0xFF3A3020 : PANEL);
                     frameBackground.setCornerRadius(d(7));
-                    frameBackground.setStroke(d(2), selectedId.equals(season.optString("id", ""))
-                            ? 0xFFFFC857 : 0xFF626A78);
+                    frameBackground.setStroke(d(selected ? 4 : 1),
+                            selected ? 0xFFFFC857 : season.optBoolean("is_placeholder")
+                                    ? 0xFF777777 : 0xFF626A78);
                     frame.setBackground(frameBackground);
-                    seasonTiles.get(i).setSelected(selectedId.equals(season.optString("id", "")));
+                    seasonTiles.get(i).setSelected(selected);
+                    seasonTiles.get(i).setElevation(d(selected ? 5 : 0));
+                    seasonSelectionMarks.get(i).setVisibility(selected ? View.VISIBLE : View.GONE);
+                    seasonNumbers.get(i).setTextColor(selected ? 0xFFFFD778
+                            : season.optBoolean("is_placeholder") ? MUTED : Color.WHITE);
                 }
             };
-            for (int i = 0; i < availableSeasons.size(); i++) {
-                final JSONObject season = availableSeasons.get(i);
+            for (int i = 0; i < allSeasons.size(); i++) {
+                final JSONObject season = allSeasons.get(i);
                 final View tile = seasonTiles.get(i);
+                final boolean missingSeason = season.optBoolean("is_placeholder");
+                final boolean incomplete = season.optBoolean("incomplete")
+                        || season.optInt("missing_episode_count") > 0;
                 tile.setOnClickListener(view -> {
+                    if (missingSeason) return;
                     userSelectedSeason[0] = true;
                     selectedSeason[0] = season;
                     updateSeasonSelection.run();
                     loadSeasonEpisodes(seriesNode, season, episodes);
                 });
+                if (missingSeason || incomplete) {
+                    tile.setOnLongClickListener(view -> {
+                        String requestStatus = season.optString("request_status", "");
+                        if ("pending".equals(requestStatus) || "sending".equals(requestStatus)
+                                || "approved".equals(requestStatus)) {
+                            Toast.makeText(this, t("Esta temporada ya tiene una solicitud."),
+                                    Toast.LENGTH_LONG).show();
+                        } else if (missingSeason) {
+                            requestSeason(seriesNode, season);
+                        } else {
+                            requestMissingSeasonEpisodes(seriesNode, season);
+                        }
+                        return true;
+                    });
+                }
             }
             updateSeasonSelection.run();
             installLazyRowScroll(seasonScroll);
-            loadSeasonEpisodes(seriesNode, selectedSeason[0], episodes);
+            if (selectedSeason[0] != null) loadSeasonEpisodes(seriesNode, selectedSeason[0], episodes);
+            else {
+                TextView emptyEpisodes = label(t("No hay temporadas disponibles para reproducir."),
+                        13, MUTED, false);
+                emptyEpisodes.setPadding(d(4), d(10), d(4), d(10));
+                episodes.addView(emptyEpisodes);
+            }
+            if (missingNumbers != null && missingNumbers.length() > 0) {
+                io.execute(() -> {
+                    try {
+                        JSONObject artwork = getJson("/api/v1/catalog/" + enc(seriesNode.optString("id"))
+                                + "/missing-season-artwork");
+                        JSONArray seasonArt = artwork.optJSONArray("seasons");
+                        if (seasonArt == null) return;
+                        runOnUiThread(() -> {
+                            if (!showingDetail || !seriesNode.optString("id").equals(detailNodeId)) return;
+                            for (int i = 0; i < seasonArt.length(); i++) {
+                                JSONObject art = seasonArt.optJSONObject(i);
+                                if (art == null || art.optString("poster_url").isEmpty()) continue;
+                                JSONObject season = seasonsByNumber.get(art.optInt("season_number", -1));
+                                if (season == null) continue;
+                                try { season.put("poster_url", art.optString("poster_url")); }
+                                catch (JSONException ignored) { }
+                                int index = allSeasons.indexOf(season);
+                                if (index >= 0) showPoster(art.optString("poster_url"),
+                                        seasonPosters.get(index), false);
+                            }
+                        });
+                    } catch (Exception ignored) { }
+                });
+            }
             if (availableSeasons.size() > 1) {
                 io.execute(() -> {
                     JSONObject lastSeenSeason = null;
@@ -5491,16 +5680,12 @@ public class MainActivity extends Activity {
                                 || userSelectedSeason[0]) return;
                         selectedSeason[0] = watchedSeason;
                         updateSeasonSelection.run();
-                        int index = availableSeasons.indexOf(watchedSeason);
+                        int index = allSeasons.indexOf(watchedSeason);
                         if (index >= 0) seasonScroll.smoothScrollTo(d(Math.max(0, index * 92)), 0);
                         loadSeasonEpisodes(seriesNode, watchedSeason, episodes);
                     });
                 });
             }
-        }
-        if (!pendingSeasons.isEmpty()) {
-            addSectionHeader("Temporadas pendientes", "A la espera de ser añadido");
-            addGrid(pendingSeasons);
         }
     }
 
@@ -5697,6 +5882,13 @@ public class MainActivity extends Activity {
             case "Acciones": return "Ekintzak";
             case "Pedir contenido": return "Edukia eskatu";
             case "Pedir temporadas restantes": return "Gainerako denboraldiak eskatu";
+            case "Pedir temporada completa": return "Denboraldi osoa eskatu";
+            case "Pedir capítulos restantes": return "Falta diren atalak eskatu";
+            case "temporada completa": return "denboraldi osoa";
+            case "Solicitada": return "Eskatuta";
+            case "Esta temporada ya tiene una solicitud.": return "Denboraldi honek eskaera bat du dagoeneko.";
+            case "No hay temporadas disponibles para reproducir.":
+                return "Ez dago erreproduzitzeko denboraldirik.";
             case "Gestión de cuentas": return "Kontuen kudeaketa";
             case "Gestión de Incoming": return "Incoming karpetaren kudeaketa";
             case "Detecta los vídeos de Incoming y edita su ruta de destino antes de moverlos.":
@@ -7920,7 +8112,23 @@ public class MainActivity extends Activity {
                             typeLabel = t("Temporadas restantes");
                             JSONObject details = request.optJSONObject("details");
                             JSONArray missing = details == null ? null : details.optJSONArray("missing_seasons");
-                            if (missing != null && missing.length() > 0) {
+                            int requestedSeason = request.optInt("season_number");
+                            boolean requestingWholeSeason = false;
+                            if (requestedSeason > 0 && missing != null) {
+                                for (int j = 0; j < missing.length(); j++)
+                                    if (missing.optInt(j) == requestedSeason) requestingWholeSeason = true;
+                            }
+                            if (requestingWholeSeason) {
+                                typeLabel = t("Temporada") + " "
+                                        + String.format(java.util.Locale.ROOT, "%02d", requestedSeason)
+                                        + " · " + t("temporada completa");
+                            } else if (requestedSeason > 0) {
+                                typeLabel = t("Temporada") + " "
+                                        + String.format(java.util.Locale.ROOT, "%02d", requestedSeason);
+                                if (details != null && details.optInt("missing_episode_count") > 0)
+                                    typeLabel += " · " + details.optInt("missing_episode_count") + " "
+                                            + t("capítulos");
+                            } else if (missing != null && missing.length() > 0) {
                                 ArrayList<String> numbers = new ArrayList<>();
                                 for (int j = 0; j < missing.length(); j++) numbers.add("T" + missing.optInt(j));
                                 typeLabel += " · " + t("Faltan") + " " + android.text.TextUtils.join(", ", numbers);

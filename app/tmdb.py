@@ -549,7 +549,8 @@ def get_candidate_details(kind: str, tmdb_id: int, access_token: str,
         "cast": _cast_payload(details),
         "seasons": ([{"season_number": int(item["season_number"]),
                       "name": item.get("name") or f"Season {item['season_number']}",
-                      "episode_count": int(item.get("episode_count") or 0)}
+                      "episode_count": int(item.get("episode_count") or 0),
+                      "poster_path": item.get("poster_path")}
                      for item in details.get("seasons", [])
                      if item.get("season_number") is not None and int(item["season_number"]) > 0]
                     if entity_kind == "tv" else []),

@@ -88,6 +88,9 @@ PLAYBACK_TICKETS: dict[str, tuple[str, float, str]] = {}
 PLAYBACK_TICKET_LOCK = threading.Lock()
 EPISODE_THUMBNAIL_LOCK = threading.Lock()
 EPISODE_THUMBNAIL_RUNNING = False
+SEASON_ART_CACHE_LOCK = threading.Lock()
+SEASON_ART_CACHE: dict[tuple[int, str], tuple[float, list[dict[str, object]]]] = {}
+SEASON_ART_CACHE_TTL_SECONDS = 6 * 60 * 60
 
 app = FastAPI(title="Zinema Server", version="0.1.0",
               docs_url=None, redoc_url=None, openapi_url=None)
@@ -518,6 +521,7 @@ def _catalog_request_placeholder(request: sqlite3.Row | dict, kind: str,
         "tmdb_id": request["tmdb_id"],
         "season_number": season_number,
         "request_type": request["request_type"],
+        "request_status": request["status"],
         "is_placeholder": True,
         "poster_url": poster_url,
         "poster_available": bool(poster_url),
@@ -773,6 +777,38 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
             json.loads(genre_row["genres"] or "[]") if genre_row else []
         )
 
+    season_request_statuses: dict[int, str] = {}
+    if node["kind"] == "series":
+        request_rows = connection.execute(
+            """SELECT request_type, season_number, status, details_json
+               FROM content_requests
+               WHERE (request_type='remaining_seasons' AND catalog_node_id=?)
+                  OR (request_type='new_content' AND content_type='tv' AND tmdb_id=? AND season_number IS NOT NULL)
+               ORDER BY created_at, id""",
+            (node["id"], node.get("tmdb_id")),
+        ).fetchall()
+        for request_row in request_rows:
+            details = json.loads(request_row["details_json"] or "{}")
+            targeted: set[int] = set()
+            if request_row["request_type"] == "new_content":
+                targeted.add(int(request_row["season_number"]))
+            else:
+                explicit = details.get("season_number") or request_row["season_number"]
+                if explicit is not None:
+                    targeted.add(int(explicit))
+                targeted.update(int(value) for value in details.get("missing_seasons") or [])
+                targeted.update(int(value["season_number"])
+                                for value in details.get("missing_episodes") or []
+                                if value.get("season_number") is not None)
+                if explicit is None and int(details.get("missing_episode_count") or 0) > 0:
+                    targeted.update(int(value["season_number"])
+                                    for value in node.get("missing_episodes", []))
+            for number in targeted:
+                season_request_statuses[number] = request_row["status"]
+        node["season_request_statuses"] = {
+            str(number): status for number, status in season_request_statuses.items()
+        }
+
     child_rows = connection.execute(
         """SELECT id, kind, title, metadata_title, poster_file, season_number, parent_id,
                   tmdb_episodes_json
@@ -801,6 +837,17 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
                             if available else None),
              "poster_available": available,
              "poster_is_assigned": bool(child["poster_file"])}
+        if child["kind"] == "season":
+            for missing in node.get("missing_episodes", []):
+                if int(missing["season_number"]) == int(child["season_number"] or 0):
+                    numbers = missing["episode_numbers"]
+                    child_payload.update({"incomplete": bool(numbers),
+                                          "missing_episode_numbers": numbers,
+                                          "missing_episode_count": len(numbers)})
+                    break
+            request_status = season_request_statuses.get(int(child["season_number"] or 0))
+            if request_status:
+                child_payload["request_status"] = request_status
         if child["kind"] == "series":
             child_payload.update(_series_completion(
                 connection, child["id"], child["tmdb_episodes_json"],
@@ -1059,8 +1106,14 @@ def _match_incoming_request(connection: sqlite3.Connection,
             if request_type != "tv":
                 continue
             details = json.loads(request["details_json"] or "{}")
-            if details.get("missing_seasons") and guess["season_number"] not in {
-                    int(value) for value in details["missing_seasons"]}:
+            requested_seasons = {int(value) for value in details.get("missing_seasons") or []}
+            requested_season = details.get("season_number") or request["season_number"]
+            if requested_season is not None and int(requested_season) != int(guess["season_number"]):
+                continue
+            if requested_seasons and guess["season_number"] not in requested_seasons:
+                continue
+            requested_episodes = {int(value) for value in details.get("missing_episode_numbers") or []}
+            if requested_episodes and int(guess["episode_number"] or 0) not in requested_episodes:
                 continue
         else:
             continue
@@ -1307,6 +1360,24 @@ def _remove_fulfilled_content_requests(connection: sqlite3.Connection) -> int:
                            AND parent_id=? AND season_number=? LIMIT 1""",
                         (series["id"], int(number)),
                     ).fetchone() is not None for number in missing_seasons)
+                elif details.get("season_number") is not None:
+                    season_number = int(details["season_number"])
+                    if connection.execute(
+                            """SELECT 1 FROM catalog_nodes WHERE available=1 AND kind='season'
+                               AND parent_id=? AND season_number=? LIMIT 1""",
+                            (series["id"], season_number),
+                    ).fetchone() is None:
+                        fulfilled = False
+                    else:
+                        completion = _series_completion(
+                            connection, series["id"], series["tmdb_episodes_json"],
+                        )
+                        remaining = next((item["episode_numbers"]
+                                          for item in completion["missing_episodes"]
+                                          if int(item["season_number"]) == season_number), [])
+                        requested_episodes = details.get("missing_episode_numbers") or []
+                        fulfilled = not any(int(number) in set(remaining)
+                                            for number in requested_episodes)
                 elif int(details.get("missing_episode_count") or 0) > 0:
                     completion = _series_completion(
                         connection, series["id"], series["tmdb_episodes_json"],
@@ -2520,6 +2591,51 @@ def get_catalog_node(node_id: str) -> dict:
         return _node_payload(row, connection)
 
 
+@app.get("/api/v1/catalog/{node_id}/missing-season-artwork",
+         dependencies=[Depends(require_client)])
+def get_missing_season_artwork(node_id: str) -> dict[str, object]:
+    with closing(database()) as connection:
+        row = connection.execute(
+            """SELECT id, kind, tmdb_id, tmdb_episodes_json FROM catalog_nodes
+               WHERE id=? AND available=1""",
+            (node_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Catalog node not found")
+        if row["kind"] != "series":
+            raise HTTPException(status_code=422, detail="Season artwork requires a series")
+        missing = _series_completion(connection, row["id"], row["tmdb_episodes_json"])
+        missing_numbers = set(missing["missing_seasons"])
+        tmdb_id = row["tmdb_id"]
+    if not missing_numbers or not tmdb_id or not TMDB_CONFIGURED:
+        return {"seasons": []}
+
+    cache_key = (int(tmdb_id), TMDB_LANGUAGE)
+    now = time.monotonic()
+    with SEASON_ART_CACHE_LOCK:
+        cached = SEASON_ART_CACHE.get(cache_key)
+        season_data = cached[1] if cached and cached[0] > now else []
+    if not season_data:
+        try:
+            details = get_candidate_details(
+                "tv", int(tmdb_id), TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, TMDB_KEY,
+            )
+            season_data = [dict(season) for season in details.get("seasons", [])]
+            with SEASON_ART_CACHE_LOCK:
+                SEASON_ART_CACHE[cache_key] = (now + SEASON_ART_CACHE_TTL_SECONDS, season_data)
+        except Exception as exc:
+            raise HTTPException(status_code=502,
+                                detail=f"Could not load season artwork: {str(exc)[:300]}") from None
+    return {"seasons": [
+        {"season_number": int(season["season_number"]),
+         "title": str(season.get("name") or f"Temporada {int(season['season_number']):02d}"),
+         "poster_url": (f"https://image.tmdb.org/t/p/w342{season['poster_path']}"
+                        if season.get("poster_path") else None)}
+        for season in season_data
+        if int(season.get("season_number") or 0) in missing_numbers
+    ]}
+
+
 TMDB_GENRE_NAMES = {
     12: "Aventura", 14: "Fantasía", 16: "Animación", 18: "Drama", 27: "Terror",
     28: "Acción", 35: "Comedia", 36: "Historia", 37: "Western", 53: "Suspense",
@@ -2852,7 +2968,7 @@ def create_content_request(request: ContentRequestCreate,
 
         if request.request_type == "remaining_seasons":
             if (not request.catalog_node_id or request.tmdb_id is not None
-                    or request.season_number is not None or request.items or request.content_type is not None):
+                    or request.items or request.content_type is not None):
                 raise HTTPException(status_code=422, detail="A series catalog item is required")
             series = connection.execute(
                 """SELECT id, kind, title, metadata_title, year, tmdb_id, tmdb_episodes_json,
@@ -2865,6 +2981,36 @@ def create_content_request(request: ContentRequestCreate,
             completion = _series_completion(connection, series["id"], series["tmdb_episodes_json"])
             if not completion["incomplete"]:
                 raise HTTPException(status_code=409, detail="This series has no known missing seasons or episodes")
+            missing_seasons = completion["missing_seasons"]
+            missing_episode_count = completion["missing_episode_count"]
+            missing_episode_numbers: list[int] = []
+            if request.season_number is not None:
+                season_number = request.season_number
+                season_missing = next((item for item in completion["missing_episodes"]
+                                       if int(item["season_number"]) == season_number), None)
+                if season_missing is None:
+                    raise HTTPException(status_code=409,
+                                        detail="This season has no known missing episodes")
+                missing_seasons = [season_number] if season_number in missing_seasons else []
+                missing_episode_numbers = list(season_missing["episode_numbers"])
+                missing_episode_count = len(missing_episode_numbers)
+                exists = connection.execute(
+                    """SELECT 1 FROM content_requests
+                       WHERE request_type='remaining_seasons' AND catalog_node_id=?
+                         AND season_number=? AND status IN ('pending', 'sending', 'approved')
+                       LIMIT 1""",
+                    (series["id"], season_number),
+                ).fetchone()
+            else:
+                exists = connection.execute(
+                    """SELECT 1 FROM content_requests
+                       WHERE request_type='remaining_seasons' AND catalog_node_id=?
+                         AND season_number IS NULL AND status IN ('pending', 'sending', 'approved')
+                       LIMIT 1""",
+                    (series["id"],),
+                ).fetchone()
+            if exists is not None:
+                raise HTTPException(status_code=409, detail="This season is already requested")
             poster_url = (_artwork_url(series["id"], "poster", series["poster_file"])
                           if series["poster_file"] else None)
             if not poster_url:
@@ -2875,17 +3021,20 @@ def create_content_request(request: ContentRequestCreate,
                         fallback_version=fallback_poster[2],
                     )
             details = {
-                "missing_seasons": completion["missing_seasons"],
-                "missing_episode_count": completion["missing_episode_count"],
+                "missing_seasons": missing_seasons,
+                "missing_episode_count": missing_episode_count,
                 "poster_url": poster_url,
             }
+            if request.season_number is not None:
+                details["season_number"] = request.season_number
+                details["missing_episode_numbers"] = missing_episode_numbers
             records.append({
                 "request_type": request.request_type,
                 "content_type": "tv",
                 "tmdb_id": series["tmdb_id"],
                 "title": series["metadata_title"] or series["title"],
                 "year": series["year"],
-                "season_number": None,
+                "season_number": request.season_number,
                 "catalog_node_id": series["id"],
                 "details": details,
             })
@@ -3039,7 +3188,14 @@ def content_request_telegram_caption(request: sqlite3.Row,
         lines = ["Solicitud de contenido para Zinema", f"Serie: {title}"]
         lines.append(f"Año: {request['year']}" if request["year"] else "Año: desconocido")
         missing = details.get("missing_seasons") or []
-        if missing:
+        season_number = details.get("season_number") or request["season_number"]
+        requested_episodes = details.get("missing_episode_numbers") or []
+        if season_number is not None and int(season_number) in {int(value) for value in missing}:
+            lines.append(f"Solicita temporada completa: T{int(season_number):02d}")
+        elif season_number is not None and requested_episodes:
+            numbers = ", ".join(f"E{int(number):02d}" for number in requested_episodes)
+            lines.append(f"Solicita capítulos restantes de T{int(season_number):02d}: {numbers}")
+        elif missing:
             lines.append("Solicita temporadas restantes: " + ", ".join(f"T{int(number)}" for number in missing))
         elif details.get("missing_episode_count"):
             lines.append(f"Solicita capítulos restantes: {int(details['missing_episode_count'])}")
