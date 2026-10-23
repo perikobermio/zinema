@@ -3943,7 +3943,31 @@ def start_server_update() -> dict[str, object]:
 
 @app.get("/api/v1/admin/server-update", dependencies=[Depends(require_admin)])
 def get_server_update() -> dict[str, object]:
-    return _read_server_update_state()
+    with SERVER_UPDATE_LOCK:
+        state = _read_server_update_state()
+        now = int(time.time())
+        status = state.get("status")
+        started_at = int(state.get("started_at") or now)
+        heartbeat_at = int(state.get("heartbeat_at") or started_at)
+        if status == "queued" and now - started_at > 45:
+            state.update(
+                status="failed",
+                stage="Actualización fallida",
+                error=("El auxiliar de actualización no recogió la orden; revisa "
+                       "docker compose logs zinema-updater."),
+                finished_at=now,
+            )
+            _write_server_update_state(state)
+        elif status == "running" and now - heartbeat_at > 120:
+            state.update(
+                status="failed",
+                stage="Actualización fallida",
+                error=("El auxiliar dejó de responder durante la actualización; revisa "
+                       "docker compose logs zinema-updater."),
+                finished_at=now,
+            )
+            _write_server_update_state(state)
+        return state
 
 
 @app.get("/api/v1/download-status", dependencies=[Depends(require_client)])

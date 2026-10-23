@@ -6269,6 +6269,10 @@ public class MainActivity extends Activity {
             case "No se pudo iniciar la actualización: ":
                 return "Ezin izan da eguneraketa hasi: ";
             case "Motivo no disponible.": return "Ez dago arrazoirik eskuragarri.";
+            case "El auxiliar de actualización no recogió la orden; revisa docker compose logs zinema-updater.":
+                return "Eguneraketa-laguntzaileak ez du agindua jaso; begiratu docker compose logs zinema-updater.";
+            case "El auxiliar dejó de responder durante la actualización; revisa docker compose logs zinema-updater.":
+                return "Laguntzaileak erantzuteari utzi dio eguneraketan; begiratu docker compose logs zinema-updater.";
             case "Descargando cambios (git pull)": return "Aldaketak deskargatzen (git pull)";
             case "Reconstruyendo y recreando el servidor":
                 return "Zerbitzaria berreraikitzen eta berriro sortzen";
@@ -7886,9 +7890,8 @@ public class MainActivity extends Activity {
         progressParams.topMargin = d(11);
         card.addView(progress, progressParams);
         TextView status = label("", 10, MUTED, false);
-        status.setMaxLines(5);
-        status.setEllipsize(android.text.TextUtils.TruncateAt.END);
         status.setMovementMethod(new android.text.method.ScrollingMovementMethod());
+        status.setVerticalScrollBarEnabled(true);
         LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(-1, 0, 1);
         statusParams.topMargin = d(8);
         card.addView(status, statusParams);

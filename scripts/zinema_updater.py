@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -39,33 +41,59 @@ def append_output(state: dict, text: str) -> None:
 def run_step(state: dict, title: str, command: list[str], timeout: int) -> None:
     state.update(status="running", stage=title)
     write_state(state)
+    lines: queue.Queue[str | None] = queue.Queue()
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=PROJECT_ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             errors="replace",
-            timeout=timeout,
-            check=False,
+            bufsize=1,
         )
-    except subprocess.TimeoutExpired as error:
-        partial = error.stdout or ""
-        if isinstance(partial, bytes):
-            partial = partial.decode("utf-8", errors="replace")
-        if partial:
-            append_output(state, partial)
-        raise RuntimeError(f"{title}: tiempo de espera agotado ({timeout} s)") from error
-    if result.stdout:
-        append_output(state, result.stdout)
-    if result.returncode:
-        raise RuntimeError(f"{title}: el comando terminó con código {result.returncode}")
+    except OSError as error:
+        raise RuntimeError(f"{title}: no se pudo ejecutar {command[0]}: {error}") from error
+
+    def collect_output() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            lines.put(line)
+        lines.put(None)
+
+    reader = threading.Thread(target=collect_output, daemon=True)
+    reader.start()
+    started = time.monotonic()
+    last_heartbeat = started
+    reader_finished = False
+    while process.poll() is None or not reader_finished:
+        try:
+            line = lines.get(timeout=1.0)
+            if line is None:
+                reader_finished = True
+            else:
+                append_output(state, line)
+        except queue.Empty:
+            pass
+        now = time.monotonic()
+        if now - started > timeout:
+            process.kill()
+            process.wait()
+            reader.join(timeout=2.0)
+            raise RuntimeError(f"{title}: tiempo de espera agotado ({timeout} s)")
+        if now - last_heartbeat >= 5.0:
+            state["heartbeat_at"] = int(time.time())
+            write_state(state)
+            last_heartbeat = now
+    return_code = process.wait()
+    if return_code:
+        raise RuntimeError(f"{title}: el comando terminó con código {return_code}")
 
 
 def process(state: dict) -> None:
     job_id = state.get("id")
-    state.update(status="running", stage="Preparando actualización", output="")
+    state.update(status="running", stage="Preparando actualización", output="",
+                 heartbeat_at=int(time.time()))
     write_state(state)
     try:
         if not (PROJECT_ROOT / ".git").is_dir():
