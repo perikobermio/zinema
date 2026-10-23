@@ -2528,8 +2528,14 @@ public class MainActivity extends Activity {
     }
 
     void sortNewestFirst(List<JSONObject> nodes) {
-        Collections.sort(nodes, (left, right) ->
-                right.optString("added_at", "").compareTo(left.optString("added_at", "")));
+        Collections.sort(nodes, (left, right) -> newestCatalogTimestamp(right)
+                .compareTo(newestCatalogTimestamp(left)));
+    }
+
+    String newestCatalogTimestamp(JSONObject node) {
+        String latestEpisode = node.optString("latest_episode_added_at", "");
+        String addedAt = node.optString("added_at", "");
+        return latestEpisode.compareTo(addedAt) > 0 ? latestEpisode : addedAt;
     }
 
     void sortAlphabetically(List<JSONObject> nodes) {
@@ -2770,6 +2776,8 @@ public class MainActivity extends Activity {
             collectPendingHomeItems(node, "", pendingItems, pendingIds);
         for (JSONObject node : visibleSeries)
             collectPendingHomeItems(node, "", pendingItems, pendingIds);
+        for (JSONObject node : visibleSeries)
+            collectRequestedIncompleteSeries(node, pendingItems, pendingIds);
         List<JSONObject> catalogItems = new ArrayList<>();
         for (JSONObject node : visibleMovies)
             if (!node.optBoolean("is_placeholder") && "movie".equals(node.optString("kind")))
@@ -2834,6 +2842,42 @@ public class MainActivity extends Activity {
         if (children == null) return;
         for (int i = 0; i < children.length(); i++)
             collectPendingHomeItems(children.optJSONObject(i), seriesTitle, output, includedIds);
+    }
+
+    boolean hasRequestedMissingEpisodes(JSONObject seriesNode) {
+        if (!"series".equals(seriesNode.optString("kind"))) return false;
+        JSONArray seasons = seriesNode.optJSONArray("children");
+        if (seasons == null) return false;
+        for (int i = 0; i < seasons.length(); i++) {
+            JSONObject season = seasons.optJSONObject(i);
+            if (season == null || !"season".equals(season.optString("kind"))
+                    || season.optBoolean("is_placeholder")) continue;
+            String requestStatus = season.optString("request_status", "");
+            if (requestStatus.isEmpty()) continue;
+            if (season.optBoolean("incomplete") || season.optInt("missing_episode_count") > 0)
+                return true;
+        }
+        return false;
+    }
+
+    void collectRequestedIncompleteSeries(JSONObject node, List<JSONObject> output,
+                                          Set<String> includedIds) {
+        if (node == null) return;
+        if ("series".equals(node.optString("kind"))
+                && isKidAllowedNode(node) && hasRequestedMissingEpisodes(node)) {
+            String id = node.optString("id", "");
+            if (!id.isEmpty() && includedIds.add(id)) {
+                try {
+                    JSONObject requestedSeries = new JSONObject(node.toString());
+                    requestedSeries.put("is_requested_incomplete_series", true);
+                    output.add(requestedSeries);
+                } catch (JSONException ignored) { }
+            }
+        }
+        JSONArray children = node.optJSONArray("children");
+        if (children != null)
+            for (int i = 0; i < children.length(); i++)
+                collectRequestedIncompleteSeries(children.optJSONObject(i), output, includedIds);
     }
 
     List<JSONObject> incomingItemsFrom(List<JSONObject> nodes) {
@@ -3510,6 +3554,8 @@ public class MainActivity extends Activity {
             String summary = seasons + (seasons == 1 ? " " + t("temporada") : " " + t("temporadas"));
             if (pendingSeasons > 0)
                 summary += " · " + pendingSeasons + " " + t("Pendiente de añadir").toLowerCase();
+            if (node.optBoolean("is_requested_incomplete_series"))
+                summary += " · " + t("Capítulos solicitados");
             return summary;
         }
         if (kind.equals("season")) return t("Temporada") + " " + String.format("%02d", node.optInt("season_number"));
@@ -5959,6 +6005,7 @@ public class MainActivity extends Activity {
             case "No se pudieron cargar las solicitudes.": return "Ezin izan dira eskaerak kargatu.";
             case "pendientes": return "zain";
             case "No hay solicitudes de contenido.": return "Ez dago eduki-eskaerarik.";
+            case "Capítulos solicitados": return "Eskatutako atalak";
             case "Descargar": return "Deskargatu";
             case "Selecciona el archivo": return "Hautatu fitxategia";
             case "Capítulos disponibles": return "Atal eskuragarriak";

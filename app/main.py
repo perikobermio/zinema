@@ -805,6 +805,12 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     node["genres"] = genres
     if node["kind"] == "series":
         node.update(_series_completion(connection, node["id"], node.get("tmdb_episodes_json")))
+        latest_episode = connection.execute(
+            "SELECT MAX(modified_at) FROM library_items "
+            "WHERE series_node_id=? AND available=1",
+            (node["id"],),
+        ).fetchone()
+        node["latest_episode_added_at"] = latest_episode[0] if latest_episode else None
     poster_file = node.get("poster_file")
     collection_artwork = _collection_artwork(connection, node["id"]) if node["kind"] == "collection" else None
     single_item_poster = collection_artwork["single_item_poster_url"] if collection_artwork else None
