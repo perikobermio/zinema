@@ -3402,12 +3402,37 @@ def _manual_telegram_downloads(media: list[dict[str, object]]) -> list[dict[str,
             guess["season_number"] = int(season)
             guess["episode_number"] = int(episode)
             if not EPISODE_RE.search(Path(filename).stem):
-                source_title = str(item.get("title") or item.get("caption") or filename)
+                # Captions commonly carry SxxExx while Telegram's file title is
+                # only the series name; use that richer text to recover the series.
+                source_title = str(item.get("caption") or item.get("title") or filename)
                 match = EPISODE_RE.search(source_title)
                 if match:
                     guess["title"] = (_clean_media_title(source_title[:match.start()])
                                        or str(guess.get("title") or "Unknown title"))
         base_title = str(guess.get("title") or Path(filename).stem)
+        filename_episode_title = ""
+        if is_episode:
+            filename_stem = Path(filename).stem
+            filename_match = EPISODE_RE.search(filename_stem)
+            if filename_match:
+                filename_episode_title = _clean_media_title(
+                    filename_stem[filename_match.end():],
+                )
+                if not filename_episode_title:
+                    filename_episode_title = _clean_media_title(
+                        filename_stem[:filename_match.start()],
+                    )
+            else:
+                descriptive_part = filename_stem
+                base_prefix = re.match(
+                    rf"(?i)^\s*{re.escape(base_title)}(?:\s*[-_.:]+\s*|\s+)",
+                    descriptive_part,
+                )
+                if base_prefix:
+                    descriptive_part = descriptive_part[base_prefix.end():]
+                filename_episode_title = _clean_media_title(descriptive_part)
+            if _media_titles_similar(filename_episode_title, base_title):
+                filename_episode_title = ""
         telegram_title = str(item.get("title") or "").strip()
         caption = re.sub(r"\s+", " ", str(item.get("caption") or "")).strip()
         filename_title = Path(filename).stem
@@ -3422,14 +3447,18 @@ def _manual_telegram_downloads(media: list[dict[str, object]]) -> list[dict[str,
             _normalize_media_title(filename),
             _normalize_media_title(filename_title),
         }
-        if is_episode and generic_title and descriptive_caption:
+        if is_episode and filename_episode_title:
+            item_title = (f"{base_title} · S{int(season):02d}E{int(episode):02d}"
+                          f" · {filename_episode_title}")
+        elif is_episode and generic_title and descriptive_caption:
             # Telegram's media title is often just the series name. Prefer the
             # caption as secondary metadata and retain the series/episode identity.
             item_title = f"{base_title} · S{int(season):02d}E{int(episode):02d}"
         elif not telegram_title or telegram_title == filename or generic_title:
             if is_episode:
                 item_title = f"{base_title} · S{int(season):02d}E{int(episode):02d}"
-                episode_title = str(guess.get("episode_title") or "").strip(" -_.")
+                episode_title = (filename_episode_title
+                                 or str(guess.get("episode_title") or "").strip(" -_."))
                 if episode_title:
                     item_title += f" · {episode_title}"
             else:
