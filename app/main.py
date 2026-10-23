@@ -3283,6 +3283,21 @@ def _telegram_saved_media() -> list[dict[str, object]]:
                         media = [item for item in parsed if isinstance(item, dict)]
             except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
                 media = []
+        for item in media:
+            if item.get("season_number") is not None and item.get("episode_number") is not None:
+                continue
+            episode = EPISODE_RE.search(" ".join((
+                str(item.get("filename") or ""), str(item.get("title") or ""),
+                str(item.get("caption") or ""),
+            )))
+            if episode is None:
+                continue
+            if episode.group(1) is not None:
+                item["season_number"] = int(episode.group(1))
+                item["episode_number"] = int(episode.group(2))
+            else:
+                item["season_number"] = int(episode.group(3))
+                item["episode_number"] = int(episode.group(4))
         TELEGRAM_SCAN_CACHE.update({"checked_at": time.monotonic(), "media": media})
         return media
 

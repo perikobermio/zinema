@@ -23,7 +23,7 @@ from telegram_download_zinema import (
 
 
 EPISODE_PATTERN = re.compile(
-    r"(?i)(?:\bS(?P<s_season>\d{1,2})\s*E(?P<s_episode>\d{1,3})\b"
+    r"(?i)(?:\b[ST]\s*(?P<s_season>\d{1,2})[\s,._-]*E\s*(?P<s_episode>\d{1,3})\b"
     r"|\b(?P<x_season>\d{1,2})x(?P<x_episode>\d{1,3})\b)"
 )
 VIDEO_EXTENSIONS = {

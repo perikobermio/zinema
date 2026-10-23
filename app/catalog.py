@@ -11,7 +11,11 @@ VIDEO_EXTENSIONS = {
     ".mts", ".ts", ".vob", ".webm", ".wmv",
 }
 SEASON_RE = re.compile(r"^(?:season|temporada)\s*0*(\d+)(?:\b|\s|$)", re.IGNORECASE)
-EPISODE_RE = re.compile(r"(?:s(\d{1,2})\s*e(\d{1,3})|(\d{1,2})x(\d{1,3}))", re.IGNORECASE)
+EPISODE_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9])(?:s|t)\s*(\d{1,2})[\s,._-]*e\s*(\d{1,3})"
+    r"|(?<![A-Za-z0-9])(\d{1,2})x(\d{1,3})\b)",
+    re.IGNORECASE,
+)
 YEAR_RE = re.compile(r"\s*\(((?:19|20)\d{2})\)\s*$")
 
 
