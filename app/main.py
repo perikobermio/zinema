@@ -3407,9 +3407,30 @@ def _manual_telegram_downloads(media: list[dict[str, object]]) -> list[dict[str,
                 if match:
                     guess["title"] = (_clean_media_title(source_title[:match.start()])
                                        or str(guess.get("title") or "Unknown title"))
-        item_title = str(item.get("title") or item.get("caption") or "").strip()
-        if not item_title or item_title == filename:
-            base_title = str(guess.get("title") or Path(filename).stem)
+        base_title = str(guess.get("title") or Path(filename).stem)
+        telegram_title = str(item.get("title") or "").strip()
+        caption = re.sub(r"\s+", " ", str(item.get("caption") or "")).strip()
+        filename_title = Path(filename).stem
+        generic_title = (not telegram_title
+                         or _normalize_media_title(telegram_title)
+                         in {_normalize_media_title(filename),
+                             _normalize_media_title(filename_title)}
+                         or (is_episode and _media_titles_similar(telegram_title, base_title)))
+        descriptive_caption = bool(caption) and _normalize_media_title(caption) not in {
+            _normalize_media_title(base_title),
+            _normalize_media_title(telegram_title),
+            _normalize_media_title(filename),
+            _normalize_media_title(filename_title),
+        }
+        if is_episode and generic_title and descriptive_caption:
+            # Telegram's media title is often just the series name. Prefer the
+            # message caption so rows distinguish episodes with generic filenames.
+            base_normalized = _normalize_media_title(base_title)
+            caption_normalized = _normalize_media_title(caption)
+            item_title = (caption if not base_normalized
+                          or caption_normalized.startswith(base_normalized)
+                          else f"{base_title} · {caption}")
+        elif not telegram_title or telegram_title == filename or generic_title:
             if is_episode:
                 item_title = f"{base_title} · S{int(season):02d}E{int(episode):02d}"
                 episode_title = str(guess.get("episode_title") or "").strip(" -_.")
@@ -3418,6 +3439,8 @@ def _manual_telegram_downloads(media: list[dict[str, object]]) -> list[dict[str,
             else:
                 year = guess.get("year")
                 item_title = f"{base_title} ({year})" if year else base_title
+        else:
+            item_title = telegram_title
         downloads.append({
             "message_id": int(item.get("message_id") or 0),
             "filename": filename,
