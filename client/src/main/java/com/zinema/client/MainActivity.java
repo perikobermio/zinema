@@ -6907,15 +6907,33 @@ public class MainActivity extends Activity {
         button.setPadding(0, 0, 0, 0);
         button.setMinWidth(d(44));
         button.setGravity(Gravity.CENTER);
-        android.graphics.drawable.Drawable icon = getDrawable(iconResource);
-        if (icon != null) {
-            int iconSize = d(iconSizeDp);
-            icon.setBounds(0, 0, iconSize, iconSize);
-            button.setCompoundDrawables(icon, null, null, null);
-        }
         if (transparentBackground) button.setBackgroundColor(Color.TRANSPARENT);
+        setCenteredActionIcon(button, iconResource, iconSizeDp);
         button.setContentDescription(t(accessibilityLabel));
         return button;
+    }
+
+    void setCenteredActionIcon(Button button, int iconResource, int iconSizeDp) {
+        android.graphics.drawable.Drawable icon = getDrawable(iconResource);
+        if (button == null || icon == null) return;
+        icon = icon.mutate();
+        int iconSize = d(iconSizeDp);
+        icon.setBounds(0, 0, iconSize, iconSize);
+        android.graphics.drawable.Drawable currentBackground = button.getBackground();
+        android.graphics.drawable.LayerDrawable layers;
+        if (currentBackground instanceof android.graphics.drawable.LayerDrawable
+                && ((android.graphics.drawable.LayerDrawable) currentBackground).getNumberOfLayers() == 2) {
+            layers = (android.graphics.drawable.LayerDrawable) currentBackground;
+            layers.setDrawable(1, icon);
+        } else {
+            layers = new android.graphics.drawable.LayerDrawable(
+                    new android.graphics.drawable.Drawable[]{currentBackground, icon});
+            layers.setLayerGravity(0, Gravity.FILL);
+            layers.setLayerGravity(1, Gravity.CENTER);
+            layers.setLayerSize(1, iconSize, iconSize);
+            button.setBackground(layers);
+        }
+        button.setCompoundDrawables(null, null, null, null);
     }
 
     void showSearch() {
@@ -8321,13 +8339,8 @@ public class MainActivity extends Activity {
                             expandEpisodes.setOnClickListener(v -> {
                                 boolean expanded = episodesPanel.getVisibility() != View.VISIBLE;
                                 episodesPanel.setVisibility(expanded ? View.VISIBLE : View.GONE);
-                                android.graphics.drawable.Drawable arrow = getDrawable(expanded
-                                        ? R.drawable.ic_expand_less : R.drawable.ic_expand_more);
-                                if (arrow != null) {
-                                    int arrowSize = d(34);
-                                    arrow.setBounds(0, 0, arrowSize, arrowSize);
-                                    expandEpisodes.setCompoundDrawables(arrow, null, null, null);
-                                }
+                                setCenteredActionIcon(expandEpisodes, expanded
+                                        ? R.drawable.ic_expand_less : R.drawable.ic_expand_more, 34);
                                 expandEpisodes.setContentDescription(t(expanded
                                         ? "Contraer capítulos" : "Expandir capítulos"));
                             });
@@ -8343,7 +8356,10 @@ public class MainActivity extends Activity {
                             int downloadMessageId = telegramDownloads.optJSONObject(0) == null ? 0
                                     : telegramDownloads.optJSONObject(0).optInt("message_id");
                             download.setTag("request-download-button:movie:" + downloadMessageId);
-                            actions.addView(download, new LinearLayout.LayoutParams(d(44), d(40)));
+                            LinearLayout.LayoutParams downloadParams =
+                                    new LinearLayout.LayoutParams(d(44), d(40));
+                            downloadParams.rightMargin = d(8);
+                            actions.addView(download, downloadParams);
                             download.setOnClickListener(v -> {
                                 if (telegramDownloads.length() == 1) {
                                     startContentRequestDownload(request, telegramDownloads.optJSONObject(0), download);
@@ -8470,12 +8486,7 @@ public class MainActivity extends Activity {
         View expander = adminContentRequestsSlot == null ? null
                 : adminContentRequestsSlot.findViewWithTag("request-download-expander:" + requestId);
         if (!(expander instanceof Button)) return;
-        android.graphics.drawable.Drawable arrow = getDrawable(R.drawable.ic_expand_less);
-        if (arrow != null) {
-            int arrowSize = d(34);
-            arrow.setBounds(0, 0, arrowSize, arrowSize);
-            ((Button) expander).setCompoundDrawables(arrow, null, null, null);
-        }
+        setCenteredActionIcon((Button) expander, R.drawable.ic_expand_less, 34);
         expander.setContentDescription(t("Contraer capítulos"));
     }
 
