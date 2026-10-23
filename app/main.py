@@ -792,6 +792,19 @@ def _series_completion(connection: sqlite3.Connection, series_id: str,
             "incomplete": bool(missing_episodes) if known else False}
 
 
+def _series_has_active_missing_request(connection: sqlite3.Connection,
+                                       series_id: str,
+                                       tmdb_id: int | None) -> bool:
+    return connection.execute(
+        """SELECT 1 FROM content_requests
+           WHERE status IN ('pending', 'sending', 'approved') AND (
+               (request_type='remaining_seasons' AND catalog_node_id=?) OR
+               (request_type='new_content' AND content_type='tv' AND tmdb_id=?))
+           LIMIT 1""",
+        (series_id, tmdb_id),
+    ).fetchone() is not None
+
+
 def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     node = dict(row)
     genres = normalize_genres(json.loads(node.pop("genres", "[]") or "[]"))
@@ -805,6 +818,9 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
     node["genres"] = genres
     if node["kind"] == "series":
         node.update(_series_completion(connection, node["id"], node.get("tmdb_episodes_json")))
+        node["has_active_missing_episode_request"] = _series_has_active_missing_request(
+            connection, node["id"], node.get("tmdb_id"),
+        )
         latest_episode = connection.execute(
             "SELECT MAX(modified_at) FROM library_items "
             "WHERE series_node_id=? AND available=1",
@@ -938,6 +954,9 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
             child_payload.update(_series_completion(
                 connection, child["id"], child["tmdb_episodes_json"],
             ))
+            child_payload["has_active_missing_episode_request"] = _series_has_active_missing_request(
+                connection, child["id"], child["tmdb_id"],
+            )
         if child["kind"] == "collection":
             child_artwork = _collection_artwork(connection, child["id"])
             if not child["poster_file"] and child_artwork["single_item_poster_url"]:

@@ -2846,6 +2846,9 @@ public class MainActivity extends Activity {
 
     boolean hasRequestedMissingEpisodes(JSONObject seriesNode) {
         if (!"series".equals(seriesNode.optString("kind"))) return false;
+        if (seriesNode.optBoolean("has_active_missing_episode_request")
+                && (seriesNode.optBoolean("incomplete")
+                    || seriesNode.optInt("missing_episode_count") > 0)) return true;
         JSONArray seasons = seriesNode.optJSONArray("children");
         if (seasons == null) return false;
         for (int i = 0; i < seasons.length(); i++) {
