@@ -3424,12 +3424,8 @@ def _manual_telegram_downloads(media: list[dict[str, object]]) -> list[dict[str,
         }
         if is_episode and generic_title and descriptive_caption:
             # Telegram's media title is often just the series name. Prefer the
-            # message caption so rows distinguish episodes with generic filenames.
-            base_normalized = _normalize_media_title(base_title)
-            caption_normalized = _normalize_media_title(caption)
-            item_title = (caption if not base_normalized
-                          or caption_normalized.startswith(base_normalized)
-                          else f"{base_title} · {caption}")
+            # caption as secondary metadata and retain the series/episode identity.
+            item_title = f"{base_title} · S{int(season):02d}E{int(episode):02d}"
         elif not telegram_title or telegram_title == filename or generic_title:
             if is_episode:
                 item_title = f"{base_title} · S{int(season):02d}E{int(episode):02d}"
@@ -3445,6 +3441,7 @@ def _manual_telegram_downloads(media: list[dict[str, object]]) -> list[dict[str,
             "message_id": int(item.get("message_id") or 0),
             "filename": filename,
             "title": item_title,
+            "description": caption if descriptive_caption else "",
             "size_bytes": int(item.get("size_bytes") or 0),
             "season_number": int(season) if is_episode else None,
             "episode_number": int(episode) if is_episode else None,

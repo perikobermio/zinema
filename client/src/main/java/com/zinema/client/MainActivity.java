@@ -8601,6 +8601,15 @@ public class MainActivity extends Activity {
         name.setMaxLines(2);
         name.setEllipsize(android.text.TextUtils.TruncateAt.END);
         itemInfo.addView(name);
+        String descriptionText = candidate.optString("description", "").trim();
+        if (!descriptionText.isEmpty() && !descriptionText.equals(name.getText().toString().trim())) {
+            TextView description = labelRaw(descriptionText, 11, MUTED, false);
+            description.setMaxLines(2);
+            description.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            LinearLayout.LayoutParams descriptionParams = new LinearLayout.LayoutParams(-1, -2);
+            descriptionParams.topMargin = d(2);
+            itemInfo.addView(description, descriptionParams);
+        }
         LinearLayout progressRow = new LinearLayout(this);
         progressRow.setGravity(Gravity.CENTER_VERTICAL);
         progressRow.setVisibility(View.GONE);
