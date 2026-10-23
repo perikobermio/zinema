@@ -3440,7 +3440,19 @@ def _manual_telegram_downloads(media: list[dict[str, object]]) -> list[dict[str,
                          or _normalize_media_title(telegram_title)
                          in {_normalize_media_title(filename),
                              _normalize_media_title(filename_title)}
-                         or (is_episode and _media_titles_similar(telegram_title, base_title)))
+                         or _media_titles_similar(telegram_title, base_title))
+        normalized_filename_title = _normalize_media_title(base_title)
+        filename_title_is_useful = (
+            len(normalized_filename_title) >= 4
+            and normalized_filename_title not in {
+                "video", "movie", "film", "pelicula", "unknowntitle", "unknown",
+            }
+        )
+        prefer_filename_title = (
+            filename_title_is_useful
+            and (not telegram_title
+                 or not _media_titles_similar(telegram_title, base_title))
+        )
         descriptive_caption = bool(caption) and _normalize_media_title(caption) not in {
             _normalize_media_title(base_title),
             _normalize_media_title(telegram_title),
@@ -3454,6 +3466,11 @@ def _manual_telegram_downloads(media: list[dict[str, object]]) -> list[dict[str,
             # Telegram's media title is often just the series name. Prefer the
             # caption as secondary metadata and retain the series/episode identity.
             item_title = f"{base_title} · S{int(season):02d}E{int(episode):02d}"
+        elif is_episode and prefer_filename_title:
+            item_title = f"{base_title} · S{int(season):02d}E{int(episode):02d}"
+        elif not is_episode and prefer_filename_title:
+            year = guess.get("year")
+            item_title = f"{base_title} ({year})" if year else base_title
         elif not telegram_title or telegram_title == filename or generic_title:
             if is_episode:
                 item_title = f"{base_title} · S{int(season):02d}E{int(episode):02d}"
