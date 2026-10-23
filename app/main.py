@@ -1815,7 +1815,8 @@ def _record_nas_download_output(line: str) -> None:
     _update_nas_download_state(**values)
 
 
-def _run_nas_download(job_id: str, message_id: int | None = None) -> None:
+def _run_nas_download(job_id: str, message_id: int | None = None,
+                      source: str = "app") -> None:
     try:
         command = [sys.executable, "-u", str(NAS_DOWNLOADER_SCRIPT), "--force"]
         if message_id is not None:
@@ -1851,9 +1852,30 @@ def _run_nas_download(job_id: str, message_id: int | None = None) -> None:
         if exit_code == 0:
             with TELEGRAM_SCAN_LOCK:
                 TELEGRAM_SCAN_CACHE["checked_at"] = 0.0
+            sync_job_id = None
+            sync_queued = False
+            previous_sync_job_id = ""
+            if source == "telegram-manual":
+                try:
+                    sync_job_id = _start_sync_job()
+                    if sync_job_id is None:
+                        sync_queued = _schedule_sync_when_available()
+                        if sync_queued:
+                            with closing(database()) as connection:
+                                latest = connection.execute(
+                                    "SELECT id FROM sync_runs ORDER BY started_at DESC LIMIT 1"
+                                ).fetchone()
+                            previous_sync_job_id = latest["id"] if latest else ""
+                except Exception:
+                    # Preserve the successful file download even if sync scheduling fails.
+                    sync_job_id = None
+                    sync_queued = False
             _update_nas_download_state(
                 status="completed", completed_at=completed_at, exit_code=exit_code,
                 error=None, progress="Descarga finalizada.", current_percent=100.0,
+                catalog_sync_job_id=sync_job_id or "",
+                catalog_sync_queued=sync_queued,
+                catalog_sync_previous_job_id=previous_sync_job_id,
             )
         else:
             _update_nas_download_state(
@@ -3361,14 +3383,12 @@ def _requested_telegram_message_ids(media: list[dict[str, object]]) -> set[int]:
     return requested_ids
 
 
-def _manual_telegram_download_groups(media: list[dict[str, object]]) -> list[dict[str, object]]:
+def _manual_telegram_downloads(media: list[dict[str, object]]) -> list[dict[str, object]]:
     requested_ids = _requested_telegram_message_ids(media)
-    groups: dict[tuple[object, ...], dict[str, object]] = {}
-    ordered_groups: list[dict[str, object]] = []
-    # The scanner returns newest first. Apply the 30 item limit before grouping,
-    # so series with several recent episodes still consume the same limit.
+    # The scanner returns newest first; each video gets its own row.
     standalone = [item for item in media
                   if int(item.get("message_id") or 0) not in requested_ids][:30]
+    downloads: list[dict[str, object]] = []
     for item in standalone:
         filename = str(item.get("filename") or item.get("title") or "Telegram media")
         guess = _incoming_guess(Path(filename))
@@ -3387,28 +3407,27 @@ def _manual_telegram_download_groups(media: list[dict[str, object]]) -> list[dic
                 if match:
                     guess["title"] = (_clean_media_title(source_title[:match.start()])
                                        or str(guess.get("title") or "Unknown title"))
-        title = str(guess.get("title") or "Unknown title")
-        year = guess.get("year")
-        content_type = "tv" if is_episode else "movie"
-        normalized_title = _normalize_media_title(title)
-        key = (content_type, normalized_title, year)
-        group = groups.get(key)
-        if group is None:
-            group = {
-                "content_type": content_type, "title": title, "year": year,
-                "telegram_downloads": [],
-            }
-            groups[key] = group
-            ordered_groups.append(group)
-        group["telegram_downloads"].append({
+        item_title = str(item.get("title") or item.get("caption") or "").strip()
+        if not item_title or item_title == filename:
+            base_title = str(guess.get("title") or Path(filename).stem)
+            if is_episode:
+                item_title = f"{base_title} · S{int(season):02d}E{int(episode):02d}"
+                episode_title = str(guess.get("episode_title") or "").strip(" -_.")
+                if episode_title:
+                    item_title += f" · {episode_title}"
+            else:
+                year = guess.get("year")
+                item_title = f"{base_title} ({year})" if year else base_title
+        downloads.append({
             "message_id": int(item.get("message_id") or 0),
             "filename": filename,
+            "title": item_title,
             "size_bytes": int(item.get("size_bytes") or 0),
             "season_number": int(season) if is_episode else None,
             "episode_number": int(episode) if is_episode else None,
             "date": item.get("date"),
         })
-    return ordered_groups
+    return downloads
 
 
 @app.get("/api/v1/admin/content-requests", dependencies=[Depends(require_admin)])
@@ -3453,29 +3472,22 @@ def list_content_requests() -> list[dict[str, object]]:
 
 @app.get("/api/v1/admin/telegram-manual-downloads", dependencies=[Depends(require_admin)])
 def list_manual_telegram_downloads() -> list[dict[str, object]]:
-    return _manual_telegram_download_groups(_telegram_saved_media())
+    return _manual_telegram_downloads(_telegram_saved_media())
 
 
 @app.post("/api/v1/admin/telegram-manual-downloads/{message_id}/download", status_code=202,
           dependencies=[Depends(require_admin)])
 def start_manual_telegram_download(message_id: int) -> dict[str, object]:
     media = _telegram_saved_media()
-    requested_ids = _requested_telegram_message_ids(media)
-    manual_ids = {
-        int(item.get("message_id") or 0)
-        for item in media if int(item.get("message_id") or 0)
-        not in requested_ids
-    }
+    manual_ids = {int(item["message_id"]) for item in _manual_telegram_downloads(media)}
     if message_id not in manual_ids:
         with TELEGRAM_SCAN_LOCK:
             TELEGRAM_SCAN_CACHE["checked_at"] = 0.0
         media = _telegram_saved_media()
-        requested_ids = _requested_telegram_message_ids(media)
-        manual_ids = {int(item.get("message_id") or 0) for item in media
-                      if int(item.get("message_id") or 0) not in requested_ids}
+        manual_ids = {int(item["message_id"]) for item in _manual_telegram_downloads(media)}
     if message_id not in manual_ids:
         raise HTTPException(status_code=404, detail="Manual Telegram media not found")
-    return _start_nas_download(message_id)
+    return _start_nas_download(message_id, source="telegram-manual")
 
 
 @app.post("/api/v1/admin/content-requests/{request_id}/download", status_code=202,
@@ -3782,7 +3794,8 @@ def list_incoming_videos() -> list[dict[str, object]]:
         return _incoming_entries(connection)
 
 
-def _start_nas_download(message_id: int | None = None) -> dict[str, object]:
+def _start_nas_download(message_id: int | None = None,
+                        source: str = "app") -> dict[str, object]:
     if not NAS_DOWNLOADER_SCRIPT.is_file():
         raise HTTPException(status_code=503, detail="NAS downloader script is not mounted")
     _scan_incoming_download_activity()
@@ -3795,12 +3808,14 @@ def _start_nas_download(message_id: int | None = None) -> dict[str, object]:
             "current_file": None, "current_title": None, "current_message_id": message_id,
             "current_percent": None,
             "downloaded_bytes": 0, "total_bytes": 0,
-            "current_bytes": 0, "current_path": None, "source": "app",
+            "current_bytes": 0, "current_path": None, "source": source,
             "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": None,
-            "exit_code": None, "error": None, "_awaiting_file_settle": False,
+            "exit_code": None, "error": None, "catalog_sync_job_id": "",
+            "catalog_sync_queued": False, "catalog_sync_previous_job_id": "",
+            "_awaiting_file_settle": False,
         })
     INCOMING_MONITOR_WAKE.set()
-    threading.Thread(target=_run_nas_download, args=(job_id, message_id), daemon=True,
+    threading.Thread(target=_run_nas_download, args=(job_id, message_id, source), daemon=True,
                      name=f"nas-download-{job_id[:8]}").start()
     return {"id": job_id, "status": "starting"}
 

@@ -183,6 +183,7 @@ public class MainActivity extends Activity {
     LinearLayout adminContentRequestsSlot;
     LinearLayout adminManualTelegramDownloadsSlot;
     String manualTelegramRefreshedDownloadId = "";
+    String manualSyncMonitoredDownloadId = "";
     String contentRequestsRefreshedDownloadId = "";
     String incomingCatalogSyncJobId = "";
     String incomingCatalogSyncPreviousJobId = "";
@@ -7511,6 +7512,8 @@ public class MainActivity extends Activity {
                                 Toast.makeText(this, t("Sincronización fallida"), Toast.LENGTH_LONG).show();
                             }
                             refreshCatalogAfterSync();
+                            if (adminManualTelegramDownloadsSlot != null)
+                                loadManualTelegramDownloadControls(adminManualTelegramDownloadsSlot);
                         });
                         incomingCatalogSyncJobId = "";
                         incomingCatalogSyncPreviousJobId = "";
@@ -7977,6 +7980,15 @@ public class MainActivity extends Activity {
                                 && adminManualTelegramDownloadsSlot != null) {
                             manualTelegramRefreshedDownloadId = completedDownloadId;
                             loadManualTelegramDownloadControls(adminManualTelegramDownloadsSlot);
+                        }
+                        if ("telegram-manual".equals(state.optString("source"))
+                                && !completedDownloadId.isEmpty()
+                                && !completedDownloadId.equals(manualSyncMonitoredDownloadId)) {
+                            manualSyncMonitoredDownloadId = completedDownloadId;
+                            monitorIncomingCatalogSync(
+                                    state.optString("catalog_sync_job_id", ""),
+                                    state.optString("catalog_sync_previous_job_id", ""),
+                                    state.optBoolean("catalog_sync_queued"));
                         }
                     }
                     scheduleNasDownloadPoll(state.optString("id", ""), status, progress, start);
@@ -8534,7 +8546,7 @@ public class MainActivity extends Activity {
         slot.addView(loading);
         io.execute(() -> {
             try {
-                JSONArray groups = getArray("/api/v1/admin/telegram-manual-downloads");
+                JSONArray items = getArray("/api/v1/admin/telegram-manual-downloads");
                 JSONObject state = null;
                 try { state = getJson("/api/v1/admin/incoming-download"); }
                 catch (Exception ignored) { }
@@ -8546,87 +8558,17 @@ public class MainActivity extends Activity {
                     LinearLayout card = settingsCard();
                     slot.addView(card);
                     card.addView(label(t("Descargas manuales de Telegram") + " · "
-                            + groups.length(), 16, Color.WHITE, true));
-                    if (groups.length() == 0) {
+                            + items.length(), 16, Color.WHITE, true));
+                    if (items.length() == 0) {
                         TextView empty = label(t("No hay vídeos manuales disponibles."), 13, MUTED, false);
                         empty.setPadding(0, d(8), 0, 0);
                         card.addView(empty);
                         refreshContentRequestDownloadIndicators(activeState);
                         return;
                     }
-                    for (int i = 0; i < groups.length(); i++) {
-                        JSONObject item = groups.optJSONObject(i);
-                        if (item == null) continue;
-                        JSONArray downloads = item.optJSONArray("telegram_downloads");
-                        if (downloads == null || downloads.length() == 0) continue;
-                        boolean series = "tv".equals(item.optString("content_type"));
-                        LinearLayout row = new LinearLayout(this);
-                        row.setGravity(Gravity.TOP);
-                        LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, -2);
-                        rowParams.topMargin = d(14);
-                        card.addView(row, rowParams);
-                        ImageView poster = new ImageView(this);
-                        poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                        poster.setBackground(round(PANEL, d(7)));
-                        row.addView(poster, new LinearLayout.LayoutParams(d(68), d(100)));
-                        LinearLayout details = new LinearLayout(this);
-                        details.setOrientation(LinearLayout.VERTICAL);
-                        LinearLayout.LayoutParams detailsParams = new LinearLayout.LayoutParams(0, -2, 1);
-                        detailsParams.leftMargin = d(10);
-                        row.addView(details, detailsParams);
-                        details.addView(labelRaw(item.optString("title", ""), 16, Color.WHITE, true));
-                        String infoText = t(series ? "Serie" : "Película");
-                        if (!item.isNull("year")) infoText += " · " + item.optString("year");
-                        TextView info = label(infoText, 12, MUTED, false);
-                        LinearLayout.LayoutParams infoParams = new LinearLayout.LayoutParams(-1, -2);
-                        infoParams.topMargin = d(4);
-                        details.addView(info, infoParams);
-                        if (series) {
-                            int groupId = downloads.optJSONObject(0).optInt("message_id");
-                            LinearLayout episodesHeader = new LinearLayout(this);
-                            episodesHeader.setGravity(Gravity.CENTER_VERTICAL);
-                            LinearLayout.LayoutParams headerParams = new LinearLayout.LayoutParams(-1, -2);
-                            headerParams.topMargin = d(6);
-                            details.addView(episodesHeader, headerParams);
-                            episodesHeader.addView(label(t("Capítulos disponibles") + " · "
-                                    + downloads.length(), 12, MUTED, true),
-                                    new LinearLayout.LayoutParams(0, -2, 1));
-                            LinearLayout panel = new LinearLayout(this);
-                            panel.setOrientation(LinearLayout.VERTICAL);
-                            panel.setVisibility(View.GONE);
-                            panel.setTag("request-download-episodes-panel:manual-" + groupId);
-                            LinearLayout.LayoutParams panelParams = new LinearLayout.LayoutParams(-1, -2);
-                            panelParams.topMargin = d(4);
-                            details.addView(panel, panelParams);
-                            for (int j = 0; j < downloads.length(); j++) {
-                                JSONObject candidate = downloads.optJSONObject(j);
-                                if (candidate == null) continue;
-                                addManualTelegramEpisodeRow(panel, candidate);
-                            }
-                            Button expander = iconActionButton(
-                                    R.drawable.ic_expand_more, "Expandir capítulos", false, 34, true);
-                            expander.setTag("request-download-expander:manual-" + groupId);
-                            episodesHeader.addView(expander, new LinearLayout.LayoutParams(d(48), d(48)));
-                            expander.setOnClickListener(v -> {
-                                boolean expanded = panel.getVisibility() != View.VISIBLE;
-                                panel.setVisibility(expanded ? View.VISIBLE : View.GONE);
-                                setCenteredActionIcon(expander, expanded
-                                        ? R.drawable.ic_expand_less : R.drawable.ic_expand_more, 34);
-                                expander.setContentDescription(t(expanded
-                                        ? "Contraer capítulos" : "Expandir capítulos"));
-                            });
-                        } else {
-                            JSONObject candidate = downloads.optJSONObject(0);
-                            int messageId = candidate.optInt("message_id");
-                            Button download = iconActionButton(
-                                    R.drawable.ic_request_download, "Descargar", false, 22, false);
-                            download.setTag("request-download-button:movie:" + messageId);
-                            LinearLayout.LayoutParams downloadParams = new LinearLayout.LayoutParams(d(44), d(40));
-                            downloadParams.topMargin = d(6);
-                            downloadParams.gravity = Gravity.RIGHT;
-                            details.addView(download, downloadParams);
-                            download.setOnClickListener(v -> startManualTelegramDownload(candidate, download));
-                        }
+                    for (int i = 0; i < items.length(); i++) {
+                        JSONObject item = items.optJSONObject(i);
+                        if (item != null) addManualTelegramRow(card, item);
                     }
                     refreshContentRequestDownloadIndicators(activeState);
                 });
@@ -8641,34 +8583,31 @@ public class MainActivity extends Activity {
         });
     }
 
-    void addManualTelegramEpisodeRow(LinearLayout panel, JSONObject candidate) {
+    void addManualTelegramRow(LinearLayout card, JSONObject candidate) {
         int messageId = candidate.optInt("message_id");
-        LinearLayout episodeRow = new LinearLayout(this);
-        episodeRow.setGravity(Gravity.CENTER_VERTICAL);
-        episodeRow.setPadding(d(8), d(3), d(4), d(3));
-        episodeRow.setBackground(round(0x6622252C, d(6)));
-        episodeRow.setTag("request-download-episode:" + messageId);
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(d(8), d(5), d(4), d(5));
+        row.setBackground(round(0x6622252C, d(6)));
+        row.setTag("request-download-episode:" + messageId);
         LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, -2);
-        rowParams.topMargin = d(3);
-        panel.addView(episodeRow, rowParams);
-        int season = candidate.optInt("season_number");
-        int episode = candidate.optInt("episode_number");
-        String prefix = season > 0 && episode > 0
-                ? String.format(java.util.Locale.ROOT, "S%02dE%02d · ", season, episode) : "";
-        LinearLayout episodeInfo = new LinearLayout(this);
-        episodeInfo.setOrientation(LinearLayout.VERTICAL);
-        episodeRow.addView(episodeInfo, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView name = labelRaw(prefix + candidate.optString("filename", ""), 12, Color.WHITE, false);
+        rowParams.topMargin = d(7);
+        card.addView(row, rowParams);
+        LinearLayout itemInfo = new LinearLayout(this);
+        itemInfo.setOrientation(LinearLayout.VERTICAL);
+        row.addView(itemInfo, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView name = labelRaw(candidate.optString("title", candidate.optString("filename", "")),
+                13, Color.WHITE, false);
         name.setMaxLines(2);
         name.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        episodeInfo.addView(name);
+        itemInfo.addView(name);
         LinearLayout progressRow = new LinearLayout(this);
         progressRow.setGravity(Gravity.CENTER_VERTICAL);
         progressRow.setVisibility(View.GONE);
         progressRow.setTag("request-download-progress-row:" + messageId);
-        LinearLayout.LayoutParams progressRowParams = new LinearLayout.LayoutParams(-1, d(16));
+        LinearLayout.LayoutParams progressRowParams = new LinearLayout.LayoutParams(-1, d(14));
         progressRowParams.topMargin = d(3);
-        episodeInfo.addView(progressRow, progressRowParams);
+        itemInfo.addView(progressRow, progressRowParams);
         ProgressBar progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progress.setMax(100);
         progress.setProgressTintList(android.content.res.ColorStateList.valueOf(Color.WHITE));
@@ -8680,11 +8619,11 @@ public class MainActivity extends Activity {
         percent.setPadding(d(6), 0, d(2), 0);
         progressRow.addView(percent, new LinearLayout.LayoutParams(-2, -2));
         Button download = iconActionButton(R.drawable.ic_request_download,
-                "Descarga capítulo", false, 22, false);
-        download.setTag("request-download-button:episode:" + messageId);
+                "Descargar", false, 22, false);
+        download.setTag("request-download-button:movie:" + messageId);
         LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(d(44), d(40));
         buttonParams.leftMargin = d(5);
-        episodeRow.addView(download, buttonParams);
+        row.addView(download, buttonParams);
         download.setOnClickListener(v -> startManualTelegramDownload(candidate, download));
     }
 
