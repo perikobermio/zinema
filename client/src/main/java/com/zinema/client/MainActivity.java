@@ -177,6 +177,7 @@ public class MainActivity extends Activity {
     Runnable adminSyncPollTask;
     Runnable incomingCatalogSyncPollTask;
     Runnable nasDownloadPollTask;
+    Runnable serverUpdatePollTask;
     Runnable catalogDownloadStatusTask;
     boolean catalogDownloadStatusRequestRunning;
     JSONObject catalogDownloadStatus = new JSONObject();
@@ -240,6 +241,7 @@ public class MainActivity extends Activity {
     boolean libraryMode;
     boolean showingDetail;
     boolean showingAdmin;
+    boolean showingDownloadManagement;
     boolean showingProfiles;
     boolean profileEditorVisible;
     boolean introShowing;
@@ -1003,6 +1005,8 @@ public class MainActivity extends Activity {
     }
 
     void loadHome() {
+        showingDownloadManagement = false;
+        showingAdmin = false;
         if (clientApiToken().isEmpty()) {
             showingProfiles = false;
             profileEditorVisible = false;
@@ -1639,6 +1643,7 @@ public class MainActivity extends Activity {
             addAvatarMenuItem(menu, 6, 3, t("Pedir contenido"), MenuIconDrawable.SEARCH);
             if (prefs.getBoolean("account_is_admin", false)) {
                 addAvatarMenuItem(menu, 5, 4, t("Gestión de cuentas"), MenuIconDrawable.ACCOUNTS);
+                addAvatarMenuItem(menu, 7, 5, t("Gestión descargas"), MenuIconDrawable.SETTINGS);
             }
             addAvatarMenuItem(menu, 3, 5, t("Cerrar sesión"), MenuIconDrawable.LOGOUT);
             addAvatarMenuItem(menu, 4, 6, t("Salir"), MenuIconDrawable.EXIT);
@@ -1656,6 +1661,7 @@ public class MainActivity extends Activity {
         else if (id == 2) showSettings();
         else if (id == 5) showAccountManagement();
         else if (id == 6) showContentRequestScreen();
+        else if (id == 7) showDownloadManagement();
         else if (id == 3) logoutAccount();
         else if (id == 4) finishAndRemoveTask();
     }
@@ -1668,6 +1674,7 @@ public class MainActivity extends Activity {
         leaveStartupHomeWait();
         if (!showingAdmin) adminReturnDetailId = showingDetail ? detailNodeId : "";
         showingAdmin = true;
+        showingDownloadManagement = false;
         showingDetail = false;
         buildShell(t("Pedir contenido"));
         content.removeAllViews();
@@ -6146,6 +6153,7 @@ public class MainActivity extends Activity {
             case "Reintentar": return "Berriro saiatu";
             case "Configurar servidor": return "Zerbitzaria konfiguratu";
             case "Administración": return "Administrazioa";
+            case "Gestión descargas": return "Deskargen kudeaketa";
             case "No se encontraron pósteres.": return "Ez da posterik aurkitu.";
             case "Reproductor": return "Erreproduzitzailea";
             case "VLC devuelve posición y duración al terminar. El reproductor de Zinema incluye controles y guarda el progreso mientras ves el vídeo.":
@@ -6248,6 +6256,25 @@ public class MainActivity extends Activity {
             case "Revisa la dirección y el nombre del servidor.":
                 return "Egiaztatu zerbitzariaren helbidea eta izena.";
             case "Idioma de la aplicación": return "Aplikazioaren hizkuntza";
+            case "Reiniciar servidor": return "Zerbitzaria berrabiarazi";
+            case "Pull y recrear": return "Eguneratu eta berriro sortu";
+            case "Actualización en curso…": return "Eguneraketa martxan…";
+            case "Actualización en cola…": return "Eguneraketa ilaran…";
+            case "Actualización completada.": return "Eguneraketa osatu da.";
+            case "Actualización fallida: ": return "Eguneraketak huts egin du: ";
+            case "Preparado para actualizar el servidor.":
+                return "Zerbitzaria eguneratzeko prest.";
+            case "No se pudo consultar el estado de la actualización.":
+                return "Ezin izan da eguneraketaren egoera kontsultatu.";
+            case "No se pudo iniciar la actualización: ":
+                return "Ezin izan da eguneraketa hasi: ";
+            case "Motivo no disponible.": return "Ez dago arrazoirik eskuragarri.";
+            case "Descargando cambios (git pull)": return "Aldaketak deskargatzen (git pull)";
+            case "Reconstruyendo y recreando el servidor":
+                return "Zerbitzaria berreraikitzen eta berriro sortzen";
+            case "Actualización en cola": return "Eguneraketa ilaran";
+            case "Actualización completada": return "Eguneraketa osatu da";
+            case "Actualización fallida": return "Eguneraketak huts egin du";
             case "Descarga desde Telegram": return "Telegram bidez deskargatu";
             case "Ejecuta la descarga de Telegram y muestra el progreso.":
                 return "Telegram deskarga hasi eta aurrerapena erakusten du.";
@@ -7315,7 +7342,7 @@ public class MainActivity extends Activity {
                     slot.removeAllViews();
                     slot.setVisibility(View.VISIBLE);
                     LinearLayout card = settingsCard();
-                    slot.addView(card, new LinearLayout.LayoutParams(-1, d(190)));
+                    slot.addView(card, new LinearLayout.LayoutParams(-1, d(220)));
                     card.addView(label(t("Sincronización del catálogo"), 16, Color.WHITE, true));
                     ProgressBar progress = new ProgressBar(this);
                     progress.setIndeterminate(true);
@@ -7538,14 +7565,35 @@ public class MainActivity extends Activity {
         leaveStartupHomeWait();
         if (!showingAdmin) adminReturnDetailId = showingDetail ? detailNodeId : "";
         showingAdmin = true;
+        showingDownloadManagement = false;
         showingDetail = false;
         buildShell("Administración");
         renderAdminWindow();
     }
 
+    void showDownloadManagement() {
+        if (isActiveKidProfile()) {
+            showKidAdminAccessDenied();
+            return;
+        }
+        if (!prefs.getBoolean("account_is_admin", false)) return;
+        if (clientApiToken().isEmpty()) {
+            showLoginScreen();
+            return;
+        }
+        leaveStartupHomeWait();
+        if (!showingAdmin) adminReturnDetailId = showingDetail ? detailNodeId : "";
+        showingAdmin = true;
+        showingDownloadManagement = true;
+        showingDetail = false;
+        buildShell(t("Gestión descargas"));
+        renderDownloadManagementWindow();
+    }
+
     void showLoginScreen() {
         leaveStartupHomeWait();
         showingAdmin = false;
+        showingDownloadManagement = false;
         showingProfiles = false;
         profileEditorVisible = false;
         FrameLayout root = new FrameLayout(this);
@@ -7684,7 +7732,6 @@ public class MainActivity extends Activity {
 
     void renderAdminWindow() {
         content.removeAllViews();
-        boolean admin = canAccessAdminTools();
         LinearLayout screen = new LinearLayout(this);
         screen.setOrientation(LinearLayout.VERTICAL);
         screen.setPadding(d(20), d(14), d(20), d(24));
@@ -7695,45 +7742,6 @@ public class MainActivity extends Activity {
         introP.topMargin = d(5);
         introP.bottomMargin = d(20);
         screen.addView(intro, introP);
-
-        LinearLayout topAdminRow = new LinearLayout(this);
-        topAdminRow.setOrientation(LinearLayout.HORIZONTAL);
-        topAdminRow.setVisibility(admin ? View.VISIBLE : View.GONE);
-        LinearLayout.LayoutParams topAdminRowParams = new LinearLayout.LayoutParams(-1, -2);
-        screen.addView(topAdminRow, topAdminRowParams);
-        LinearLayout downloadSlot = new LinearLayout(this);
-        downloadSlot.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams downloadSlotParams = new LinearLayout.LayoutParams(0, -2, 1);
-        topAdminRow.addView(downloadSlot, downloadSlotParams);
-        LinearLayout syncSlot = new LinearLayout(this);
-        syncSlot.setOrientation(LinearLayout.VERTICAL);
-        syncSlot.setVisibility(View.GONE);
-        LinearLayout.LayoutParams syncSlotParams = new LinearLayout.LayoutParams(0, -2, 1);
-        syncSlotParams.leftMargin = d(10);
-        topAdminRow.addView(syncSlot, syncSlotParams);
-
-        LinearLayout incomingSlot = new LinearLayout(this);
-        incomingSlot.setOrientation(LinearLayout.VERTICAL);
-        incomingSlot.setVisibility(admin ? View.VISIBLE : View.GONE);
-        LinearLayout.LayoutParams incomingSlotParams = new LinearLayout.LayoutParams(-1, -2);
-        incomingSlotParams.topMargin = d(14);
-        screen.addView(incomingSlot, incomingSlotParams);
-
-        LinearLayout requestsSlot = new LinearLayout(this);
-        adminContentRequestsSlot = requestsSlot;
-        requestsSlot.setOrientation(LinearLayout.VERTICAL);
-        requestsSlot.setVisibility(View.GONE);
-        LinearLayout.LayoutParams requestsSlotParams = new LinearLayout.LayoutParams(-1, -2);
-        requestsSlotParams.topMargin = d(14);
-        screen.addView(requestsSlot, requestsSlotParams);
-
-        LinearLayout manualTelegramSlot = new LinearLayout(this);
-        adminManualTelegramDownloadsSlot = manualTelegramSlot;
-        manualTelegramSlot.setOrientation(LinearLayout.VERTICAL);
-        manualTelegramSlot.setVisibility(View.GONE);
-        LinearLayout.LayoutParams manualTelegramSlotParams = new LinearLayout.LayoutParams(-1, -2);
-        manualTelegramSlotParams.topMargin = d(14);
-        screen.addView(manualTelegramSlot, manualTelegramSlotParams);
 
         LinearLayout languageCard = settingsCard();
         LinearLayout.LayoutParams languageP = new LinearLayout.LayoutParams(-1, -2);
@@ -7783,18 +7791,56 @@ public class MainActivity extends Activity {
                     : t("Se usará el reproductor de Zinema."), Toast.LENGTH_SHORT).show();
         });
 
-        TextView attribution = label("This product uses the TMDB API but is not endorsed or certified by TMDB.",
-                11, MUTED, false);
-        attribution.setPadding(d(2), d(16), d(2), 0);
-        screen.addView(attribution);
         content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
-        if (admin) {
-            loadNasDownloadControls(downloadSlot);
-            loadAdminSyncControls(syncSlot);
-            loadIncomingControls(incomingSlot);
-            loadContentRequestControls(requestsSlot);
-            loadManualTelegramDownloadControls(manualTelegramSlot);
-        }
+    }
+
+    void renderDownloadManagementWindow() {
+        content.removeAllViews();
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setPadding(d(20), d(14), d(20), d(24));
+        screen.addView(label(t("Gestión descargas"), 27, Color.WHITE, true));
+
+        LinearLayout topAdminRow = new LinearLayout(this);
+        topAdminRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams topAdminRowParams = new LinearLayout.LayoutParams(-1, -2);
+        topAdminRowParams.topMargin = d(14);
+        screen.addView(topAdminRow, topAdminRowParams);
+        LinearLayout downloadSlot = new LinearLayout(this);
+        downloadSlot.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams downloadSlotParams = new LinearLayout.LayoutParams(0, -2, 1);
+        topAdminRow.addView(downloadSlot, downloadSlotParams);
+        LinearLayout syncSlot = new LinearLayout(this);
+        syncSlot.setOrientation(LinearLayout.VERTICAL);
+        syncSlot.setVisibility(View.GONE);
+        LinearLayout.LayoutParams syncSlotParams = new LinearLayout.LayoutParams(0, -2, 1);
+        syncSlotParams.leftMargin = d(10);
+        topAdminRow.addView(syncSlot, syncSlotParams);
+
+        LinearLayout incomingSlot = new LinearLayout(this);
+        incomingSlot.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams incomingParams = new LinearLayout.LayoutParams(-1, -2);
+        incomingParams.topMargin = d(14);
+        screen.addView(incomingSlot, incomingParams);
+        LinearLayout requestsSlot = new LinearLayout(this);
+        adminContentRequestsSlot = requestsSlot;
+        requestsSlot.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams requestsParams = new LinearLayout.LayoutParams(-1, -2);
+        requestsParams.topMargin = d(14);
+        screen.addView(requestsSlot, requestsParams);
+        LinearLayout manualTelegramSlot = new LinearLayout(this);
+        adminManualTelegramDownloadsSlot = manualTelegramSlot;
+        manualTelegramSlot.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams manualParams = new LinearLayout.LayoutParams(-1, -2);
+        manualParams.topMargin = d(14);
+        screen.addView(manualTelegramSlot, manualParams);
+        content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
+
+        loadServerUpdateControls(downloadSlot);
+        loadAdminSyncControls(syncSlot);
+        loadIncomingControls(incomingSlot);
+        loadContentRequestControls(requestsSlot);
+        loadManualTelegramDownloadControls(manualTelegramSlot);
     }
 
     void loadNasDownloadControls(LinearLayout slot) {
@@ -7811,6 +7857,135 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> buildNasDownloadControls(slot, loadedState, error));
             } catch (Exception ignored) { }
         });
+    }
+
+    void loadServerUpdateControls(LinearLayout slot) {
+        io.execute(() -> {
+            try {
+                JSONObject account = getJson("/api/v1/auth/me");
+                if (!account.optBoolean("is_admin")) return;
+                JSONObject state = getJson("/api/v1/admin/server-update");
+                runOnUiThread(() -> buildServerUpdateControls(slot, state));
+            } catch (Exception error) {
+                runOnUiThread(() -> buildServerUpdateControls(slot, null));
+            }
+        });
+    }
+
+    void buildServerUpdateControls(LinearLayout slot, JSONObject state) {
+        if (slot == null || !showingDownloadManagement || slot.getParent() == null) return;
+        if (serverUpdatePollTask != null) nasDownloadHandler.removeCallbacks(serverUpdatePollTask);
+        slot.removeAllViews();
+        slot.setVisibility(View.VISIBLE);
+        LinearLayout card = settingsCard();
+        slot.addView(card, new LinearLayout.LayoutParams(-1, d(220)));
+        card.addView(label(t("Reiniciar servidor"), 16, Color.WHITE, true));
+        ProgressBar progress = new ProgressBar(this);
+        progress.setIndeterminate(true);
+        LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(-1, d(4));
+        progressParams.topMargin = d(11);
+        card.addView(progress, progressParams);
+        TextView status = label("", 10, MUTED, false);
+        status.setMaxLines(5);
+        status.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        status.setMovementMethod(new android.text.method.ScrollingMovementMethod());
+        LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(-1, 0, 1);
+        statusParams.topMargin = d(8);
+        card.addView(status, statusParams);
+        Button update = actionButton(t("Pull y recrear"), true);
+        LinearLayout.LayoutParams updateParams = new LinearLayout.LayoutParams(-1, d(44));
+        updateParams.topMargin = d(8);
+        card.addView(update, updateParams);
+        if (state == null) {
+            progress.setVisibility(View.GONE);
+            status.setText(t("No se pudo consultar el estado de la actualización."));
+            update.setEnabled(false);
+            update.setAlpha(0.38f);
+        } else applyServerUpdateState(state, status, progress, update);
+        update.setOnClickListener(v -> startServerUpdate(status, progress, update));
+    }
+
+    boolean applyServerUpdateState(JSONObject state, TextView status, ProgressBar progress,
+                                   Button update) {
+        String stateName = state.optString("status", "idle");
+        boolean active = "queued".equals(stateName) || "running".equals(stateName);
+        progress.setVisibility(active ? View.VISIBLE : View.GONE);
+        update.setEnabled(!active);
+        update.setAlpha(active ? 0.38f : 1.0f);
+        update.setText(t(active ? "Actualización en curso…" : "Pull y recrear"));
+        String stage = state.optString("stage", "");
+        String output = state.optString("output", "").trim();
+        String message;
+        if ("queued".equals(stateName)) message = t("Actualización en cola…");
+        else if ("running".equals(stateName)) message = t(stage.isEmpty()
+                ? "Actualización en curso…" : stage);
+        else if ("completed".equals(stateName)) message = t("Actualización completada.");
+        else if ("failed".equals(stateName)) message = t("Actualización fallida: ")
+                + state.optString("error", t("Motivo no disponible."));
+        else message = t("Preparado para actualizar el servidor.");
+        if (!output.isEmpty()) message += "\n\n" + output;
+        status.setText(message);
+        status.post(() -> status.scrollTo(0, status.getLayout() == null ? 0
+                : status.getLayout().getHeight()));
+        return active;
+    }
+
+    void startServerUpdate(TextView status, ProgressBar progress, Button update) {
+        update.setEnabled(false);
+        update.setAlpha(0.38f);
+        update.setText(t("Actualización en curso…"));
+        progress.setVisibility(View.VISIBLE);
+        status.setText(t("Actualización en cola…"));
+        io.execute(() -> {
+            try {
+                postJson("/api/v1/admin/server-update", new JSONObject());
+                runOnUiThread(() -> pollServerUpdate(status, progress, update));
+            } catch (Exception error) {
+                String detail = error.getMessage() == null ? "" : error.getMessage();
+                if (detail.contains("409")) {
+                    runOnUiThread(() -> pollServerUpdate(status, progress, update));
+                    return;
+                }
+                runOnUiThread(() -> {
+                    if (!showingDownloadManagement || status.getParent() == null) return;
+                    progress.setVisibility(View.GONE);
+                    update.setEnabled(true);
+                    update.setAlpha(1.0f);
+                    update.setText(t("Pull y recrear"));
+                    status.setText(t("No se pudo iniciar la actualización: ") + detail);
+                });
+            }
+        });
+    }
+
+    void pollServerUpdate(TextView status, ProgressBar progress, Button update) {
+        if (!showingDownloadManagement || status.getParent() == null) return;
+        io.execute(() -> {
+            try {
+                JSONObject state = getJson("/api/v1/admin/server-update");
+                runOnUiThread(() -> {
+                    if (!showingDownloadManagement || status.getParent() == null) return;
+                    boolean active = applyServerUpdateState(state, status, progress, update);
+                    if (active) scheduleServerUpdatePoll(status, progress, update);
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> {
+                    if (!showingDownloadManagement || status.getParent() == null) return;
+                    status.setText(t("No se pudo consultar el estado de la actualización.")
+                            + "\n" + error.getMessage());
+                    scheduleServerUpdatePoll(status, progress, update);
+                });
+            }
+        });
+    }
+
+    void scheduleServerUpdatePoll(TextView status, ProgressBar progress, Button update) {
+        if (serverUpdatePollTask != null) nasDownloadHandler.removeCallbacks(serverUpdatePollTask);
+        serverUpdatePollTask = () -> {
+            serverUpdatePollTask = null;
+            pollServerUpdate(status, progress, update);
+        };
+        nasDownloadHandler.postDelayed(serverUpdatePollTask, 2500L);
     }
 
     void buildNasDownloadControls(LinearLayout slot, JSONObject state, String loadError) {
@@ -7851,6 +8026,7 @@ public class MainActivity extends Activity {
         } else {
             progress.setVisibility(View.GONE);
             start.setEnabled(loadError.isEmpty());
+            start.setAlpha(loadError.isEmpty() ? 1.0f : 0.38f);
             pollNasDownload("", status, progress, start);
         }
     }
@@ -7864,6 +8040,7 @@ public class MainActivity extends Activity {
         progress.setIndeterminate(active && percent < 0.0);
         if (percent >= 0.0) progress.setProgress((int) Math.round(percent));
         start.setEnabled(!active);
+        start.setAlpha(active ? 0.38f : 1.0f);
         start.setText(t(active ? "Descarga en curso…" : "Iniciar descarga"));
         ViewGroup parent = status.getParent() instanceof ViewGroup
                 ? (ViewGroup) status.getParent() : null;
@@ -7924,6 +8101,7 @@ public class MainActivity extends Activity {
 
     void startNasDownload(TextView status, ProgressBar progress, Button start) {
         start.setEnabled(false);
+        start.setAlpha(0.38f);
         start.setText(t("Descarga en curso…"));
         setRequestDownloadButtonsEnabled(false);
         progress.setVisibility(View.VISIBLE);
@@ -7950,6 +8128,7 @@ public class MainActivity extends Activity {
                     if (!showingAdmin || status.getParent() == null) return;
                     progress.setVisibility(View.GONE);
                     start.setEnabled(true);
+                    start.setAlpha(1.0f);
                     start.setText(t("Iniciar descarga"));
                     setRequestDownloadButtonsEnabled(true);
                     status.setText(t("No se pudo iniciar la descarga: ") + message);
@@ -8596,13 +8775,15 @@ public class MainActivity extends Activity {
         LinearLayout itemInfo = new LinearLayout(this);
         itemInfo.setOrientation(LinearLayout.VERTICAL);
         row.addView(itemInfo, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView name = labelRaw(candidate.optString("title", candidate.optString("filename", "")),
-                13, Color.WHITE, false);
+        String fileName = candidate.optString("filename", "").trim();
+        String displayTitle = fileName.isEmpty()
+                ? candidate.optString("title", "") : fileName;
+        TextView name = labelRaw(displayTitle, 13, Color.WHITE, false);
         name.setMaxLines(2);
         name.setEllipsize(android.text.TextUtils.TruncateAt.END);
         itemInfo.addView(name);
         String descriptionText = candidate.optString("description", "").trim();
-        if (!descriptionText.isEmpty() && !descriptionText.equals(name.getText().toString().trim())) {
+        if (!descriptionText.isEmpty() && !descriptionText.equals(displayTitle)) {
             TextView description = labelRaw(descriptionText, 11, MUTED, false);
             description.setMaxLines(2);
             description.setEllipsize(android.text.TextUtils.TruncateAt.END);
@@ -8700,6 +8881,7 @@ public class MainActivity extends Activity {
                 boolean episodeActive = active && messageId > 0 && messageId == currentMessageId;
                 Button button = (Button) view;
                 button.setEnabled(!active);
+                button.setAlpha(active ? 0.38f : 1.0f);
                 button.setText("");
                 button.setContentDescription(t(episodeActive
                         ? "Descarga en curso…"
@@ -8748,6 +8930,7 @@ public class MainActivity extends Activity {
         if (buttonView instanceof Button) {
             Button button = (Button) buttonView;
             button.setEnabled(!loading);
+            button.setAlpha(loading ? 0.38f : 1.0f);
             button.setText("");
             button.setContentDescription(t(loading ? "Iniciando…" : "Descarga capítulo"));
         }
@@ -8777,6 +8960,7 @@ public class MainActivity extends Activity {
             String tag = (String) tagValue;
             Button button = (Button) view;
             button.setEnabled(enabled);
+            button.setAlpha(enabled ? 1.0f : 0.38f);
             button.setContentDescription(t(enabled
                     ? (tag.contains(":episode:") ? "Descarga capítulo" : "Descargar")
                     : "Descarga en curso…"));
@@ -8911,6 +9095,7 @@ public class MainActivity extends Activity {
         }
         leaveStartupHomeWait();
         showingAdmin = true;
+        showingDownloadManagement = false;
         showingDetail = false;
         buildShell("Gestión de cuentas");
         renderAccountManagement();
@@ -8923,6 +9108,7 @@ public class MainActivity extends Activity {
     void showKidAdminAccessDenied() {
         Toast.makeText(this, t("Esta opción no está disponible en un perfil infantil."), Toast.LENGTH_LONG).show();
         showingAdmin = false;
+        showingDownloadManagement = false;
         showingDetail = false;
         loadHome();
     }
@@ -9860,6 +10046,7 @@ public class MainActivity extends Activity {
         }
         if (showingAdmin) {
             showingAdmin = false;
+            showingDownloadManagement = false;
             String returnDetailId = adminReturnDetailId;
             adminReturnDetailId = "";
             if (!returnDetailId.isEmpty()) {

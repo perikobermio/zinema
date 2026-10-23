@@ -51,3 +51,21 @@ services:
         bind:
           create_host_path: false
       - ./data:/data
+
+  zinema-updater:
+    build:
+      context: .
+      dockerfile: Dockerfile.updater
+    container_name: zinema-updater
+    restart: unless-stopped
+    environment:
+      ZINEMA_PROJECT_ROOT: /var/www/zinema
+      ZINEMA_UPDATE_STATE: /data/server-update.json
+    volumes:
+      - type: bind
+        source: ${NAS_PROJECT_PATH:-/var/www/zinema}
+        target: /var/www/zinema
+        bind:
+          create_host_path: false
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock

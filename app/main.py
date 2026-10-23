@@ -64,6 +64,8 @@ SYNC_RETRY_LOCK = threading.Lock()
 SYNC_RETRY_SCHEDULED = False
 INCOMING_MOVE_LOCK = threading.Lock()
 NAS_DOWNLOAD_LOCK = threading.Lock()
+SERVER_UPDATE_LOCK = threading.Lock()
+SERVER_UPDATE_STATE_PATH = DATABASE_PATH.parent / "server-update.json"
 TELEGRAM_SCAN_LOCK = threading.Lock()
 TELEGRAM_SCAN_CACHE: dict[str, object] = {"checked_at": 0.0, "media": []}
 TELEGRAM_SCAN_CACHE_SECONDS = 60.0
@@ -3900,6 +3902,48 @@ def get_nas_catalog_download(refresh: bool = False) -> dict[str, object]:
         payload = {key: value for key, value in NAS_DOWNLOAD_STATE.items()
                    if not key.startswith("_")}
         return payload
+
+
+def _read_server_update_state() -> dict[str, object]:
+    try:
+        value = json.loads(SERVER_UPDATE_STATE_PATH.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            return value
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"status": "idle", "stage": "", "output": "", "error": None}
+
+
+def _write_server_update_state(state: dict[str, object]) -> None:
+    SERVER_UPDATE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = SERVER_UPDATE_STATE_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(SERVER_UPDATE_STATE_PATH)
+
+
+@app.post("/api/v1/admin/server-update", status_code=202,
+          dependencies=[Depends(require_admin)])
+def start_server_update() -> dict[str, object]:
+    with SERVER_UPDATE_LOCK:
+        current = _read_server_update_state()
+        if current.get("status") in {"queued", "running"}:
+            raise HTTPException(status_code=409, detail="A server update is already running")
+        state = {
+            "id": uuid4().hex,
+            "status": "queued",
+            "stage": "Actualización en cola",
+            "output": "",
+            "error": None,
+            "started_at": int(time.time()),
+            "finished_at": None,
+        }
+        _write_server_update_state(state)
+        return state
+
+
+@app.get("/api/v1/admin/server-update", dependencies=[Depends(require_admin)])
+def get_server_update() -> dict[str, object]:
+    return _read_server_update_state()
 
 
 @app.get("/api/v1/download-status", dependencies=[Depends(require_client)])

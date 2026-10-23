@@ -1,0 +1,6 @@
+FROM alpine:3.21
+
+RUN apk add --no-cache docker-cli docker-cli-compose git python3
+COPY scripts/zinema_updater.py /usr/local/bin/zinema-updater.py
+
+ENTRYPOINT ["python3", "/usr/local/bin/zinema-updater.py"]
