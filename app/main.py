@@ -913,7 +913,7 @@ def _node_payload(row: sqlite3.Row, connection: sqlite3.Connection) -> dict:
 
     child_rows = connection.execute(
         """SELECT id, kind, title, metadata_title, poster_file, season_number, parent_id,
-                  tmdb_episodes_json
+                  tmdb_id, tmdb_episodes_json
            FROM catalog_nodes WHERE parent_id=? AND available=1
            ORDER BY CASE kind WHEN 'collection' THEN 0 WHEN 'series' THEN 1
                               WHEN 'season' THEN 2 ELSE 3 END,
