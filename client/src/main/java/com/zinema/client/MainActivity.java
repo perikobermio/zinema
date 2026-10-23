@@ -2772,12 +2772,19 @@ public class MainActivity extends Activity {
         if (!favorites.isEmpty()) addRow("Mi lista", favorites);
         List<JSONObject> pendingItems = new ArrayList<>();
         Set<String> pendingIds = new HashSet<>();
+        Set<String> requestedSeriesIds = new HashSet<>();
         for (JSONObject node : visibleMovies)
             collectPendingHomeItems(node, "", pendingItems, pendingIds);
         for (JSONObject node : visibleSeries)
             collectPendingHomeItems(node, "", pendingItems, pendingIds);
         for (JSONObject node : visibleSeries)
-            collectRequestedIncompleteSeries(node, pendingItems, pendingIds);
+            collectRequestedIncompleteSeries(node, pendingItems, pendingIds, requestedSeriesIds);
+        for (int i = pendingItems.size() - 1; i >= 0; i--) {
+            JSONObject pending = pendingItems.get(i);
+            if ("season".equals(pending.optString("kind"))
+                    && requestedSeriesIds.contains(pending.optString("parent_id", "")))
+                pendingItems.remove(i);
+        }
         List<JSONObject> catalogItems = new ArrayList<>();
         for (JSONObject node : visibleMovies)
             if (!node.optBoolean("is_placeholder") && "movie".equals(node.optString("kind")))
@@ -2864,15 +2871,21 @@ public class MainActivity extends Activity {
     }
 
     void collectRequestedIncompleteSeries(JSONObject node, List<JSONObject> output,
-                                          Set<String> includedIds) {
+                                          Set<String> includedIds, Set<String> requestedSeriesIds) {
         if (node == null) return;
         if ("series".equals(node.optString("kind"))
                 && isKidAllowedNode(node) && hasRequestedMissingEpisodes(node)) {
             String id = node.optString("id", "");
+            if (!id.isEmpty()) requestedSeriesIds.add(id);
             if (!id.isEmpty() && includedIds.add(id)) {
                 try {
                     JSONObject requestedSeries = new JSONObject(node.toString());
-                    requestedSeries.put("is_requested_incomplete_series", true);
+                requestedSeries.put("is_placeholder", true);
+                requestedSeries.remove("is_requested_incomplete_series");
+                requestedSeries.remove("incomplete");
+                requestedSeries.remove("missing_seasons");
+                requestedSeries.remove("missing_episodes");
+                requestedSeries.remove("missing_episode_count");
                     output.add(requestedSeries);
                 } catch (JSONException ignored) { }
             }
@@ -2880,7 +2893,8 @@ public class MainActivity extends Activity {
         JSONArray children = node.optJSONArray("children");
         if (children != null)
             for (int i = 0; i < children.length(); i++)
-                collectRequestedIncompleteSeries(children.optJSONObject(i), output, includedIds);
+                collectRequestedIncompleteSeries(children.optJSONObject(i), output,
+                        includedIds, requestedSeriesIds);
     }
 
     List<JSONObject> incomingItemsFrom(List<JSONObject> nodes) {
@@ -3557,8 +3571,6 @@ public class MainActivity extends Activity {
             String summary = seasons + (seasons == 1 ? " " + t("temporada") : " " + t("temporadas"));
             if (pendingSeasons > 0)
                 summary += " · " + pendingSeasons + " " + t("Pendiente de añadir").toLowerCase();
-            if (node.optBoolean("is_requested_incomplete_series"))
-                summary += " · " + t("Capítulos solicitados");
             return summary;
         }
         if (kind.equals("season")) return t("Temporada") + " " + String.format("%02d", node.optInt("season_number"));
@@ -6008,7 +6020,6 @@ public class MainActivity extends Activity {
             case "No se pudieron cargar las solicitudes.": return "Ezin izan dira eskaerak kargatu.";
             case "pendientes": return "zain";
             case "No hay solicitudes de contenido.": return "Ez dago eduki-eskaerarik.";
-            case "Capítulos solicitados": return "Eskatutako atalak";
             case "Descargar": return "Deskargatu";
             case "Selecciona el archivo": return "Hautatu fitxategia";
             case "Capítulos disponibles": return "Atal eskuragarriak";
