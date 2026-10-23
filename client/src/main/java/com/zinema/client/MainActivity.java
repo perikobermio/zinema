@@ -5955,6 +5955,8 @@ public class MainActivity extends Activity {
             case "Película": return "Filma";
             case "Serie": return "Telesaila";
             case "Solicitudes de contenido": return "Eduki-eskaerak";
+            case "Cargando solicitudes…": return "Eskaerak kargatzen…";
+            case "No se pudieron cargar las solicitudes.": return "Ezin izan dira eskaerak kargatu.";
             case "pendientes": return "zain";
             case "No hay solicitudes de contenido.": return "Ez dago eduki-eskaerarik.";
             case "Descargar": return "Deskargatu";
@@ -6904,11 +6906,12 @@ public class MainActivity extends Activity {
         Button button = actionButton("", primary);
         button.setPadding(0, 0, 0, 0);
         button.setMinWidth(d(44));
+        button.setGravity(Gravity.CENTER);
         android.graphics.drawable.Drawable icon = getDrawable(iconResource);
         if (icon != null) {
             int iconSize = d(iconSizeDp);
             icon.setBounds(0, 0, iconSize, iconSize);
-            button.setCompoundDrawables(null, icon, null, null);
+            button.setCompoundDrawables(icon, null, null, null);
         }
         if (transparentBackground) button.setBackgroundColor(Color.TRANSPARENT);
         button.setContentDescription(t(accessibilityLabel));
@@ -7825,6 +7828,7 @@ public class MainActivity extends Activity {
     void startNasDownload(TextView status, ProgressBar progress, Button start) {
         start.setEnabled(false);
         start.setText(t("Descarga en curso…"));
+        setRequestDownloadButtonsEnabled(false);
         progress.setVisibility(View.VISIBLE);
         status.setText(t("Iniciando descarga…"));
         io.execute(() -> {
@@ -7850,6 +7854,7 @@ public class MainActivity extends Activity {
                     progress.setVisibility(View.GONE);
                     start.setEnabled(true);
                     start.setText(t("Iniciar descarga"));
+                    setRequestDownloadButtonsEnabled(true);
                     status.setText(t("No se pudo iniciar la descarga: ") + message);
                 });
             }
@@ -8119,6 +8124,17 @@ public class MainActivity extends Activity {
     }
 
     void loadContentRequestControls(LinearLayout slot) {
+        slot.removeAllViews();
+        slot.setVisibility(View.VISIBLE);
+        LinearLayout loadingRow = new LinearLayout(this);
+        loadingRow.setGravity(Gravity.CENTER_VERTICAL);
+        loadingRow.setPadding(d(8), d(12), d(8), d(12));
+        loadingRow.addView(new ProgressBar(this), new LinearLayout.LayoutParams(d(24), d(24)));
+        TextView loadingLabel = label(t("Cargando solicitudes…"), 13, MUTED, false);
+        LinearLayout.LayoutParams loadingLabelParams = new LinearLayout.LayoutParams(-2, -2);
+        loadingLabelParams.leftMargin = d(10);
+        loadingRow.addView(loadingLabel, loadingLabelParams);
+        slot.addView(loadingRow);
         io.execute(() -> {
             try {
                 JSONArray requests = getArray("/api/v1/admin/content-requests");
@@ -8288,7 +8304,7 @@ public class MainActivity extends Activity {
                                         new LinearLayout.LayoutParams(-2, -2));
                                 Button episodeDownload = iconActionButton(
                                         R.drawable.ic_request_download, "Descarga capítulo", false, 22, false);
-                                episodeDownload.setTag("request-download-button:" + messageId);
+                                episodeDownload.setTag("request-download-button:episode:" + messageId);
                                 LinearLayout.LayoutParams episodeDownloadParams =
                                         new LinearLayout.LayoutParams(d(44), d(40));
                                 episodeDownloadParams.leftMargin = d(5);
@@ -8310,7 +8326,7 @@ public class MainActivity extends Activity {
                                 if (arrow != null) {
                                     int arrowSize = d(34);
                                     arrow.setBounds(0, 0, arrowSize, arrowSize);
-                                    expandEpisodes.setCompoundDrawables(null, arrow, null, null);
+                                    expandEpisodes.setCompoundDrawables(arrow, null, null, null);
                                 }
                                 expandEpisodes.setContentDescription(t(expanded
                                         ? "Contraer capítulos" : "Expandir capítulos"));
@@ -8324,6 +8340,9 @@ public class MainActivity extends Activity {
                         if (hasTelegramDownloads && !isSeriesRequest) {
                             Button download = iconActionButton(
                                     R.drawable.ic_request_download, "Descargar", false, 22, false);
+                            int downloadMessageId = telegramDownloads.optJSONObject(0) == null ? 0
+                                    : telegramDownloads.optJSONObject(0).optInt("message_id");
+                            download.setTag("request-download-button:movie:" + downloadMessageId);
                             actions.addView(download, new LinearLayout.LayoutParams(d(44), d(40)));
                             download.setOnClickListener(v -> {
                                 if (telegramDownloads.length() == 1) {
@@ -8375,8 +8394,15 @@ public class MainActivity extends Activity {
                     }
                     refreshContentRequestDownloadIndicators(activeDownloadState);
                 });
-            } catch (Exception ignored) {
-                // The protected endpoint stays hidden for non-administrator accounts.
+            } catch (Exception error) {
+                runOnUiThread(() -> {
+                    if (!showingAdmin || slot.getParent() == null) return;
+                    slot.removeAllViews();
+                    TextView failure = label(t("No se pudieron cargar las solicitudes."),
+                            13, MUTED, false);
+                    failure.setPadding(d(8), d(12), d(8), d(12));
+                    slot.addView(failure);
+                });
             }
         });
     }
@@ -8417,10 +8443,11 @@ public class MainActivity extends Activity {
                 int messageId = parseTaggedMessageId(tag);
                 boolean episodeActive = active && messageId > 0 && messageId == currentMessageId;
                 Button button = (Button) view;
-                button.setEnabled(!episodeActive);
+                button.setEnabled(!active);
                 button.setText("");
                 button.setContentDescription(t(episodeActive
-                        ? "Descarga en curso…" : "Descarga capítulo"));
+                        ? "Descarga en curso…"
+                        : tag.contains(":episode:") ? "Descarga capítulo" : "Descargar"));
             }
         }
         if (view instanceof ViewGroup) {
@@ -8447,7 +8474,7 @@ public class MainActivity extends Activity {
         if (arrow != null) {
             int arrowSize = d(34);
             arrow.setBounds(0, 0, arrowSize, arrowSize);
-            ((Button) expander).setCompoundDrawables(null, arrow, null, null);
+            ((Button) expander).setCompoundDrawables(arrow, null, null, null);
         }
         expander.setContentDescription(t("Contraer capítulos"));
     }
@@ -8465,7 +8492,7 @@ public class MainActivity extends Activity {
         View percentView = adminContentRequestsSlot.findViewWithTag(
                 "request-download-percent:" + messageId);
         View buttonView = adminContentRequestsSlot.findViewWithTag(
-                "request-download-button:" + messageId);
+                "request-download-button:episode:" + messageId);
         if (progressRow != null) progressRow.setVisibility(loading ? View.VISIBLE : View.GONE);
         if (progressView instanceof ProgressBar) {
             ProgressBar bar = (ProgressBar) progressView;
@@ -8478,6 +8505,31 @@ public class MainActivity extends Activity {
             button.setEnabled(!loading);
             button.setText("");
             button.setContentDescription(t(loading ? "Iniciando…" : "Descarga capítulo"));
+        }
+    }
+
+    void setRequestDownloadButtonsEnabled(boolean enabled) {
+        if (adminContentRequestsSlot != null)
+            setRequestDownloadButtonsEnabled(adminContentRequestsSlot, enabled);
+    }
+
+    void setRequestDownloadButtonsEnabled(View view, boolean enabled) {
+        if (view == null) return;
+        Object tagValue = view.getTag();
+        if (tagValue instanceof String
+                && ((String) tagValue).startsWith("request-download-button:")
+                && view instanceof Button) {
+            String tag = (String) tagValue;
+            Button button = (Button) view;
+            button.setEnabled(enabled);
+            button.setContentDescription(t(enabled
+                    ? (tag.contains(":episode:") ? "Descarga capítulo" : "Descargar")
+                    : "Descarga en curso…"));
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++)
+                setRequestDownloadButtonsEnabled(group.getChildAt(i), enabled);
         }
     }
 
@@ -8500,6 +8552,7 @@ public class MainActivity extends Activity {
         button.setEnabled(false);
         button.setText("");
         button.setContentDescription(t("Iniciando…"));
+        setRequestDownloadButtonsEnabled(false);
         if (isEpisodeDownload) setRequestEpisodeLoading(messageId, true);
         io.execute(() -> {
             try {
@@ -8514,12 +8567,22 @@ public class MainActivity extends Activity {
             } catch (Exception error) {
                 runOnUiThread(() -> {
                     if (isEpisodeDownload) setRequestEpisodeLoading(messageId, false);
-                    button.setEnabled(true);
-                    button.setText(initialText);
-                    button.setContentDescription(initialDescription);
                     String message = error.getMessage() == null ? "" : error.getMessage();
                     Toast.makeText(this, t("No se pudo iniciar la descarga: ") + message,
                             Toast.LENGTH_LONG).show();
+                    io.execute(() -> {
+                        JSONObject state = null;
+                        try { state = getJson("/api/v1/admin/incoming-download"); }
+                        catch (Exception ignored) { }
+                        JSONObject currentState = state;
+                        runOnUiThread(() -> {
+                            if (currentState != null)
+                                refreshContentRequestDownloadIndicators(currentState);
+                            else setRequestDownloadButtonsEnabled(true);
+                            button.setText(initialText);
+                            button.setContentDescription(initialDescription);
+                        });
+                    });
                 });
             }
         });

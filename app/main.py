@@ -3284,6 +3284,11 @@ def _request_telegram_downloads(request: dict[str, object],
         item_episode = int(item["episode_number"]) if item.get("episode_number") is not None else None
         if content_type == "movie" and item_season is not None:
             continue
+        # Episode requests must only match media identified as an episode. Without
+        # this guard a movie with a shared title can appear downloadable for a TV
+        # request (for example, a film and series with the same franchise name).
+        if content_type == "tv" and (item_season is None or item_episode is None):
+            continue
         if target_seasons:
             if item_season is None or item_season not in target_seasons:
                 continue
