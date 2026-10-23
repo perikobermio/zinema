@@ -3339,6 +3339,78 @@ def _request_telegram_downloads(request: dict[str, object],
     return matches
 
 
+def _requested_telegram_message_ids(media: list[dict[str, object]]) -> set[int]:
+    """Return Telegram messages already associated with a content request."""
+    with closing(database()) as connection:
+        rows = connection.execute("SELECT * FROM content_requests").fetchall()
+    requested_ids: set[int] = set()
+    for row in rows:
+        try:
+            details = json.loads(row["details_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            details = {}
+        payload = {key: row[key] for key in (
+            "id", "request_type", "content_type", "tmdb_id", "title", "year",
+            "season_number", "catalog_node_id",
+        )}
+        payload["details"] = details
+        requested_ids.update(
+            int(candidate["message_id"])
+            for candidate in _request_telegram_downloads(payload, media)
+        )
+    return requested_ids
+
+
+def _manual_telegram_download_groups(media: list[dict[str, object]]) -> list[dict[str, object]]:
+    requested_ids = _requested_telegram_message_ids(media)
+    groups: dict[tuple[object, ...], dict[str, object]] = {}
+    ordered_groups: list[dict[str, object]] = []
+    # The scanner returns newest first. Apply the 30 item limit before grouping,
+    # so series with several recent episodes still consume the same limit.
+    standalone = [item for item in media
+                  if int(item.get("message_id") or 0) not in requested_ids][:30]
+    for item in standalone:
+        filename = str(item.get("filename") or item.get("title") or "Telegram media")
+        guess = _incoming_guess(Path(filename))
+        season = item.get("season_number")
+        episode = item.get("episode_number")
+        is_episode = season is not None and episode is not None
+        if is_episode:
+            # Scanner metadata can identify episodes using the caption too.
+            guess["library"] = "series"
+            guess["kind"] = "episode"
+            guess["season_number"] = int(season)
+            guess["episode_number"] = int(episode)
+            if not EPISODE_RE.search(Path(filename).stem):
+                source_title = str(item.get("title") or item.get("caption") or filename)
+                match = EPISODE_RE.search(source_title)
+                if match:
+                    guess["title"] = (_clean_media_title(source_title[:match.start()])
+                                       or str(guess.get("title") or "Unknown title"))
+        title = str(guess.get("title") or "Unknown title")
+        year = guess.get("year")
+        content_type = "tv" if is_episode else "movie"
+        normalized_title = _normalize_media_title(title)
+        key = (content_type, normalized_title, year)
+        group = groups.get(key)
+        if group is None:
+            group = {
+                "content_type": content_type, "title": title, "year": year,
+                "telegram_downloads": [],
+            }
+            groups[key] = group
+            ordered_groups.append(group)
+        group["telegram_downloads"].append({
+            "message_id": int(item.get("message_id") or 0),
+            "filename": filename,
+            "size_bytes": int(item.get("size_bytes") or 0),
+            "season_number": int(season) if is_episode else None,
+            "episode_number": int(episode) if is_episode else None,
+            "date": item.get("date"),
+        })
+    return ordered_groups
+
+
 @app.get("/api/v1/admin/content-requests", dependencies=[Depends(require_admin)])
 def list_content_requests() -> list[dict[str, object]]:
     with closing(database()) as connection:
@@ -3377,6 +3449,33 @@ def list_content_requests() -> list[dict[str, object]]:
                 continue
         results.append(request_payload)
     return results
+
+
+@app.get("/api/v1/admin/telegram-manual-downloads", dependencies=[Depends(require_admin)])
+def list_manual_telegram_downloads() -> list[dict[str, object]]:
+    return _manual_telegram_download_groups(_telegram_saved_media())
+
+
+@app.post("/api/v1/admin/telegram-manual-downloads/{message_id}/download", status_code=202,
+          dependencies=[Depends(require_admin)])
+def start_manual_telegram_download(message_id: int) -> dict[str, object]:
+    media = _telegram_saved_media()
+    requested_ids = _requested_telegram_message_ids(media)
+    manual_ids = {
+        int(item.get("message_id") or 0)
+        for item in media if int(item.get("message_id") or 0)
+        not in requested_ids
+    }
+    if message_id not in manual_ids:
+        with TELEGRAM_SCAN_LOCK:
+            TELEGRAM_SCAN_CACHE["checked_at"] = 0.0
+        media = _telegram_saved_media()
+        requested_ids = _requested_telegram_message_ids(media)
+        manual_ids = {int(item.get("message_id") or 0) for item in media
+                      if int(item.get("message_id") or 0) not in requested_ids}
+    if message_id not in manual_ids:
+        raise HTTPException(status_code=404, detail="Manual Telegram media not found")
+    return _start_nas_download(message_id)
 
 
 @app.post("/api/v1/admin/content-requests/{request_id}/download", status_code=202,
