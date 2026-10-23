@@ -1824,6 +1824,8 @@ def _run_nas_download(job_id: str, message_id: int | None = None) -> None:
         _settle_app_download_files()
         completed_at = datetime.now(timezone.utc).isoformat()
         if exit_code == 0:
+            with TELEGRAM_SCAN_LOCK:
+                TELEGRAM_SCAN_CACHE["checked_at"] = 0.0
             _update_nas_download_state(
                 status="completed", completed_at=completed_at, exit_code=exit_code,
                 error=None, progress="Descarga finalizada.", current_percent=100.0,
@@ -3326,8 +3328,6 @@ def list_content_requests() -> list[dict[str, object]]:
     results = []
     saved_media = _telegram_saved_media() if rows else []
     for row in rows:
-        if row["status"] == "approved" and row["id"] in incoming_request_ids:
-            continue
         details = json.loads(row["details_json"] or "{}")
         request_payload = {**{key: row[key] for key in (
         "id", "requester_name", "request_type", "content_type", "tmdb_id",
@@ -3336,9 +3336,15 @@ def list_content_requests() -> list[dict[str, object]]:
         )}, "details": details,
         "poster_path": details.get("poster_path"),
         "poster_url": details.get("poster_url")}
-        request_payload["telegram_downloads"] = _request_telegram_downloads(
+        telegram_downloads = _request_telegram_downloads(
             request_payload, saved_media,
         )
+        request_payload["telegram_downloads"] = telegram_downloads
+        if row["status"] == "approved" and row["id"] in incoming_request_ids:
+            # A single downloaded episode in Incoming must not hide the whole
+            # series request while other requested episodes remain in Telegram.
+            if row["content_type"] != "tv" or not telegram_downloads:
+                continue
         results.append(request_payload)
     return results
 
