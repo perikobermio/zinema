@@ -105,7 +105,7 @@ def process(state: dict) -> None:
         run_step(state, "Reconstruyendo y recreando el servidor",
                  ["docker", "compose", "-f", str(PROJECT_ROOT / "compose.yaml"),
                   "--project-directory", str(PROJECT_ROOT), "up", "-d", "--build",
-                  "--no-deps", "zinema"], 1800)
+                  "--force-recreate", "zinema"], 1800)
         state.update(status="completed", stage="Actualización completada", error=None)
     except Exception as error:  # Preserve the reason and command output for the admin.
         state.update(status="failed", stage="Actualización fallida", error=str(error))

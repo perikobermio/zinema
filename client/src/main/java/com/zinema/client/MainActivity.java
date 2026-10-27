@@ -260,6 +260,8 @@ public class MainActivity extends Activity {
     List<JSONObject> startupSeries = new ArrayList<>();
     List<JSONObject> startupHomeCatalog = new ArrayList<>();
     List<JSONObject> homeCatalog = new ArrayList<>();
+    boolean homeCatalogRefreshRunning;
+    long homeCatalogUpdatedAtMs;
     JSONArray startupRemoteProfiles;
     String startupPrefetchError;
     volatile JSONArray incomingFilesCache;
@@ -386,6 +388,7 @@ public class MainActivity extends Activity {
         WebSettings webSettings = introWebView.getSettings();
         webSettings.setJavaScriptEnabled(true);
         webSettings.setAllowFileAccess(true);
+        webSettings.setMediaPlaybackRequiresUserGesture(false);
         introWebView.addJavascriptInterface(new IntroBridge(), "ZinemaIntro");
         setContentView(introWebView);
         introWebView.loadUrl("file:///android_asset/zinema_intro.html?embed=1");
@@ -431,8 +434,6 @@ public class MainActivity extends Activity {
                         () -> getArray("/api/v1/catalog?library=movies"));
                 java.util.concurrent.Future<JSONArray> seriesFuture = io.submit(
                         () -> getArray("/api/v1/catalog?library=series"));
-                java.util.concurrent.Future<JSONArray> homeCatalogFuture = io.submit(
-                        () -> getArray("/api/v1/catalog/home"));
                 java.util.concurrent.Future<JSONArray> profilesFuture = readProfiles().isEmpty()
                         ? io.submit(() -> getAuthorizedProfileArray("/api/v1/profiles")) : null;
                 JSONArray movieRows = movieFuture.get();
@@ -441,8 +442,7 @@ public class MainActivity extends Activity {
                 catch (Exception ignored) { }
                 movieList = toList(movieRows);
                 seriesList = toList(seriesRows);
-                try { homeList = toList(homeCatalogFuture.get()); }
-                catch (Exception ignored) { homeList = rootPlayableItems(movieList, seriesList); }
+                homeList = rootPlayableItems(movieList, seriesList);
                 sortNewestFirst(movieList);
                 sortNewestFirst(seriesList);
             } catch (Exception e) {
@@ -514,6 +514,7 @@ public class MainActivity extends Activity {
             return;
         }
         renderHome();
+        refreshHomeCatalogItems(false);
     }
 
     void leaveStartupHomeWait() {
@@ -1021,6 +1022,7 @@ public class MainActivity extends Activity {
             movies = cachedMovies;
             series = cachedSeries;
             renderHome();
+            refreshHomeCatalogItems(false);
             maybeRefreshHomeCatalog();
             return;
         }
@@ -2489,29 +2491,23 @@ public class MainActivity extends Activity {
                         () -> getArray("/api/v1/catalog?library=movies"));
                 java.util.concurrent.Future<JSONArray> seriesFuture = io.submit(
                         () -> getArray("/api/v1/catalog?library=series"));
-                java.util.concurrent.Future<JSONArray> homeCatalogFuture = io.submit(
-                        () -> getArray("/api/v1/catalog/home"));
                 JSONArray m = movieFuture.get();
                 JSONArray s = seriesFuture.get();
-                List<JSONObject> homeCatalogList;
-                try { homeCatalogList = toList(homeCatalogFuture.get()); }
-                catch (Exception ignored) {
-                    homeCatalogList = rootPlayableItems(toList(m), toList(s));
-                }
-                final List<JSONObject> resolvedHomeCatalog = homeCatalogList;
                 List<JSONObject> movieList = toList(m);
                 List<JSONObject> seriesList = toList(s);
+                List<JSONObject> homeCatalogList = rootPlayableItems(movieList, seriesList);
                 sortNewestFirst(movieList);
                 sortNewestFirst(seriesList);
                 runOnUiThread(() -> {
                     movies = movieList;
                     series = seriesList;
-                    homeCatalog = resolvedHomeCatalog;
+                    homeCatalog = homeCatalogList;
                     putCatalogList("movies", null, movieList);
                     putCatalogList("series", null, seriesList);
                     catalogVersion = "";
                     lastCatalogVersionCheckMs = System.currentTimeMillis();
                     renderHome();
+                    refreshHomeCatalogItems(true);
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> renderError(e.getMessage()));
@@ -2541,6 +2537,30 @@ public class MainActivity extends Activity {
     void sortNewestFirst(List<JSONObject> nodes) {
         Collections.sort(nodes, (left, right) -> newestCatalogTimestamp(right)
                 .compareTo(newestCatalogTimestamp(left)));
+    }
+
+    void refreshHomeCatalogItems(boolean force) {
+        long now = System.currentTimeMillis();
+        if (homeCatalogRefreshRunning || (!force && now - homeCatalogUpdatedAtMs < 5L * 60L * 1000L)) return;
+        homeCatalogRefreshRunning = true;
+        io.execute(() -> {
+            List<JSONObject> rows = null;
+            try { rows = toList(getArray("/api/v1/catalog/home")); }
+            catch (Exception ignored) { }
+            List<JSONObject> result = rows;
+            runOnUiThread(() -> {
+                homeCatalogRefreshRunning = false;
+                if (result == null) return;
+                homeCatalog = result;
+                homeCatalogUpdatedAtMs = System.currentTimeMillis();
+                if (activityResumed && !showingDetail && !showingAdmin && !showingProfiles
+                        && !libraryMode && "home".equals(selectedSection)) {
+                    int previousY = contentScroller == null ? 0 : contentScroller.getScrollY();
+                    pendingListingRestoreY = previousY;
+                    renderHome();
+                }
+            });
+        });
     }
 
     String newestCatalogTimestamp(JSONObject node) {
@@ -2659,14 +2679,8 @@ public class MainActivity extends Activity {
                         () -> getArray(catalogListingPath("movies", null)));
                 java.util.concurrent.Future<JSONArray> seriesFuture = io.submit(
                         () -> getArray(catalogListingPath("series", null)));
-                java.util.concurrent.Future<JSONArray> homeCatalogFuture = io.submit(
-                        () -> getArray("/api/v1/catalog/home"));
                 List<JSONObject> movieList = toList(movieFuture.get());
                 List<JSONObject> seriesList = toList(seriesFuture.get());
-                List<JSONObject> homeCatalogList;
-                try { homeCatalogList = toList(homeCatalogFuture.get()); }
-                catch (Exception ignored) { homeCatalogList = rootPlayableItems(movieList, seriesList); }
-                final List<JSONObject> resolvedHomeCatalog = homeCatalogList;
                 sortNewestFirst(movieList);
                 sortNewestFirst(seriesList);
                 runOnUiThread(() -> {
@@ -2677,12 +2691,13 @@ public class MainActivity extends Activity {
                     putCatalogList("series", null, seriesList);
                     movies = movieList;
                     series = seriesList;
-                    homeCatalog = resolvedHomeCatalog;
+                    homeCatalog = rootPlayableItems(movieList, seriesList);
                     if (!libraryMode && !showingDetail && !showingAdmin && !metadataEditorMode) {
                         int previousY = contentScroller == null ? 0 : contentScroller.getScrollY();
                         pendingListingRestoreY = previousY;
                         renderHome();
                     }
+                    refreshHomeCatalogItems(true);
                 });
             } catch (Exception ignored) {
                 runOnUiThread(() -> catalogVersionCheckRunning = false);
@@ -6301,6 +6316,8 @@ public class MainActivity extends Activity {
                 return "Zerbitzaria eguneratzeko prest.";
             case "No se pudo consultar el estado de la actualización.":
                 return "Ezin izan da eguneraketaren egoera kontsultatu.";
+            case "El servidor se está reiniciando; esperando respuesta…":
+                return "Zerbitzaria berrabiarazten ari da; erantzunaren zain…";
             case "No se pudo iniciar la actualización: ":
                 return "Ezin izan da eguneraketa hasi: ";
             case "Motivo no disponible.": return "Ez dago arrazoirik eskuragarri.";
@@ -8010,8 +8027,8 @@ public class MainActivity extends Activity {
             } catch (Exception error) {
                 runOnUiThread(() -> {
                     if (!showingDownloadManagement || status.getParent() == null) return;
-                    status.setText(t("No se pudo consultar el estado de la actualización.")
-                            + "\n" + error.getMessage());
+                    status.setText(t("El servidor se está reiniciando; esperando respuesta…")
+                            + "\n" + (error.getMessage() == null ? "" : error.getMessage()));
                     scheduleServerUpdatePoll(status, progress, update);
                 });
             }
