@@ -173,7 +173,6 @@ public class MainActivity extends Activity {
     final Handler nasDownloadHandler = new Handler(Looper.getMainLooper());
     final Handler downloadProgressHandler = new Handler(Looper.getMainLooper());
     final Handler contentRequestSearchHandler = new Handler(Looper.getMainLooper());
-    final Handler homeIdleHandler = new Handler(Looper.getMainLooper());
     final Handler incomingDownloadStatusHandler = new Handler(Looper.getMainLooper());
     Runnable contentRequestSearchTask;
     Runnable adminSyncPollTask;
@@ -181,9 +180,9 @@ public class MainActivity extends Activity {
     Runnable nasDownloadPollTask;
     Runnable serverUpdatePollTask;
     Runnable catalogDownloadStatusTask;
-    Runnable homeIdleTask;
     Runnable incomingDownloadStatusTask;
     boolean catalogDownloadStatusRequestRunning;
+    boolean catalogDownloadStatusLoaded;
     boolean incomingDownloadStatusRequestRunning;
     String incomingStatusRefreshedDownloadId = "";
     JSONObject catalogDownloadStatus = new JSONObject();
@@ -260,8 +259,7 @@ public class MainActivity extends Activity {
     List<JSONObject> startupSeries = new ArrayList<>();
     List<JSONObject> startupHomeCatalog = new ArrayList<>();
     List<JSONObject> homeCatalog = new ArrayList<>();
-    boolean homeCatalogRefreshRunning;
-    long homeCatalogUpdatedAtMs;
+    JSONObject startupDownloadStatus;
     JSONArray startupRemoteProfiles;
     String startupPrefetchError;
     volatile JSONArray incomingFilesCache;
@@ -434,6 +432,10 @@ public class MainActivity extends Activity {
                         () -> getArray("/api/v1/catalog?library=movies"));
                 java.util.concurrent.Future<JSONArray> seriesFuture = io.submit(
                         () -> getArray("/api/v1/catalog?library=series"));
+                java.util.concurrent.Future<JSONArray> homeFuture = io.submit(
+                        () -> getArray("/api/v1/catalog/home"));
+                java.util.concurrent.Future<JSONObject> downloadFuture = io.submit(
+                        () -> getJson("/api/v1/download-status"));
                 java.util.concurrent.Future<JSONArray> profilesFuture = readProfiles().isEmpty()
                         ? io.submit(() -> getAuthorizedProfileArray("/api/v1/profiles")) : null;
                 JSONArray movieRows = movieFuture.get();
@@ -442,7 +444,10 @@ public class MainActivity extends Activity {
                 catch (Exception ignored) { }
                 movieList = toList(movieRows);
                 seriesList = toList(seriesRows);
-                homeList = rootPlayableItems(movieList, seriesList);
+                try { homeList = toList(homeFuture.get()); }
+                catch (Exception ignored) { homeList = rootPlayableItems(movieList, seriesList); }
+                try { startupDownloadStatus = downloadFuture.get(); }
+                catch (Exception ignored) { startupDownloadStatus = null; }
                 sortNewestFirst(movieList);
                 sortNewestFirst(seriesList);
             } catch (Exception e) {
@@ -464,6 +469,7 @@ public class MainActivity extends Activity {
         List<JSONObject> movieList;
         List<JSONObject> seriesList;
         List<JSONObject> homeCatalogList;
+        JSONObject downloadStatus;
         JSONArray remoteProfiles;
         String error;
         synchronized (this) {
@@ -473,6 +479,7 @@ public class MainActivity extends Activity {
             movieList = startupMovies;
             seriesList = startupSeries;
             homeCatalogList = startupHomeCatalog;
+            downloadStatus = startupDownloadStatus;
             remoteProfiles = startupRemoteProfiles;
             error = startupPrefetchError;
         }
@@ -498,6 +505,10 @@ public class MainActivity extends Activity {
         movies = movieList == null ? new ArrayList<>() : movieList;
         series = seriesList == null ? new ArrayList<>() : seriesList;
         homeCatalog = homeCatalogList == null ? rootPlayableItems(movies, series) : homeCatalogList;
+        if (downloadStatus != null) {
+            catalogDownloadStatus = downloadStatus;
+            catalogDownloadStatusLoaded = true;
+        }
         if (remoteProfiles != null) mergeRemoteProfiles(remoteProfiles);
         putCatalogList("movies", null, movies);
         putCatalogList("series", null, series);
@@ -514,7 +525,6 @@ public class MainActivity extends Activity {
             return;
         }
         renderHome();
-        refreshHomeCatalogItems(false);
     }
 
     void leaveStartupHomeWait() {
@@ -1022,8 +1032,6 @@ public class MainActivity extends Activity {
             movies = cachedMovies;
             series = cachedSeries;
             renderHome();
-            refreshHomeCatalogItems(false);
-            maybeRefreshHomeCatalog();
             return;
         }
         showLoading("Conectando con tu biblioteca…");
@@ -2491,23 +2499,27 @@ public class MainActivity extends Activity {
                         () -> getArray("/api/v1/catalog?library=movies"));
                 java.util.concurrent.Future<JSONArray> seriesFuture = io.submit(
                         () -> getArray("/api/v1/catalog?library=series"));
+                java.util.concurrent.Future<JSONArray> homeFuture = io.submit(
+                        () -> getArray("/api/v1/catalog/home"));
                 JSONArray m = movieFuture.get();
                 JSONArray s = seriesFuture.get();
                 List<JSONObject> movieList = toList(m);
                 List<JSONObject> seriesList = toList(s);
-                List<JSONObject> homeCatalogList = rootPlayableItems(movieList, seriesList);
+                List<JSONObject> homeCatalogList;
+                try { homeCatalogList = toList(homeFuture.get()); }
+                catch (Exception ignored) { homeCatalogList = rootPlayableItems(movieList, seriesList); }
+                final List<JSONObject> resolvedHomeCatalog = homeCatalogList;
                 sortNewestFirst(movieList);
                 sortNewestFirst(seriesList);
                 runOnUiThread(() -> {
                     movies = movieList;
                     series = seriesList;
-                    homeCatalog = homeCatalogList;
+                    homeCatalog = resolvedHomeCatalog;
                     putCatalogList("movies", null, movieList);
                     putCatalogList("series", null, seriesList);
                     catalogVersion = "";
                     lastCatalogVersionCheckMs = System.currentTimeMillis();
                     renderHome();
-                    refreshHomeCatalogItems(true);
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> renderError(e.getMessage()));
@@ -2537,30 +2549,6 @@ public class MainActivity extends Activity {
     void sortNewestFirst(List<JSONObject> nodes) {
         Collections.sort(nodes, (left, right) -> newestCatalogTimestamp(right)
                 .compareTo(newestCatalogTimestamp(left)));
-    }
-
-    void refreshHomeCatalogItems(boolean force) {
-        long now = System.currentTimeMillis();
-        if (homeCatalogRefreshRunning || (!force && now - homeCatalogUpdatedAtMs < 5L * 60L * 1000L)) return;
-        homeCatalogRefreshRunning = true;
-        io.execute(() -> {
-            List<JSONObject> rows = null;
-            try { rows = toList(getArray("/api/v1/catalog/home")); }
-            catch (Exception ignored) { }
-            List<JSONObject> result = rows;
-            runOnUiThread(() -> {
-                homeCatalogRefreshRunning = false;
-                if (result == null) return;
-                homeCatalog = result;
-                homeCatalogUpdatedAtMs = System.currentTimeMillis();
-                if (activityResumed && !showingDetail && !showingAdmin && !showingProfiles
-                        && !libraryMode && "home".equals(selectedSection)) {
-                    int previousY = contentScroller == null ? 0 : contentScroller.getScrollY();
-                    pendingListingRestoreY = previousY;
-                    renderHome();
-                }
-            });
-        });
     }
 
     String newestCatalogTimestamp(JSONObject node) {
@@ -2662,49 +2650,6 @@ public class MainActivity extends Activity {
         });
     }
 
-    void maybeRefreshHomeCatalog() {
-        long now = System.currentTimeMillis();
-        if (catalogVersionCheckRunning || now - lastCatalogVersionCheckMs < CATALOG_CACHE_TTL_MS) return;
-        catalogVersionCheckRunning = true;
-        lastCatalogVersionCheckMs = now;
-        String knownVersion = catalogVersion;
-        io.execute(() -> {
-            String remoteVersion = fetchCatalogVersionSafely();
-            if (!remoteVersion.isEmpty() && remoteVersion.equals(knownVersion)) {
-                runOnUiThread(() -> catalogVersionCheckRunning = false);
-                return;
-            }
-            try {
-                java.util.concurrent.Future<JSONArray> movieFuture = io.submit(
-                        () -> getArray(catalogListingPath("movies", null)));
-                java.util.concurrent.Future<JSONArray> seriesFuture = io.submit(
-                        () -> getArray(catalogListingPath("series", null)));
-                List<JSONObject> movieList = toList(movieFuture.get());
-                List<JSONObject> seriesList = toList(seriesFuture.get());
-                sortNewestFirst(movieList);
-                sortNewestFirst(seriesList);
-                runOnUiThread(() -> {
-                    catalogVersionCheckRunning = false;
-                    if (!remoteVersion.isEmpty() && !remoteVersion.equals(catalogVersion)) clearCatalogCache();
-                    if (!remoteVersion.isEmpty()) catalogVersion = remoteVersion;
-                    putCatalogList("movies", null, movieList);
-                    putCatalogList("series", null, seriesList);
-                    movies = movieList;
-                    series = seriesList;
-                    homeCatalog = rootPlayableItems(movieList, seriesList);
-                    if (!libraryMode && !showingDetail && !showingAdmin && !metadataEditorMode) {
-                        int previousY = contentScroller == null ? 0 : contentScroller.getScrollY();
-                        pendingListingRestoreY = previousY;
-                        renderHome();
-                    }
-                    refreshHomeCatalogItems(true);
-                });
-            } catch (Exception ignored) {
-                runOnUiThread(() -> catalogVersionCheckRunning = false);
-            }
-        });
-    }
-
     boolean isCatalogDownloadScreenVisible() {
         return activityResumed && page != null && content != null && !showingAdmin
                 && !showingDetail && !showingProfiles && !metadataEditorMode
@@ -2716,6 +2661,13 @@ public class MainActivity extends Activity {
     void startCatalogDownloadStatusPolling() {
         if (!isCatalogDownloadScreenVisible() || catalogDownloadStatusTask != null
                 || catalogDownloadStatusRequestRunning) return;
+        if (catalogDownloadStatusLoaded) {
+            refreshVisibleDownloadPosters(content);
+            boolean active = "starting".equals(catalogDownloadStatus.optString("status"))
+                    || "running".equals(catalogDownloadStatus.optString("status"));
+            scheduleCatalogDownloadStatusPolling(active ? 2000L : 30000L);
+            return;
+        }
         requestCatalogDownloadStatus();
     }
 
@@ -2733,6 +2685,7 @@ public class MainActivity extends Activity {
                 if (!isCatalogDownloadScreenVisible()) return;
                 if (result != null) {
                     catalogDownloadStatus = result;
+                    catalogDownloadStatusLoaded = true;
                     refreshVisibleDownloadPosters(content);
                 }
                 boolean active = result != null && ("starting".equals(result.optString("status"))
@@ -2860,29 +2813,7 @@ public class MainActivity extends Activity {
         }
         restoreListingScrollIfPending();
         restorePendingFocus();
-        scheduleHomeIdleWork();
         startCatalogDownloadStatusPolling();
-    }
-
-    void scheduleHomeIdleWork() {
-        if (homeIdleTask != null) homeIdleHandler.removeCallbacks(homeIdleTask);
-        if (!activityResumed || showingDetail || showingAdmin || showingProfiles
-                || !"home".equals(selectedSection)) return;
-        homeIdleTask = () -> {
-            homeIdleTask = null;
-            if (activityResumed && !showingDetail && !showingAdmin && !showingProfiles
-                    && "home".equals(selectedSection)) {
-                synchronizeProfilesFromServer(false);
-                backfillMissingSeriesSuggestions();
-            }
-        };
-        homeIdleHandler.postDelayed(homeIdleTask, 10000L);
-    }
-
-    @Override public void onUserInteraction() {
-        super.onUserInteraction();
-        if ("home".equals(selectedSection) && !showingDetail && !showingAdmin)
-            scheduleHomeIdleWork();
     }
 
     void collectPendingHomeItems(JSONObject node, String parentSeriesTitle,
@@ -7534,13 +7465,16 @@ public class MainActivity extends Activity {
             try {
                 List<JSONObject> updatedMovies = toList(getArray(catalogListingPath("movies", null)));
                 List<JSONObject> updatedSeries = toList(getArray(catalogListingPath("series", null)));
+                List<JSONObject> updatedHome = toList(getArray("/api/v1/catalog/home"));
                 sortNewestFirst(updatedMovies);
                 sortNewestFirst(updatedSeries);
                 String version = fetchCatalogVersionSafely();
+                final List<JSONObject> homeSnapshot = updatedHome;
                 runOnUiThread(() -> {
                     clearCatalogCache();
                     movies = updatedMovies;
                     series = updatedSeries;
+                    homeCatalog = homeSnapshot;
                     putCatalogList("movies", null, movies);
                     putCatalogList("series", null, series);
                     if (!version.isEmpty()) catalogVersion = version;
@@ -10119,9 +10053,8 @@ public class MainActivity extends Activity {
                 scheduleProfileStateSync();
             }
             if (!startupPrefetchPending) {
-                if ("home".equals(selectedSection) && !showingAdmin && !showingDetail)
-                    scheduleHomeIdleWork();
-                else synchronizeProfilesFromServer(false);
+                if (!"home".equals(selectedSection) || showingAdmin || showingDetail)
+                    synchronizeProfilesFromServer(false);
             }
         } else hasResumedOnce = true;
         if (prefs != null && page != null && "home".equals(selectedSection)
@@ -10130,7 +10063,6 @@ public class MainActivity extends Activity {
             int scrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
             renderHome();
             if (contentScroller != null) contentScroller.post(() -> contentScroller.scrollTo(0, scrollY));
-            maybeRefreshHomeCatalog();
         } else if (prefs != null && libraryMode && !showingDetail && !showingAdmin && !metadataEditorMode) {
             if (breadcrumbs.isEmpty()) maybeRefreshCatalogListing(currentLibrary, null);
             else maybeRefreshCatalogListing(currentLibrary,
@@ -10147,10 +10079,6 @@ public class MainActivity extends Activity {
             catalogDownloadStatusTask = null;
         }
         stopIncomingDownloadStatusPolling();
-        if (homeIdleTask != null) {
-            homeIdleHandler.removeCallbacks(homeIdleTask);
-            homeIdleTask = null;
-        }
         super.onPause();
     }
 
