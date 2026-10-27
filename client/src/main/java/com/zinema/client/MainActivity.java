@@ -173,13 +173,19 @@ public class MainActivity extends Activity {
     final Handler nasDownloadHandler = new Handler(Looper.getMainLooper());
     final Handler downloadProgressHandler = new Handler(Looper.getMainLooper());
     final Handler contentRequestSearchHandler = new Handler(Looper.getMainLooper());
+    final Handler homeIdleHandler = new Handler(Looper.getMainLooper());
+    final Handler incomingDownloadStatusHandler = new Handler(Looper.getMainLooper());
     Runnable contentRequestSearchTask;
     Runnable adminSyncPollTask;
     Runnable incomingCatalogSyncPollTask;
     Runnable nasDownloadPollTask;
     Runnable serverUpdatePollTask;
     Runnable catalogDownloadStatusTask;
+    Runnable homeIdleTask;
+    Runnable incomingDownloadStatusTask;
     boolean catalogDownloadStatusRequestRunning;
+    boolean incomingDownloadStatusRequestRunning;
+    String incomingStatusRefreshedDownloadId = "";
     JSONObject catalogDownloadStatus = new JSONObject();
     LinearLayout adminContentRequestsSlot;
     LinearLayout adminManualTelegramDownloadsSlot;
@@ -252,12 +258,8 @@ public class MainActivity extends Activity {
     boolean startupHomeAwaiting;
     List<JSONObject> startupMovies = new ArrayList<>();
     List<JSONObject> startupSeries = new ArrayList<>();
-    JSONArray startupItems;
     JSONArray startupRemoteProfiles;
-    JSONObject startupRemoteProfileState;
-    String startupRemoteStateProfileId = "";
     String startupPrefetchError;
-    String startupCatalogVersion = "";
     volatile JSONArray incomingFilesCache;
     String adminReturnDetailId = "";
     String editingProfileId = "";
@@ -325,7 +327,6 @@ public class MainActivity extends Activity {
                     startStartupPrefetch();
                     showIntro();
                 });
-                if (isAdmin) prefetchIncomingVideosForAdmin();
             } catch (Exception e) {
                 String message = e.getMessage() == null ? "" : e.getMessage();
                 if (message.contains("HTTP 401") || message.contains("HTTP 403")) {
@@ -420,31 +421,19 @@ public class MainActivity extends Activity {
         io.execute(() -> {
             List<JSONObject> movieList = null;
             List<JSONObject> seriesList = null;
-            JSONArray items = null;
             JSONArray remoteProfiles = null;
-            JSONObject remoteState = null;
-            String remoteStateProfileId = "";
             String error = null;
-            String version = "";
             try {
-                JSONArray movieRows = getArray("/api/v1/catalog?library=movies");
-                JSONArray seriesRows = getArray("/api/v1/catalog?library=series");
-                items = getArray("/api/v1/items?limit=500");
-                try { version = getJson("/api/v1/catalog/version").optString("version", ""); }
+                java.util.concurrent.Future<JSONArray> movieFuture = io.submit(
+                        () -> getArray("/api/v1/catalog?library=movies"));
+                java.util.concurrent.Future<JSONArray> seriesFuture = io.submit(
+                        () -> getArray("/api/v1/catalog?library=series"));
+                java.util.concurrent.Future<JSONArray> profilesFuture = readProfiles().isEmpty()
+                        ? io.submit(() -> getAuthorizedProfileArray("/api/v1/profiles")) : null;
+                JSONArray movieRows = movieFuture.get();
+                JSONArray seriesRows = seriesFuture.get();
+                try { if (profilesFuture != null) remoteProfiles = profilesFuture.get(); }
                 catch (Exception ignored) { }
-                if (!clientApiToken().isEmpty()) {
-                    try {
-                        remoteProfiles = getAuthorizedProfileArray("/api/v1/profiles");
-                        remoteStateProfileId = prefs.getString("active_profile", "");
-                        if (remoteStateProfileId.isEmpty() && remoteProfiles.length() > 0) {
-                            remoteStateProfileId = remoteProfiles.optJSONObject(0).optString("id", "");
-                        }
-                        if (!remoteStateProfileId.isEmpty()) {
-                            remoteState = getAuthorizedProfileJson("/api/v1/profiles/" +
-                                    enc(remoteStateProfileId) + "/state");
-                        }
-                    } catch (Exception ignored) { }
-                }
                 movieList = toList(movieRows);
                 seriesList = toList(seriesRows);
                 sortNewestFirst(movieList);
@@ -455,11 +444,7 @@ public class MainActivity extends Activity {
             synchronized (MainActivity.this) {
                 startupMovies = movieList;
                 startupSeries = seriesList;
-                startupItems = items;
                 startupRemoteProfiles = remoteProfiles;
-                startupRemoteProfileState = remoteState;
-                startupRemoteStateProfileId = remoteStateProfileId;
-                startupCatalogVersion = version;
                 startupPrefetchError = error;
                 startupPrefetchReady = true;
             }
@@ -470,23 +455,15 @@ public class MainActivity extends Activity {
     void consumeStartupPrefetch() {
         List<JSONObject> movieList;
         List<JSONObject> seriesList;
-        JSONArray items;
         JSONArray remoteProfiles;
-        JSONObject remoteState;
-        String remoteStateProfileId;
         String error;
-        String version;
         synchronized (this) {
             if (!startupPrefetchPending || !startupPrefetchReady || !startupHomeAwaiting) return;
             startupPrefetchPending = false;
             startupHomeAwaiting = false;
             movieList = startupMovies;
             seriesList = startupSeries;
-            items = startupItems;
             remoteProfiles = startupRemoteProfiles;
-            remoteState = startupRemoteProfileState;
-            remoteStateProfileId = startupRemoteStateProfileId;
-            version = startupCatalogVersion;
             error = startupPrefetchError;
         }
         boolean hasRemoteProfiles = false;
@@ -513,19 +490,8 @@ public class MainActivity extends Activity {
         if (remoteProfiles != null) mergeRemoteProfiles(remoteProfiles);
         putCatalogList("movies", null, movies);
         putCatalogList("series", null, series);
-        catalogVersion = version == null ? "" : version;
+        catalogVersion = "";
         lastCatalogVersionCheckMs = System.currentTimeMillis();
-        if (items != null) cachePosterByStream(items);
-        if (remoteProfiles != null) lastProfileSyncMs = System.currentTimeMillis();
-        if (remoteState != null && remoteStateProfileId.equals(activeProfileId())) {
-            JSONObject state = remoteState.optJSONObject("state");
-            boolean localDirty = prefs.getBoolean(profileStateDirtyKey(remoteStateProfileId), false);
-            boolean localHasState = collectProfileState(remoteStateProfileId).keys().hasNext();
-            if (localDirty || (remoteState.optInt("revision") == 0 && localHasState)) {
-                if (localHasState) scheduleProfileStateSync();
-                else if (state != null) applyProfileState(remoteStateProfileId, state);
-            } else if (state != null) applyProfileState(remoteStateProfileId, state);
-        }
         if (readProfiles().isEmpty()) {
             if (!profileEditorVisible) openProfileManager();
             return;
@@ -834,7 +800,10 @@ public class MainActivity extends Activity {
         tab.addView(indicator, indicatorParams);
         tab.setFocusable(true);
         tab.setClickable(true);
-        tab.setOnClickListener(v -> action.run());
+        tab.setOnClickListener(v -> {
+            if (active && !"A–Z".equals(title)) return;
+            action.run();
+        });
         applyTvFocusStyle(tab, false);
         return tab;
     }
@@ -1005,6 +974,7 @@ public class MainActivity extends Activity {
     }
 
     void loadHome() {
+        stopIncomingDownloadStatusPolling();
         showingDownloadManagement = false;
         showingAdmin = false;
         if (clientApiToken().isEmpty()) {
@@ -1672,6 +1642,7 @@ public class MainActivity extends Activity {
             return;
         }
         leaveStartupHomeWait();
+        stopIncomingDownloadStatusPolling();
         if (!showingAdmin) adminReturnDetailId = showingDetail ? detailNodeId : "";
         showingAdmin = true;
         showingDownloadManagement = false;
@@ -2503,21 +2474,22 @@ public class MainActivity extends Activity {
     void fetchHomeFromServer() {
         io.execute(() -> {
             try {
-                JSONArray m = getArray("/api/v1/catalog?library=movies");
-                JSONArray s = getArray("/api/v1/catalog?library=series");
-                JSONArray allItems = getArray("/api/v1/items?limit=500");
-                String version = fetchCatalogVersionSafely();
+                java.util.concurrent.Future<JSONArray> movieFuture = io.submit(
+                        () -> getArray("/api/v1/catalog?library=movies"));
+                java.util.concurrent.Future<JSONArray> seriesFuture = io.submit(
+                        () -> getArray("/api/v1/catalog?library=series"));
+                JSONArray m = movieFuture.get();
+                JSONArray s = seriesFuture.get();
                 List<JSONObject> movieList = toList(m);
                 List<JSONObject> seriesList = toList(s);
                 sortNewestFirst(movieList);
                 sortNewestFirst(seriesList);
-                cachePosterByStream(allItems);
                 runOnUiThread(() -> {
                     movies = movieList;
                     series = seriesList;
                     putCatalogList("movies", null, movieList);
                     putCatalogList("series", null, seriesList);
-                    catalogVersion = version;
+                    catalogVersion = "";
                     lastCatalogVersionCheckMs = System.currentTimeMillis();
                     renderHome();
                 });
@@ -2654,11 +2626,14 @@ public class MainActivity extends Activity {
                 return;
             }
             try {
-                List<JSONObject> movieList = toList(getArray(catalogListingPath("movies", null)));
-                List<JSONObject> seriesList = toList(getArray(catalogListingPath("series", null)));
+                java.util.concurrent.Future<JSONArray> movieFuture = io.submit(
+                        () -> getArray(catalogListingPath("movies", null)));
+                java.util.concurrent.Future<JSONArray> seriesFuture = io.submit(
+                        () -> getArray(catalogListingPath("series", null)));
+                List<JSONObject> movieList = toList(movieFuture.get());
+                List<JSONObject> seriesList = toList(seriesFuture.get());
                 sortNewestFirst(movieList);
                 sortNewestFirst(seriesList);
-                JSONArray items = getArray("/api/v1/items?limit=500");
                 runOnUiThread(() -> {
                     catalogVersionCheckRunning = false;
                     if (!remoteVersion.isEmpty() && !remoteVersion.equals(catalogVersion)) clearCatalogCache();
@@ -2667,7 +2642,6 @@ public class MainActivity extends Activity {
                     putCatalogList("series", null, seriesList);
                     movies = movieList;
                     series = seriesList;
-                    cachePosterByStream(items);
                     if (!libraryMode && !showingDetail && !showingAdmin && !metadataEditorMode) {
                         int previousY = contentScroller == null ? 0 : contentScroller.getScrollY();
                         pendingListingRestoreY = previousY;
@@ -2831,8 +2805,29 @@ public class MainActivity extends Activity {
         }
         restoreListingScrollIfPending();
         restorePendingFocus();
-        backfillMissingSeriesSuggestions();
+        scheduleHomeIdleWork();
         startCatalogDownloadStatusPolling();
+    }
+
+    void scheduleHomeIdleWork() {
+        if (homeIdleTask != null) homeIdleHandler.removeCallbacks(homeIdleTask);
+        if (!activityResumed || showingDetail || showingAdmin || showingProfiles
+                || !"home".equals(selectedSection)) return;
+        homeIdleTask = () -> {
+            homeIdleTask = null;
+            if (activityResumed && !showingDetail && !showingAdmin && !showingProfiles
+                    && "home".equals(selectedSection)) {
+                synchronizeProfilesFromServer(false);
+                backfillMissingSeriesSuggestions();
+            }
+        };
+        homeIdleHandler.postDelayed(homeIdleTask, 10000L);
+    }
+
+    @Override public void onUserInteraction() {
+        super.onUserInteraction();
+        if ("home".equals(selectedSection) && !showingDetail && !showingAdmin)
+            scheduleHomeIdleWork();
     }
 
     void collectPendingHomeItems(JSONObject node, String parentSeriesTitle,
@@ -6156,8 +6151,8 @@ public class MainActivity extends Activity {
             case "Gestión descargas": return "Deskargen kudeaketa";
             case "No se encontraron pósteres.": return "Ez da posterik aurkitu.";
             case "Reproductor": return "Erreproduzitzailea";
-            case "VLC devuelve posición y duración al terminar. El reproductor de Zinema incluye controles y guarda el progreso mientras ves el vídeo.":
-                return "VLCk posizioa eta iraupena itzultzen ditu amaitzean. Zinemaren erreproduzitzaileak kontrolak ditu eta bideoa ikusten duzun bitartean aurrerapena gordetzen du.";
+            case "Zinema prioriza el audio en euskera y después en español; inicia sin subtítulos. VLC usa sus propias preferencias.":
+                return "Zinemak euskarazko audioari ematen dio lehentasuna, eta ondoren gaztelaniazkoari; azpititulurik gabe hasten da. VLCk bere hobespenak erabiltzen ditu.";
             case "Reproductor de Zinema": return "Zinemaren erreproduzitzailea";
             case "Cuentas pendientes de aprobación": return "Onarpenaren zain dauden kontuak";
             case "Estas cuentas todavía no pueden acceder a la biblioteca.":
@@ -7567,6 +7562,7 @@ public class MainActivity extends Activity {
             return;
         }
         leaveStartupHomeWait();
+        stopIncomingDownloadStatusPolling();
         if (!showingAdmin) adminReturnDetailId = showingDetail ? detailNodeId : "";
         showingAdmin = true;
         showingDownloadManagement = false;
@@ -7771,7 +7767,7 @@ public class MainActivity extends Activity {
         playerCardParams.topMargin = d(14);
         screen.addView(playerCard, playerCardParams);
         playerCard.addView(label("Reproductor", 14, Color.WHITE, true));
-        TextView playerHint = label("VLC devuelve posición y duración al terminar. El reproductor de Zinema incluye controles y guarda el progreso mientras ves el vídeo.",
+        TextView playerHint = label("Zinema prioriza el audio en euskera y después en español; inicia sin subtítulos. VLC usa sus propias preferencias.",
                 12, MUTED, false);
         LinearLayout.LayoutParams playerHintParams = new LinearLayout.LayoutParams(-1, -2);
         playerHintParams.topMargin = d(5);
@@ -8621,6 +8617,14 @@ public class MainActivity extends Activity {
                                         ? "Contraer capítulos" : "Expandir capítulos"));
                             });
                         }
+                        if (hasTelegramDownloads && !isSeriesRequest) {
+                            for (int j = 0; j < telegramDownloads.length(); j++) {
+                                JSONObject candidate = telegramDownloads.optJSONObject(j);
+                                if (candidate != null)
+                                    addRequestDownloadProgressRow(detailsColumn,
+                                            candidate.optInt("message_id"));
+                            }
+                        }
                         LinearLayout actions = new LinearLayout(this);
                         actions.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
                         LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(-1, -2);
@@ -8711,6 +8715,68 @@ public class MainActivity extends Activity {
         if (adminManualTelegramDownloadsSlot != null)
             updateContentRequestDownloadIndicators(adminManualTelegramDownloadsSlot, active,
                     currentMessageId, percent);
+        if (active) scheduleIncomingDownloadStatusPoll(1000L);
+        else if (isDownloadManagementVisible()) {
+            if ("completed".equals(downloadStatus)) refreshCompletedDownloadLists(state);
+            scheduleIncomingDownloadStatusPoll(60000L);
+        }
+    }
+
+    boolean isDownloadManagementVisible() {
+        return activityResumed && showingAdmin && showingDownloadManagement
+                && content != null && !isFinishing();
+    }
+
+    void scheduleIncomingDownloadStatusPoll(long delayMs) {
+        if (!isDownloadManagementVisible()) return;
+        if (incomingDownloadStatusTask != null)
+            incomingDownloadStatusHandler.removeCallbacks(incomingDownloadStatusTask);
+        incomingDownloadStatusTask = () -> {
+            incomingDownloadStatusTask = null;
+            pollIncomingDownloadStatus();
+        };
+        incomingDownloadStatusHandler.postDelayed(incomingDownloadStatusTask, delayMs);
+    }
+
+    void stopIncomingDownloadStatusPolling() {
+        if (incomingDownloadStatusTask != null)
+            incomingDownloadStatusHandler.removeCallbacks(incomingDownloadStatusTask);
+        incomingDownloadStatusTask = null;
+    }
+
+    void pollIncomingDownloadStatus() {
+        if (!isDownloadManagementVisible() || incomingDownloadStatusRequestRunning) return;
+        incomingDownloadStatusRequestRunning = true;
+        io.execute(() -> {
+            JSONObject state = null;
+            try { state = getJson("/api/v1/admin/incoming-download"); }
+            catch (Exception ignored) { }
+            JSONObject result = state;
+            runOnUiThread(() -> {
+                incomingDownloadStatusRequestRunning = false;
+                if (!isDownloadManagementVisible()) return;
+                if (result == null) {
+                    scheduleIncomingDownloadStatusPoll(5000L);
+                    return;
+                }
+                refreshContentRequestDownloadIndicators(result);
+            });
+        });
+    }
+
+    void refreshCompletedDownloadLists(JSONObject state) {
+        String downloadId = state.optString("id", "");
+        if (downloadId.isEmpty() || downloadId.equals(incomingStatusRefreshedDownloadId)) return;
+        incomingStatusRefreshedDownloadId = downloadId;
+        if (adminContentRequestsSlot != null)
+            loadContentRequestControls(adminContentRequestsSlot);
+        if (adminManualTelegramDownloadsSlot != null)
+            loadManualTelegramDownloadControls(adminManualTelegramDownloadsSlot);
+        if ("telegram-manual".equals(state.optString("source"))) {
+            monitorIncomingCatalogSync(state.optString("catalog_sync_job_id", ""),
+                    state.optString("catalog_sync_previous_job_id", ""),
+                    state.optBoolean("catalog_sync_queued"));
+        }
     }
 
     void loadManualTelegramDownloadControls(LinearLayout slot) {
@@ -8834,8 +8900,10 @@ public class MainActivity extends Activity {
         io.execute(() -> {
             try {
                 postJson("/api/v1/admin/telegram-manual-downloads/" + messageId + "/download");
-                runOnUiThread(() -> Toast.makeText(this,
-                        t("Descarga iniciada en Incoming."), Toast.LENGTH_LONG).show());
+                runOnUiThread(() -> {
+                    Toast.makeText(this, t("Descarga iniciada en Incoming."), Toast.LENGTH_LONG).show();
+                    scheduleIncomingDownloadStatusPoll(0L);
+                });
             } catch (Exception error) {
                 runOnUiThread(() -> {
                     if (episode) setRequestEpisodeLoading(messageId, false);
@@ -8865,18 +8933,22 @@ public class MainActivity extends Activity {
             String tag = (String) tagValue;
             if (tag.startsWith("request-download-episode:")) {
                 int messageId = parseTaggedMessageId(tag);
-                View progressRow = view.findViewWithTag("request-download-progress-row:" + messageId);
-                View progressView = view.findViewWithTag("request-download-progress:" + messageId);
-                View percentView = view.findViewWithTag("request-download-percent:" + messageId);
                 boolean episodeActive = active && messageId > 0 && messageId == currentMessageId;
                 if (episodeActive) expandRequestEpisodePanel(view);
-                if (progressRow != null) progressRow.setVisibility(episodeActive ? View.VISIBLE : View.GONE);
-                if (progressView instanceof ProgressBar && episodeActive) {
+            } else if (tag.startsWith("request-download-progress-row:")) {
+                int messageId = parseTaggedMessageId(tag);
+                boolean itemActive = active && messageId > 0 && messageId == currentMessageId;
+                view.setVisibility(itemActive ? View.VISIBLE : View.GONE);
+                View progressView = ((ViewGroup) view)
+                        .findViewWithTag("request-download-progress:" + messageId);
+                View percentView = ((ViewGroup) view)
+                        .findViewWithTag("request-download-percent:" + messageId);
+                if (progressView instanceof ProgressBar && itemActive) {
                     ProgressBar bar = (ProgressBar) progressView;
                     bar.setIndeterminate(percent < 0.0);
                     if (percent >= 0.0) bar.setProgress((int) Math.round(percent));
                 }
-                if (percentView instanceof TextView && episodeActive)
+                if (percentView instanceof TextView && itemActive)
                     ((TextView) percentView).setText(percent >= 0.0
                             ? String.format(java.util.Locale.US, "%.0f%%", percent) : "…");
             } else if (tag.startsWith("request-download-button:")) {
@@ -8897,6 +8969,28 @@ public class MainActivity extends Activity {
                 updateContentRequestDownloadIndicators(group.getChildAt(i), active,
                         currentMessageId, percent);
         }
+    }
+
+    void addRequestDownloadProgressRow(LinearLayout parent, int messageId) {
+        if (parent == null || messageId <= 0) return;
+        LinearLayout progressRow = new LinearLayout(this);
+        progressRow.setGravity(Gravity.CENTER_VERTICAL);
+        progressRow.setVisibility(View.GONE);
+        progressRow.setTag("request-download-progress-row:" + messageId);
+        LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, d(16));
+        rowParams.topMargin = d(5);
+        parent.addView(progressRow, rowParams);
+        ProgressBar progress = new ProgressBar(this, null,
+                android.R.attr.progressBarStyleHorizontal);
+        progress.setMax(100);
+        progress.setProgressTintList(ColorStateList.valueOf(Color.WHITE));
+        progress.setProgressBackgroundTintList(ColorStateList.valueOf(0x66FFFFFF));
+        progress.setTag("request-download-progress:" + messageId);
+        progressRow.addView(progress, new LinearLayout.LayoutParams(0, d(6), 1));
+        TextView percent = label("", 10, Color.WHITE, true);
+        percent.setTag("request-download-percent:" + messageId);
+        percent.setPadding(d(6), 0, d(2), 0);
+        progressRow.addView(percent, new LinearLayout.LayoutParams(-2, -2));
     }
 
     void expandRequestEpisodePanel(View episodeRow) {
@@ -9005,6 +9099,7 @@ public class MainActivity extends Activity {
                     button.setText("");
                     button.setContentDescription(t("Descarga en curso…"));
                     Toast.makeText(this, t("Descarga iniciada en Incoming."), Toast.LENGTH_LONG).show();
+                    scheduleIncomingDownloadStatusPoll(0L);
                 });
             } catch (Exception error) {
                 runOnUiThread(() -> {
@@ -9348,7 +9443,6 @@ public class MainActivity extends Activity {
                         .putString("account_email", username).putBoolean("account_is_admin", isAdmin)
                         .remove("profile_sync_token").apply();
                 incomingFilesCache = null;
-                if (isAdmin) prefetchIncomingVideosForAdmin();
                 runOnUiThread(() -> {
                     passwordInput.setText("");
                     accountStatus.setVisibility(View.GONE);
@@ -9967,7 +10061,11 @@ public class MainActivity extends Activity {
             if (!activeId.isEmpty() && prefs.getBoolean(profileStateDirtyKey(activeId), false)) {
                 scheduleProfileStateSync();
             }
-            if (!startupPrefetchPending) synchronizeProfilesFromServer(false);
+            if (!startupPrefetchPending) {
+                if ("home".equals(selectedSection) && !showingAdmin && !showingDetail)
+                    scheduleHomeIdleWork();
+                else synchronizeProfilesFromServer(false);
+            }
         } else hasResumedOnce = true;
         if (prefs != null && page != null && "home".equals(selectedSection)
                 && !showingDetail && !showingAdmin && content != null
@@ -9982,6 +10080,7 @@ public class MainActivity extends Activity {
                     breadcrumbs.get(breadcrumbs.size() - 1).optString("id"));
         }
         startCatalogDownloadStatusPolling();
+        if (isDownloadManagementVisible()) pollIncomingDownloadStatus();
     }
 
     @Override protected void onPause() {
@@ -9989,6 +10088,11 @@ public class MainActivity extends Activity {
         if (catalogDownloadStatusTask != null) {
             downloadProgressHandler.removeCallbacks(catalogDownloadStatusTask);
             catalogDownloadStatusTask = null;
+        }
+        stopIncomingDownloadStatusPolling();
+        if (homeIdleTask != null) {
+            homeIdleHandler.removeCallbacks(homeIdleTask);
+            homeIdleTask = null;
         }
         super.onPause();
     }
@@ -10010,8 +10114,30 @@ public class MainActivity extends Activity {
             io.execute(() -> {
                 try {
                     JSONObject season = getJson("/api/v1/catalog/" + enc(completedOwner));
+                    String seriesId = season.optString("parent_id", "");
+                    JSONObject next = findNextEpisode(completedOwner, completedMedia);
+                    SharedPreferences.Editor suggestionEdit = prefs.edit();
+                    String seriesSuggestionKey = "series_next_episode:" + profileId + ":" + seriesId;
+                    if (next != null && !seriesId.isEmpty() && !"null".equals(seriesId)) {
+                        next.put("series_id", seriesId);
+                        next.put("suggestion_type", completedOwner.equals(next.optString("owner_node_id"))
+                                ? "next_episode" : "next_season");
+                        next.put("updated", System.currentTimeMillis());
+                        suggestionEdit.putString(seriesSuggestionKey, next.toString())
+                                .putString("next_episode:" + profileId, next.toString());
+                    } else {
+                        suggestionEdit.remove(seriesSuggestionKey);
+                        String global = prefs.getString("next_episode:" + profileId, "");
+                        try {
+                            if (!global.isEmpty()
+                                    && seriesId.equals(new JSONObject(global).optString("series_id")))
+                                suggestionEdit.remove("next_episode:" + profileId);
+                        } catch (JSONException ignored) { }
+                    }
+                    suggestionEdit.apply();
                     runOnUiThread(() -> {
                         refreshSeasonSeen(season);
+                        scheduleProfileStateSync();
                         advancingCompletedEpisode = false;
                         refreshCurrentScreen();
                     });

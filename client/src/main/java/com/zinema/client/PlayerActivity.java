@@ -5,6 +5,7 @@ import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.graphics.Color;
+import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
@@ -16,6 +17,8 @@ import android.widget.MediaController;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.widget.VideoView;
+
+import java.util.Locale;
 
 import org.json.JSONObject;
 
@@ -151,6 +154,7 @@ public class PlayerActivity extends Activity {
         mediaController.setContentDescription("Controles de reproducción");
         videoView.setMediaController(mediaController);
         videoView.setOnPreparedListener(player -> {
+            applyDefaultTracks(player);
             prepared = true;
             long duration = player.getDuration();
             if (resumeAt > 0L && duration > 0L && resumeAt < duration - 5000L) {
@@ -171,6 +175,55 @@ public class PlayerActivity extends Activity {
             return true;
         });
         videoView.setVideoURI(Uri.parse(url));
+    }
+
+    private void applyDefaultTracks(MediaPlayer player) {
+        try {
+            MediaPlayer.TrackInfo[] tracks = player.getTrackInfo();
+            int basqueAudio = -1;
+            int spanishAudio = -1;
+            int firstAudio = -1;
+            for (int i = 0; i < tracks.length; i++) {
+                int type = tracks[i].getTrackType();
+                if (type == MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_AUDIO) {
+                    if (firstAudio < 0) firstAudio = i;
+                    String language = normalizeTrackLanguage(tracks[i].getLanguage());
+                    if (basqueAudio < 0 && isBasque(language)) basqueAudio = i;
+                    if (spanishAudio < 0 && isSpanish(language)) spanishAudio = i;
+                } else if (type == MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_SUBTITLE
+                        || type == MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_TIMEDTEXT) {
+                    try { player.deselectTrack(i); } catch (IllegalStateException ignored) { }
+                    catch (IllegalArgumentException ignored) { }
+                }
+            }
+
+            // Prefer Euskara when present, then Spanish. If neither exists,
+            // preserve sound by selecting the file's first audio track.
+            int selectedAudio = basqueAudio >= 0 ? basqueAudio
+                    : spanishAudio >= 0 ? spanishAudio : firstAudio;
+            if (selectedAudio >= 0) {
+                try { player.selectTrack(selectedAudio); }
+                catch (IllegalStateException ignored) { }
+                catch (IllegalArgumentException ignored) { }
+            }
+        } catch (IllegalStateException ignored) {
+            // Some platform decoders do not expose selectable tracks.
+        }
+    }
+
+    private String normalizeTrackLanguage(String language) {
+        if (language == null) return "";
+        String normalized = language.trim().toLowerCase(Locale.ROOT).replace('_', '-');
+        int separator = normalized.indexOf('-');
+        return separator >= 0 ? normalized.substring(0, separator) : normalized;
+    }
+
+    private boolean isBasque(String language) {
+        return "eu".equals(language) || "eus".equals(language) || "baq".equals(language);
+    }
+
+    private boolean isSpanish(String language) {
+        return "es".equals(language) || "spa".equals(language) || "esp".equals(language);
     }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
