@@ -258,6 +258,8 @@ public class MainActivity extends Activity {
     boolean startupHomeAwaiting;
     List<JSONObject> startupMovies = new ArrayList<>();
     List<JSONObject> startupSeries = new ArrayList<>();
+    List<JSONObject> startupHomeCatalog = new ArrayList<>();
+    List<JSONObject> homeCatalog = new ArrayList<>();
     JSONArray startupRemoteProfiles;
     String startupPrefetchError;
     volatile JSONArray incomingFilesCache;
@@ -421,6 +423,7 @@ public class MainActivity extends Activity {
         io.execute(() -> {
             List<JSONObject> movieList = null;
             List<JSONObject> seriesList = null;
+            List<JSONObject> homeList = null;
             JSONArray remoteProfiles = null;
             String error = null;
             try {
@@ -428,6 +431,8 @@ public class MainActivity extends Activity {
                         () -> getArray("/api/v1/catalog?library=movies"));
                 java.util.concurrent.Future<JSONArray> seriesFuture = io.submit(
                         () -> getArray("/api/v1/catalog?library=series"));
+                java.util.concurrent.Future<JSONArray> homeCatalogFuture = io.submit(
+                        () -> getArray("/api/v1/catalog/home"));
                 java.util.concurrent.Future<JSONArray> profilesFuture = readProfiles().isEmpty()
                         ? io.submit(() -> getAuthorizedProfileArray("/api/v1/profiles")) : null;
                 JSONArray movieRows = movieFuture.get();
@@ -436,6 +441,8 @@ public class MainActivity extends Activity {
                 catch (Exception ignored) { }
                 movieList = toList(movieRows);
                 seriesList = toList(seriesRows);
+                try { homeList = toList(homeCatalogFuture.get()); }
+                catch (Exception ignored) { homeList = rootPlayableItems(movieList, seriesList); }
                 sortNewestFirst(movieList);
                 sortNewestFirst(seriesList);
             } catch (Exception e) {
@@ -444,6 +451,7 @@ public class MainActivity extends Activity {
             synchronized (MainActivity.this) {
                 startupMovies = movieList;
                 startupSeries = seriesList;
+                startupHomeCatalog = homeList;
                 startupRemoteProfiles = remoteProfiles;
                 startupPrefetchError = error;
                 startupPrefetchReady = true;
@@ -455,6 +463,7 @@ public class MainActivity extends Activity {
     void consumeStartupPrefetch() {
         List<JSONObject> movieList;
         List<JSONObject> seriesList;
+        List<JSONObject> homeCatalogList;
         JSONArray remoteProfiles;
         String error;
         synchronized (this) {
@@ -463,6 +472,7 @@ public class MainActivity extends Activity {
             startupHomeAwaiting = false;
             movieList = startupMovies;
             seriesList = startupSeries;
+            homeCatalogList = startupHomeCatalog;
             remoteProfiles = startupRemoteProfiles;
             error = startupPrefetchError;
         }
@@ -487,6 +497,7 @@ public class MainActivity extends Activity {
         }
         movies = movieList == null ? new ArrayList<>() : movieList;
         series = seriesList == null ? new ArrayList<>() : seriesList;
+        homeCatalog = homeCatalogList == null ? rootPlayableItems(movies, series) : homeCatalogList;
         if (remoteProfiles != null) mergeRemoteProfiles(remoteProfiles);
         putCatalogList("movies", null, movies);
         putCatalogList("series", null, series);
@@ -2478,8 +2489,16 @@ public class MainActivity extends Activity {
                         () -> getArray("/api/v1/catalog?library=movies"));
                 java.util.concurrent.Future<JSONArray> seriesFuture = io.submit(
                         () -> getArray("/api/v1/catalog?library=series"));
+                java.util.concurrent.Future<JSONArray> homeCatalogFuture = io.submit(
+                        () -> getArray("/api/v1/catalog/home"));
                 JSONArray m = movieFuture.get();
                 JSONArray s = seriesFuture.get();
+                List<JSONObject> homeCatalogList;
+                try { homeCatalogList = toList(homeCatalogFuture.get()); }
+                catch (Exception ignored) {
+                    homeCatalogList = rootPlayableItems(toList(m), toList(s));
+                }
+                final List<JSONObject> resolvedHomeCatalog = homeCatalogList;
                 List<JSONObject> movieList = toList(m);
                 List<JSONObject> seriesList = toList(s);
                 sortNewestFirst(movieList);
@@ -2487,6 +2506,7 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     movies = movieList;
                     series = seriesList;
+                    homeCatalog = resolvedHomeCatalog;
                     putCatalogList("movies", null, movieList);
                     putCatalogList("series", null, seriesList);
                     catalogVersion = "";
@@ -2506,6 +2526,15 @@ public class MainActivity extends Activity {
             JSONObject value = array.optJSONObject(i);
             if (value != null) result.add(value);
         }
+        return result;
+    }
+
+    List<JSONObject> rootPlayableItems(List<JSONObject> movieNodes, List<JSONObject> seriesNodes) {
+        List<JSONObject> result = new ArrayList<>();
+        if (movieNodes != null) for (JSONObject node : movieNodes)
+            if ("movie".equals(node.optString("kind")) && !node.optBoolean("is_placeholder")) result.add(node);
+        if (seriesNodes != null) for (JSONObject node : seriesNodes)
+            if ("series".equals(node.optString("kind")) && !node.optBoolean("is_placeholder")) result.add(node);
         return result;
     }
 
@@ -2630,8 +2659,14 @@ public class MainActivity extends Activity {
                         () -> getArray(catalogListingPath("movies", null)));
                 java.util.concurrent.Future<JSONArray> seriesFuture = io.submit(
                         () -> getArray(catalogListingPath("series", null)));
+                java.util.concurrent.Future<JSONArray> homeCatalogFuture = io.submit(
+                        () -> getArray("/api/v1/catalog/home"));
                 List<JSONObject> movieList = toList(movieFuture.get());
                 List<JSONObject> seriesList = toList(seriesFuture.get());
+                List<JSONObject> homeCatalogList;
+                try { homeCatalogList = toList(homeCatalogFuture.get()); }
+                catch (Exception ignored) { homeCatalogList = rootPlayableItems(movieList, seriesList); }
+                final List<JSONObject> resolvedHomeCatalog = homeCatalogList;
                 sortNewestFirst(movieList);
                 sortNewestFirst(seriesList);
                 runOnUiThread(() -> {
@@ -2642,6 +2677,7 @@ public class MainActivity extends Activity {
                     putCatalogList("series", null, seriesList);
                     movies = movieList;
                     series = seriesList;
+                    homeCatalog = resolvedHomeCatalog;
                     if (!libraryMode && !showingDetail && !showingAdmin && !metadataEditorMode) {
                         int previousY = contentScroller == null ? 0 : contentScroller.getScrollY();
                         pendingListingRestoreY = previousY;
@@ -2770,12 +2806,16 @@ public class MainActivity extends Activity {
                 pendingItems.remove(i);
         }
         List<JSONObject> catalogItems = new ArrayList<>();
-        for (JSONObject node : visibleMovies)
-            if (!node.optBoolean("is_placeholder") && "movie".equals(node.optString("kind")))
-                catalogItems.add(node);
-        for (JSONObject node : visibleSeries)
-            if (!node.optBoolean("is_placeholder") && "series".equals(node.optString("kind")))
-                catalogItems.add(node);
+        List<JSONObject> homeItems = homeCatalog.isEmpty()
+                ? rootPlayableItems(visibleMovies, visibleSeries) : homeCatalog;
+        Set<String> homeItemIds = new HashSet<>();
+        for (JSONObject node : filterKidCatalog(homeItems)) {
+            String kind = node.optString("kind");
+            String id = node.optString("id", "");
+            if (("movie".equals(kind) || "series".equals(kind))
+                    && !node.optBoolean("is_placeholder") && !node.optBoolean("is_incoming_pending")
+                    && (id.isEmpty() || homeItemIds.add(id))) catalogItems.add(node);
+        }
         List<JSONObject> newestItems = new ArrayList<>(catalogItems);
         newestItems.addAll(incomingItemsFrom(visibleMovies));
         newestItems.addAll(incomingItemsFrom(visibleSeries));

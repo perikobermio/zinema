@@ -2599,6 +2599,18 @@ def list_catalog(
         return result
 
 
+@app.get("/api/v1/catalog/home", dependencies=[Depends(require_client)])
+def list_home_catalog() -> list[dict]:
+    """Return every playable movie and series for the mixed home rows."""
+    with closing(database()) as connection:
+        rows = connection.execute(
+            """SELECT * FROM catalog_nodes
+               WHERE available=1 AND kind IN ('movie', 'series')
+               ORDER BY added_at DESC, title COLLATE NOCASE"""
+        ).fetchall()
+        return [_node_payload(row, connection) for row in rows]
+
+
 @app.get("/api/v1/genres", dependencies=[Depends(require_client)])
 def list_genres() -> list[str]:
     with closing(database()) as connection:
