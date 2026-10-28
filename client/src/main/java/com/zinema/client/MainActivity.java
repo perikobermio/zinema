@@ -2757,7 +2757,7 @@ public class MainActivity extends Activity {
         List<JSONObject> favorites = filterKidCatalog(readFavorites());
         List<JSONObject> visibleMovies = filterKidCatalog(movies);
         List<JSONObject> visibleSeries = filterKidCatalog(series);
-        if (!favorites.isEmpty()) addRow("Mi lista", favorites);
+        if (!favorites.isEmpty()) addRow("Favoritos", favorites);
         List<JSONObject> pendingItems = new ArrayList<>();
         Set<String> pendingIds = new HashSet<>();
         Set<String> requestedSeriesIds = new HashSet<>();
@@ -3172,6 +3172,49 @@ public class MainActivity extends Activity {
         content.addView(section, p);
     }
 
+    TextView favoriteButton(JSONObject node) {
+        return favoriteButton(node, 48, 27);
+    }
+
+    TextView favoriteButton(JSONObject node, int sizeDp, int textSize) {
+        TextView heart = labelRaw(isFavorite(node) ? "♥" : "♡", textSize,
+                isFavorite(node) ? 0xFFFF6672 : Color.WHITE, true);
+        heart.setGravity(Gravity.CENTER);
+        heart.setFocusable(true);
+        heart.setClickable(true);
+        heart.setBackground(round(0xBB171B25, d(sizeDp >= 40 ? 12 : 8)));
+        heart.setContentDescription(t(isFavorite(node) ? "Quitar de favoritos" : "Añadir a favoritos"));
+        heart.setTag("favorite-button:" + node.optString("id", ""));
+        applyTvFocusStyle(heart, false);
+        heart.setOnClickListener(v -> {
+            toggleFavorite(node);
+            updateFavoriteButton(heart, node);
+        });
+        return heart;
+    }
+
+    void updateFavoriteButton(TextView heart, JSONObject node) {
+        boolean favorite = isFavorite(node);
+        heart.setText(favorite ? "♥" : "♡");
+        heart.setTextColor(favorite ? 0xFFFF6672 : Color.WHITE);
+        heart.setContentDescription(t(favorite ? "Quitar de favoritos" : "Añadir a favoritos"));
+        heart.setSelected(favorite);
+    }
+
+    void addCollectionListingHeader(JSONObject collection, String title, String subtitle) {
+        LinearLayout heading = new LinearLayout(this);
+        heading.setGravity(Gravity.CENTER_VERTICAL);
+        heading.setPadding(d(20), d(12), d(20), 0);
+        TextView name = label(title, 27, Color.WHITE, true);
+        heading.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView heart = favoriteButton(collection);
+        heading.addView(heart, new LinearLayout.LayoutParams(d(48), d(44)));
+        content.addView(heading);
+        TextView sub = label(subtitle, 14, MUTED, false);
+        sub.setPadding(d(20), d(2), d(20), d(18));
+        content.addView(sub);
+    }
+
     View posterCard(JSONObject node) {
         return posterCard(node, false, shouldShowSeriesFlag());
     }
@@ -3337,7 +3380,10 @@ public class MainActivity extends Activity {
         updatePosterDownloadOverlay(art, node);
         LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(width, -2);
         cp.setMargins(0, 0, d(12), 0);
-        if (!placeholder) card.setOnClickListener(v -> openNode(node));
+        if (!placeholder) card.setOnClickListener(v -> {
+            if ("episode".equals(node.optString("kind"))) openSearchEpisodeDetail(node);
+            else openNode(node);
+        });
         View wrapped = wrap(card, cp);
         wrapped.setTag("catalog-node:" + node.optString("id", ""));
         return wrapped;
@@ -3564,7 +3610,17 @@ public class MainActivity extends Activity {
                 summary += " · " + pendingSeasons + " " + t("Pendiente de añadir").toLowerCase();
             return summary;
         }
-        if (kind.equals("season")) return t("Temporada") + " " + String.format("%02d", node.optInt("season_number"));
+        if (kind.equals("season")) {
+            String seriesTitle = node.optString("series_title", "");
+            String season = t("Temporada") + " " + String.format("%02d", node.optInt("season_number"));
+            return seriesTitle.isEmpty() ? season : seriesTitle + " · " + season;
+        }
+        if (kind.equals("episode")) {
+            String seriesTitle = node.optString("series_title", "");
+            String marker = String.format(java.util.Locale.ROOT, "S%02dE%02d",
+                    node.optInt("season_number"), node.optInt("episode_number"));
+            return seriesTitle.isEmpty() ? marker : seriesTitle + " · " + marker;
+        }
         JSONArray genres = node.optJSONArray("genres");
         if (kind.equals("collection")) {
             int count = node.optInt("item_count");
@@ -3934,7 +3990,10 @@ public class MainActivity extends Activity {
             visibleNodes = filterByGenres(alphabetized, selected);
             addLibraryListingHeader(title, subtitle, library, nodes, selected);
         } else {
-            addSectionHeader(title, subtitle);
+            JSONObject collection = breadcrumbs.isEmpty() ? null : breadcrumbs.get(breadcrumbs.size() - 1);
+            if (collection != null && "collection".equals(collection.optString("kind")))
+                addCollectionListingHeader(collection, title, subtitle);
+            else addSectionHeader(title, subtitle);
         }
         addGrid(visibleNodes);
         boolean showAlphabetRail = showAlphabet && alphabetVisible;
@@ -4344,6 +4403,9 @@ public class MainActivity extends Activity {
         List<String> actions = new ArrayList<>();
         List<Runnable> handlers = new ArrayList<>();
         String kind = node.optString("kind");
+        boolean favorite = isFavorite(node);
+        actions.add(favorite ? "Quitar de favoritos" : "Añadir a favoritos");
+        handlers.add(() -> toggleFavorite(node));
         if (kind.equals("movie") || kind.equals("series")) {
             actions.add("Marcar como visto");
             handlers.add(() -> setNodeWatched(node, true));
@@ -4596,6 +4658,10 @@ public class MainActivity extends Activity {
         List<String> actions = new ArrayList<>();
         List<Runnable> handlers = new ArrayList<>();
         String metadataKind = metadataNode.optString("kind", "");
+        JSONObject favoriteNode = episodeFavoriteNode(media, owner);
+        boolean favorite = isFavorite(favoriteNode);
+        actions.add(favorite ? "Quitar de favoritos" : "Añadir a favoritos");
+        handlers.add(() -> toggleFavorite(favoriteNode));
         if (canAccessAdminTools() && (metadataKind.equals("movie") || metadataKind.equals("series"))) {
             actions.add("Reintentar metadata (TMDb)");
             handlers.add(() -> retryMetadata(metadataNode));
@@ -4607,6 +4673,34 @@ public class MainActivity extends Activity {
         actions.add("Marcar como no visto");
         handlers.add(() -> setMediaWatched(media, owner, false));
         showStyledActionDialog(t("Acciones"), actions, index -> handlers.get(index).run());
+    }
+
+    JSONObject episodeFavoriteNode(JSONObject media, JSONObject owner) {
+        JSONObject episode;
+        try { episode = new JSONObject(media.toString()); }
+        catch (JSONException ignored) { episode = new JSONObject(); }
+        try {
+            episode.put("kind", "episode");
+            episode.put("owner_node_id", owner.optString("id", ""));
+            episode.put("node_id", owner.optString("id", ""));
+            episode.put("owner_kind", owner.optString("kind", "season"));
+            episode.put("series_id", "season".equals(owner.optString("kind"))
+                    ? owner.optString("parent_id", "") : owner.optString("id", ""));
+            episode.put("series_title", owner.optString("series_title", ""));
+            if (episode.optString("series_title").isEmpty()) {
+                JSONObject seriesNode = "season".equals(owner.optString("kind"))
+                        ? findSeriesForSeason(owner.optString("id", "")) : owner;
+                if (seriesNode != null) {
+                    episode.put("series_id", seriesNode.optString("id", ""));
+                    episode.put("series_title", displayTitle(seriesNode));
+                    if (episode.optString("poster_url").isEmpty())
+                        episode.put("poster_url", seriesNode.optString("poster_url", ""));
+                }
+            }
+            if (episode.optString("display_title").isEmpty())
+                episode.put("display_title", episode.optString("title", t("Capítulo")));
+        } catch (JSONException ignored) { }
+        return episode;
     }
 
     void setMediaWatched(JSONObject media, JSONObject owner, boolean seen) {
@@ -5411,6 +5505,12 @@ public class MainActivity extends Activity {
                 : "Reproducir", !node.optBoolean("requested"));
         primaryAction.setEnabled(!externalRecommendation || !node.optBoolean("requested"));
         controls.addView(primaryAction, new LinearLayout.LayoutParams(-2, d(44)));
+        if (!externalRecommendation) {
+            TextView heart = favoriteButton(node);
+            LinearLayout.LayoutParams heartParams = new LinearLayout.LayoutParams(d(48), d(44));
+            heartParams.leftMargin = d(8);
+            controls.addView(heart, heartParams);
+        }
         if ("movie".equals(node.optString("kind")) && files != null && files.length() > 0) {
             Button details = actionButton("ⓘ  " + t("Details"), false);
             LinearLayout.LayoutParams detailsParams = new LinearLayout.LayoutParams(-2, d(44));
@@ -5611,6 +5711,13 @@ public class MainActivity extends Activity {
                     requestedParams.setMargins(d(4), 0, 0, d(4));
                     posterFrame.addView(requestedFlag, requestedParams);
                     requestBadge = requestedFlag;
+                }
+                if (!missingSeason) {
+                    TextView heart = favoriteButton(season, 30, 18);
+                    FrameLayout.LayoutParams heartParams = new FrameLayout.LayoutParams(
+                            d(30), d(30), Gravity.TOP | Gravity.LEFT);
+                    heartParams.setMargins(d(4), d(4), 0, 0);
+                    posterFrame.addView(heart, heartParams);
                 }
                 seasonRequestBadges.add(requestBadge);
                 TextView selectedMark = label("✓", 16, 0xFF241A00, true);
@@ -5874,6 +5981,11 @@ public class MainActivity extends Activity {
             case "capítulos": return "atal";
             case "Inicio": return "Hasiera";
             case "Lo más nuevo": return "Eduki berrienak";
+            case "Favoritos": return "Gogokoenak";
+            case "Añadir a favoritos": return "Gogokoetara gehitu";
+            case "Quitar de favoritos": return "Gogokoetatik kendu";
+            case "Añadido a favoritos": return "Gogokoetara gehituta";
+            case "Eliminado de favoritos": return "Gogokoetatik kenduta";
             case "Más como esto en tu catálogo": return "Antzeko gehiago zure katalogoan";
             case "Más sugerencias de TMDb": return "TMDb-ko iradokizun gehiago";
             case "Reproducir normalmente": return "Erreproduzitu normalean";
@@ -7172,6 +7284,10 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams detailsP = new LinearLayout.LayoutParams(-2, d(44));
         detailsP.leftMargin = d(8);
         controls.addView(details, detailsP);
+        TextView heart = favoriteButton(episode);
+        LinearLayout.LayoutParams heartParams = new LinearLayout.LayoutParams(d(48), d(44));
+        heartParams.leftMargin = d(8);
+        controls.addView(heart, heartParams);
         LinearLayout.LayoutParams controlsP = new LinearLayout.LayoutParams(-1, -2);
         controlsP.topMargin = d(14);
         info.addView(controls, controlsP);
@@ -9674,10 +9790,21 @@ public class MainActivity extends Activity {
 
     void toggleFavorite(JSONObject node) {
         String key = favoriteKey(node.optString("id"));
+        if (node.optString("id").isEmpty()) return;
         if (prefs.contains(key)) prefs.edit().remove(key).apply();
-        else prefs.edit().putString(key, node.toString()).apply();
+        else prefs.edit().putString(key, favoriteDisplayNode(node).toString()).apply();
         scheduleProfileStateSync();
-        Toast.makeText(this, prefs.contains(key) ? t("Añadido a Mi lista") : t("Eliminado de Mi lista"), Toast.LENGTH_SHORT).show();
+        boolean added = prefs.contains(key);
+        Toast.makeText(this, t(added ? "Añadido a favoritos" : "Eliminado de favoritos"), Toast.LENGTH_SHORT).show();
+        if (showingDetail) {
+            View button = findTaggedView(content, "favorite-button:" + node.optString("id"));
+            if (button instanceof TextView) updateFavoriteButton((TextView) button, node);
+        } else if ("home".equals(selectedSection) && !showingAdmin && !showingProfiles) {
+            renderHome();
+        } else if (libraryMode && !showingAdmin && currentListingNodes != null) {
+            pendingListingRestoreY = contentScroller == null ? 0 : contentScroller.getScrollY();
+            renderListing(currentListingTitle, currentListingSubtitle, currentListingNodes);
+        }
     }
 
     List<JSONObject> readFavorites() {
@@ -9685,10 +9812,38 @@ public class MainActivity extends Activity {
         String prefix = progressPrefix("fav");
         for (Map.Entry<String, ?> entry : prefs.getAll().entrySet()) {
             if (!entry.getKey().startsWith(prefix)) continue;
-            try { list.add(new JSONObject(String.valueOf(entry.getValue()))); }
+            try { list.add(favoriteDisplayNode(new JSONObject(String.valueOf(entry.getValue())))); }
             catch (JSONException ignored) { }
         }
         return list;
+    }
+
+    JSONObject favoriteDisplayNode(JSONObject original) {
+        if (original == null) return new JSONObject();
+        JSONObject node;
+        try { node = new JSONObject(original.toString()); }
+        catch (JSONException ignored) { return original; }
+        if ("season".equals(node.optString("kind"))) {
+            JSONObject owner = findSeriesForSeason(node.optString("id", ""));
+            if (owner != null) {
+                try {
+                    node.put("series_title", displayTitle(owner));
+                    node.put("series_id", owner.optString("id", ""));
+                } catch (JSONException ignored) { }
+            }
+        } else if ("episode".equals(node.optString("kind"))
+                && node.optString("series_title", "").isEmpty()) {
+            JSONObject owner = findSeriesForSeason(node.optString("owner_node_id", ""));
+            if (owner != null) {
+                try {
+                    node.put("series_title", displayTitle(owner));
+                    node.put("series_id", owner.optString("id", ""));
+                    if (node.optString("poster_url", "").isEmpty())
+                        node.put("poster_url", owner.optString("poster_url", ""));
+                } catch (JSONException ignored) { }
+            }
+        }
+        return node;
     }
 
     List<JSONObject> readContinueWatching() {
