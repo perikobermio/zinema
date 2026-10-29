@@ -13,7 +13,7 @@ VIDEO_EXTENSIONS = {
 SEASON_RE = re.compile(r"^(?:season|temporada)\s*0*(\d+)(?:\b|\s|$)", re.IGNORECASE)
 EPISODE_RE = re.compile(
     r"(?:(?<![A-Za-z0-9])(?:s|t)\s*(\d{1,2})[\s,._-]*e\s*(\d{1,3})"
-    r"|(?<![A-Za-z0-9])(\d{1,2})x(\d{1,3})\b)",
+    r"|(?<![A-Za-z0-9])(\d{1,2})[x×](\d{1,3})(?![A-Za-z0-9]))",
     re.IGNORECASE,
 )
 YEAR_RE = re.compile(r"\s*\(((?:19|20)\d{2})\)\s*$")
