@@ -951,7 +951,7 @@ public class MainActivity extends Activity {
 
     JSONObject getJson(String path) throws Exception {
         String token = clientApiToken();
-        if (token.isEmpty()) throw new Exception("Configura la clave de acceso a la API en Administración.");
+        if (token.isEmpty()) throw new Exception("Configura la clave de acceso a la API en Ajustes.");
         HttpURLConnection connection = (HttpURLConnection) new URL(server + path).openConnection();
         connection.setRequestMethod("GET");
         connection.setConnectTimeout(12000);
@@ -988,7 +988,7 @@ public class MainActivity extends Activity {
 
     JSONArray getArray(String path) throws Exception {
         String token = clientApiToken();
-        if (token.isEmpty()) throw new Exception("Configura la clave de acceso a la API en Administración.");
+        if (token.isEmpty()) throw new Exception("Configura la clave de acceso a la API en Ajustes.");
         HttpURLConnection connection = (HttpURLConnection) new URL(server + path).openConnection();
         connection.setRequestMethod("GET");
         connection.setConnectTimeout(12000);
@@ -1047,7 +1047,7 @@ public class MainActivity extends Activity {
 
     String authorizedProfileRequest(String method, String path, JSONObject payload) throws Exception {
         String token = clientApiToken();
-        if (token.isEmpty()) throw new Exception("Vincula este dispositivo desde Administración.");
+        if (token.isEmpty()) throw new Exception("Vincula este dispositivo desde Ajustes.");
         HttpURLConnection connection = (HttpURLConnection) new URL(server + path).openConnection();
         connection.setRequestMethod(method);
         connection.setConnectTimeout(12000);
@@ -1724,6 +1724,7 @@ public class MainActivity extends Activity {
                 List<String> choices = new ArrayList<>();
                 List<Integer> actions = new ArrayList<>();
                 choices.add(t("Cambiar perfil")); actions.add(1);
+                choices.add(t("Ajustes")); actions.add(2);
                 choices.add(t("Pedir contenido")); actions.add(6);
                 choices.add(t("Cerrar sesión")); actions.add(3);
                 choices.add(t("Salir")); actions.add(4);
@@ -1733,11 +1734,11 @@ public class MainActivity extends Activity {
             }
             PopupMenu menu = new PopupMenu(MainActivity.this, chip);
             addAvatarMenuItem(menu, 1, 1, t("Cambiar perfil"), MenuIconDrawable.PROFILE);
-            addAvatarMenuItem(menu, 2, 2, t("Administración"), MenuIconDrawable.SETTINGS);
+            addAvatarMenuItem(menu, 2, 2, t("Ajustes"), MenuIconDrawable.SETTINGS);
             addAvatarMenuItem(menu, 6, 3, t("Pedir contenido"), MenuIconDrawable.SEARCH);
             if (prefs.getBoolean("account_is_admin", false)) {
                 addAvatarMenuItem(menu, 5, 4, t("Gestión de cuentas"), MenuIconDrawable.ACCOUNTS);
-                addAvatarMenuItem(menu, 7, 5, t("Gestión descargas"), MenuIconDrawable.SETTINGS);
+                addAvatarMenuItem(menu, 7, 5, "Admin", MenuIconDrawable.SETTINGS);
             }
             addAvatarMenuItem(menu, 3, 5, t("Cerrar sesión"), MenuIconDrawable.LOGOUT);
             addAvatarMenuItem(menu, 4, 6, t("Salir"), MenuIconDrawable.EXIT);
@@ -4398,7 +4399,7 @@ public class MainActivity extends Activity {
 
     JSONObject postJson(String path) throws Exception {
         String token = clientApiToken();
-        if (token.isEmpty()) throw new Exception("Configura la clave de acceso a la API en Administración.");
+        if (token.isEmpty()) throw new Exception("Configura la clave de acceso a la API en Ajustes.");
         HttpURLConnection connection = (HttpURLConnection) new URL(server + path).openConnection();
         connection.setRequestMethod("POST");
         connection.setConnectTimeout(12000);
@@ -4422,7 +4423,7 @@ public class MainActivity extends Activity {
 
     JSONObject postJson(String path, JSONObject payload) throws Exception {
         String token = clientApiToken();
-        if (token.isEmpty()) throw new Exception("Configura la clave de acceso a la API en Administración.");
+        if (token.isEmpty()) throw new Exception("Configura la clave de acceso a la API en Ajustes.");
         HttpURLConnection connection = (HttpURLConnection) new URL(server + path).openConnection();
         connection.setRequestMethod("POST");
         connection.setConnectTimeout(12000);
@@ -6368,8 +6369,7 @@ public class MainActivity extends Activity {
             case "Comprueba que el servidor esté encendido.": return "Egiaztatu zerbitzaria piztuta dagoela.";
             case "Reintentar": return "Berriro saiatu";
             case "Configurar servidor": return "Zerbitzaria konfiguratu";
-            case "Administración": return "Administrazioa";
-            case "Gestión descargas": return "Deskargen kudeaketa";
+            case "Ajustes": return "Ezarpenak";
             case "No se encontraron pósteres.": return "Ez da posterik aurkitu.";
             case "Reproductor": return "Erreproduzitzailea";
             case "Zinema prioriza el audio en euskera y después en español; inicia sin subtítulos. VLC usa sus propias preferencias.":
@@ -7786,10 +7786,6 @@ public class MainActivity extends Activity {
     }
 
     void showSettings() {
-        if (isActiveKidProfile()) {
-            showKidAdminAccessDenied();
-            return;
-        }
         if (clientApiToken().isEmpty()) {
             showLoginScreen();
             return;
@@ -7801,7 +7797,7 @@ public class MainActivity extends Activity {
         showingAdmin = true;
         showingDownloadManagement = false;
         showingDetail = false;
-        buildShell("Administración");
+        buildShell(t("Ajustes"));
         renderAdminWindow();
     }
 
@@ -7821,7 +7817,7 @@ public class MainActivity extends Activity {
         showingAdmin = true;
         showingDownloadManagement = true;
         showingDetail = false;
-        buildShell(t("Gestión descargas"));
+        buildShell("Admin");
         renderDownloadManagementWindow();
     }
 
@@ -7971,22 +7967,13 @@ public class MainActivity extends Activity {
         LinearLayout screen = new LinearLayout(this);
         screen.setOrientation(LinearLayout.VERTICAL);
         screen.setPadding(d(20), d(14), d(20), d(24));
-        TextView heading = label("Administración", 27, Color.WHITE, true);
+        TextView heading = label(t("Ajustes"), 27, Color.WHITE, true);
         screen.addView(heading);
         TextView intro = label(t("Ajustes de Zinema"), 14, MUTED, false);
         LinearLayout.LayoutParams introP = new LinearLayout.LayoutParams(-1, -2);
         introP.topMargin = d(5);
         introP.bottomMargin = d(20);
         screen.addView(intro, introP);
-
-        if (prefs.getBoolean("account_is_admin", false)) {
-            LinearLayout playbackSlot = new LinearLayout(this);
-            playbackSlot.setOrientation(LinearLayout.VERTICAL);
-            LinearLayout.LayoutParams playbackSlotParams = new LinearLayout.LayoutParams(-1, -2);
-            playbackSlotParams.bottomMargin = d(14);
-            screen.addView(playbackSlot, playbackSlotParams);
-            loadPlaybackLimitControls(playbackSlot);
-        }
 
         LinearLayout languageCard = settingsCard();
         LinearLayout.LayoutParams languageP = new LinearLayout.LayoutParams(-1, -2);
@@ -8044,7 +8031,7 @@ public class MainActivity extends Activity {
             try {
                 JSONObject settings = getJson("/api/v1/admin/playback-limit");
                 runOnUiThread(() -> {
-                    if (!showingAdmin || slot.getParent() == null) return;
+                    if (!showingDownloadManagement || slot.getParent() == null) return;
                     LinearLayout card = settingsCard();
                     card.addView(label(t("Reproducciones simultáneas"), 16, Color.WHITE, true));
                     TextView hint = label(t("Número máximo de dispositivos reproduciendo a la vez."),
@@ -8098,7 +8085,7 @@ public class MainActivity extends Activity {
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
-                    if (!showingAdmin || slot.getParent() == null) return;
+                    if (!showingDownloadManagement || slot.getParent() == null) return;
                     slot.removeAllViews();
                     LinearLayout card = settingsCard();
                     card.addView(label(t("No se pudo cargar el límite de reproducción: ")
@@ -8114,7 +8101,7 @@ public class MainActivity extends Activity {
         LinearLayout screen = new LinearLayout(this);
         screen.setOrientation(LinearLayout.VERTICAL);
         screen.setPadding(d(20), d(14), d(20), d(24));
-        screen.addView(label(t("Gestión descargas"), 27, Color.WHITE, true));
+        screen.addView(label("Admin", 27, Color.WHITE, true));
 
         LinearLayout topAdminRow = new LinearLayout(this);
         topAdminRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -8156,6 +8143,13 @@ public class MainActivity extends Activity {
         loadIncomingControls(incomingSlot);
         loadContentRequestControls(requestsSlot);
         loadManualTelegramDownloadControls(manualTelegramSlot);
+
+        LinearLayout playbackSlot = new LinearLayout(this);
+        playbackSlot.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams playbackParams = new LinearLayout.LayoutParams(-1, -2);
+        playbackParams.topMargin = d(14);
+        screen.addView(playbackSlot, playbackParams);
+        loadPlaybackLimitControls(playbackSlot);
     }
 
     void loadNasDownloadControls(LinearLayout slot) {
@@ -8748,7 +8742,7 @@ public class MainActivity extends Activity {
                 catch (Exception ignored) { }
                 JSONObject activeDownloadState = downloadState;
                 runOnUiThread(() -> {
-                    if (!showingAdmin || slot.getParent() == null) return;
+                    if (!showingDownloadManagement || slot.getParent() == null) return;
                     slot.removeAllViews();
                     slot.setVisibility(View.VISIBLE);
                     LinearLayout card = settingsCard();
@@ -9007,7 +9001,7 @@ public class MainActivity extends Activity {
                 });
             } catch (Exception error) {
                 runOnUiThread(() -> {
-                    if (!showingAdmin || slot.getParent() == null) return;
+                    if (!showingDownloadManagement || slot.getParent() == null) return;
                     slot.removeAllViews();
                     TextView failure = label(t("No se pudieron cargar las solicitudes."),
                             13, MUTED, false);
