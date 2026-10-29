@@ -934,9 +934,8 @@ public class MainActivity extends Activity {
                     refreshPlaybackCapacityUi();
                 }
                 if (activityResumed && !showingAdmin && !showingProfiles) {
-                    long delay = playbackCapacityLoaded && !canStartPlayback() ? 5000L : 30000L;
                     playbackCapacityTask = this::startPlaybackCapacityPolling;
-                    playbackCapacityHandler.postDelayed(playbackCapacityTask, delay);
+                    playbackCapacityHandler.postDelayed(playbackCapacityTask, 5 * 60 * 1000L);
                 }
             });
         });
