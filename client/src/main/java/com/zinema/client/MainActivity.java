@@ -60,6 +60,7 @@ import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.Spinner;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.webkit.JavascriptInterface;
@@ -273,6 +274,13 @@ public class MainActivity extends Activity {
     String editingProfileId = "";
     String selectedProfileAvatar = "";
     boolean metadataEditorMode;
+    boolean showingSeasons;
+    String seasonsSeriesId = "";
+    String seasonsReturnScreen = "";
+    String seasonsReturnDetailId = "";
+    int seasonsReturnScrollY;
+    String seasonsReturnFocusTag = "";
+    String seasonDetailParentId = "";
     String metadataEditorReturnScreen = "";
     String metadataEditorReturnDetailId = "";
     int metadataEditorReturnScrollY;
@@ -395,7 +403,9 @@ public class MainActivity extends Activity {
         webSettings.setMediaPlaybackRequiresUserGesture(false);
         introWebView.addJavascriptInterface(new IntroBridge(), "ZinemaIntro");
         setContentView(introWebView);
-        introWebView.loadUrl("file:///android_asset/zinema_intro.html?embed=1");
+        boolean introSoundEnabled = prefs.getBoolean("intro_sound_enabled", true);
+        introWebView.loadUrl("file:///android_asset/zinema_intro.html?embed=1&sound="
+                + (introSoundEnabled ? "1" : "0"));
     }
 
     public final class IntroBridge {
@@ -3247,6 +3257,9 @@ public class MainActivity extends Activity {
         if (node.optString("kind").equals("season")) {
             if (node.optBoolean("is_placeholder") && node.optInt("season_number") <= 0)
                 return t("Capítulos pendientes");
+            String standardTitle = "Temporada "
+                    + String.format(java.util.Locale.ROOT, "%02d", node.optInt("season_number"));
+            if (!title.isEmpty() && !title.equalsIgnoreCase(standardTitle)) return title;
             return t("Temporada") + " " + String.format("%02d", node.optInt("season_number"));
         }
         return title;
@@ -4481,7 +4494,7 @@ public class MainActivity extends Activity {
                             : (i == 0 ? 0xFFFF858C : 0xFFB7C4E1), true);
             symbol.setGravity(Gravity.CENTER);
             option.addView(symbol, new LinearLayout.LayoutParams(d(34), d(48)));
-            TextView text = label(options.get(i), 15, Color.WHITE, true);
+            TextView text = label(t(options.get(i)), 15, Color.WHITE, true);
             text.setGravity(Gravity.CENTER_VERTICAL);
             LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(0, d(52), 1);
             textParams.leftMargin = d(8);
@@ -4511,6 +4524,10 @@ public class MainActivity extends Activity {
         boolean favorite = isFavorite(node);
         actions.add(favorite ? "Quitar de favoritos" : "Añadir a favoritos");
         handlers.add(() -> toggleFavorite(node));
+        if ("series".equals(kind)) {
+            actions.add("Ver temporadas");
+            handlers.add(() -> showSeriesSeasons(node, false));
+        }
         if (kind.equals("movie") || kind.equals("series")) {
             actions.add("Marcar como visto");
             handlers.add(() -> setNodeWatched(node, true));
@@ -5451,7 +5468,10 @@ public class MainActivity extends Activity {
         if (metadataEditorReturnPrepared) return;
         metadataEditorReturnScrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
         metadataEditorReturnDetailId = showingDetail ? detailNodeId : "";
-        if (showingDetail) metadataEditorReturnScreen = "detail";
+        if (showingSeasons) {
+            metadataEditorReturnScreen = "seasons";
+            metadataEditorReturnDetailId = seasonsSeriesId;
+        } else if (showingDetail) metadataEditorReturnScreen = "detail";
         else if (!breadcrumbs.isEmpty()) metadataEditorReturnScreen = "collection";
         else if (lastSearchQuery != null) metadataEditorReturnScreen = "search";
         else if (libraryMode) metadataEditorReturnScreen = "library";
@@ -5481,6 +5501,20 @@ public class MainActivity extends Activity {
                 } catch (Exception e) {
                     runOnUiThread(() -> renderError("No se pudo volver a la ficha: " + e.getMessage()));
                 }
+            });
+            return;
+        }
+
+        if ("seasons".equals(returnScreen) && !returnDetailId.isEmpty()) {
+            io.execute(() -> {
+                try {
+                    JSONObject series = getJson("/api/v1/catalog/" + enc(returnDetailId));
+                    runOnUiThread(() -> {
+                        showingSeasons = true;
+                        seasonsSeriesId = returnDetailId;
+                        renderSeasonsWindow(series);
+                    });
+                } catch (Exception e) { runOnUiThread(this::loadHome); }
             });
             return;
         }
@@ -5616,6 +5650,14 @@ public class MainActivity extends Activity {
             heartParams.leftMargin = d(8);
             controls.addView(heart, heartParams);
         }
+        if ("series".equals(node.optString("kind")) && !externalRecommendation) {
+            Button seasonsButton = actionButton("▤", false);
+            seasonsButton.setContentDescription(t("Temporadas"));
+            LinearLayout.LayoutParams seasonsParams = new LinearLayout.LayoutParams(d(48), d(44));
+            seasonsParams.leftMargin = d(8);
+            controls.addView(seasonsButton, seasonsParams);
+            seasonsButton.setOnClickListener(v -> showSeriesSeasons(node, true));
+        }
         if ("movie".equals(node.optString("kind")) && files != null && files.length() > 0) {
             Button details = actionButton("ⓘ  " + t("Details"), false);
             LinearLayout.LayoutParams detailsParams = new LinearLayout.LayoutParams(-2, d(44));
@@ -5687,6 +5729,200 @@ public class MainActivity extends Activity {
                     || node.optJSONArray("missing_seasons").length() == 0)
                 && !node.optString("kind").equals("movie")) addEmpty("No se encontraron episodios.");
         restorePendingFocus();
+    }
+
+    void showSeriesSeasons(JSONObject seriesSummary, boolean returnToDetail) {
+        if (seriesSummary == null || !"series".equals(seriesSummary.optString("kind"))) return;
+        String seriesId = seriesSummary.optString("id", "");
+        if (seriesId.isEmpty()) return;
+        if (!showingSeasons) {
+            seasonsReturnScreen = (returnToDetail || showingDetail) ? "detail"
+                    : !breadcrumbs.isEmpty() ? "collection"
+                    : libraryMode ? "library" : lastSearchQuery != null ? "search" : "home";
+            seasonsReturnDetailId = (returnToDetail || showingDetail) ? seriesId : "";
+            seasonsReturnScrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
+            seasonsReturnFocusTag = focusedTagWithPrefix("catalog-node:");
+            if (backButton != null) backButton.setVisibility(View.VISIBLE);
+        }
+        showingSeasons = true;
+        seasonsSeriesId = seriesId;
+        showingDetail = false;
+        if (alphabetToggleButton != null) alphabetToggleButton.setVisibility(View.GONE);
+        removeAlphabetRail();
+        content.removeAllViews();
+        if (contentScroller != null) contentScroller.scrollTo(0, 0);
+        showLoading(t("Cargando temporadas…"));
+        io.execute(() -> {
+            try {
+                JSONObject fullSeries = getJson("/api/v1/catalog/" + enc(seriesId));
+                runOnUiThread(() -> {
+                    if (!showingSeasons || !seriesId.equals(seasonsSeriesId)) return;
+                    renderSeasonsWindow(fullSeries);
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (showingSeasons && seriesId.equals(seasonsSeriesId)) renderError(e.getMessage());
+                });
+            }
+        });
+    }
+
+    void renderSeasonsWindow(JSONObject series) {
+        content.removeAllViews();
+        addSectionHeader(t("Temporadas"), displayTitle(series));
+        TextView help = label(t("Selecciona una temporada para ver sus capítulos."), 13, MUTED, false);
+        help.setPadding(d(20), 0, d(20), d(14));
+        content.addView(help);
+        JSONArray children = series.optJSONArray("children");
+        List<JSONObject> seasons = new ArrayList<>();
+        if (children != null) {
+            for (int i = 0; i < children.length(); i++) {
+                JSONObject child = children.optJSONObject(i);
+                if (child != null && "season".equals(child.optString("kind"))) seasons.add(child);
+            }
+        }
+        JSONArray missingNumbers = series.optJSONArray("missing_seasons");
+        if (missingNumbers != null) {
+            for (int i = 0; i < missingNumbers.length(); i++) {
+                int number = missingNumbers.optInt(i, -1);
+                if (number <= 0 || findSeasonByNumber(seasons, number) != null) continue;
+                JSONObject placeholder = new JSONObject();
+                try {
+                    placeholder.put("id", "missing-season:" + series.optString("id") + ":" + number);
+                    placeholder.put("kind", "season");
+                    placeholder.put("season_number", number);
+                    placeholder.put("title", "Temporada " + String.format(java.util.Locale.ROOT, "%02d", number));
+                    placeholder.put("display_title", placeholder.optString("title"));
+                    placeholder.put("poster_url", series.optString("poster_url", ""));
+                    placeholder.put("is_placeholder", true);
+                    JSONObject statuses = series.optJSONObject("season_request_statuses");
+                    if (statuses != null) placeholder.put("request_status", statuses.optString(String.valueOf(number), ""));
+                } catch (JSONException ignored) { }
+                seasons.add(placeholder);
+            }
+        }
+        Collections.sort(seasons, Comparator.comparingInt(value -> value.optInt("season_number", Integer.MAX_VALUE)));
+        if (seasons.isEmpty()) {
+            addEmpty(t("No se encontraron temporadas."));
+            return;
+        }
+        int screenWidthDp = Math.round(getResources().getDisplayMetrics().widthPixels
+                / getResources().getDisplayMetrics().density);
+        int columns = isTelevision() ? Math.max(2, Math.min(6, (screenWidthDp - 32) / 170))
+                : (getResources().getConfiguration().orientation == 2 ? 4 : 2);
+        int cardWidthDp = Math.max(1, (screenWidthDp - 32 - columns * 8) / columns);
+        int rowIndex = 0;
+        LinearLayout row = null;
+        for (JSONObject season : seasons) {
+            if (rowIndex % columns == 0) {
+                row = new LinearLayout(this);
+                row.setGravity(Gravity.TOP);
+                row.setPadding(d(16), 0, d(16), d(14));
+                content.addView(row, new LinearLayout.LayoutParams(-1, -2));
+            }
+            final JSONObject selectedSeason = season;
+            LinearLayout card = new LinearLayout(this);
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setFocusable(true);
+            card.setClickable(!season.optBoolean("is_placeholder"));
+            card.setLongClickable(!season.optBoolean("is_placeholder"));
+            applyTvFocusStyle(card, true);
+            FrameLayout art = new FrameLayout(this);
+            art.setBackground(round(PANEL, d(9)));
+            ImageView poster = new ImageView(this);
+            poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            art.addView(poster, new FrameLayout.LayoutParams(-1, -1));
+            showPoster(season.optString("poster_url", series.optString("poster_url", "")), poster, false);
+            if (season.optBoolean("is_placeholder")) {
+                View shade = new View(this);
+                shade.setBackgroundColor(0x99090A0D);
+                art.addView(shade, new FrameLayout.LayoutParams(-1, -1));
+                TextView missing = label("pending".equals(season.optString("request_status"))
+                        || "approved".equals(season.optString("request_status"))
+                        ? t("Solicitada") : t("Pendiente"), 11, Color.WHITE, true);
+                missing.setGravity(Gravity.CENTER);
+                missing.setBackground(round(0xDD343945, d(7)));
+                FrameLayout.LayoutParams badge = new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER);
+                art.addView(missing, badge);
+            }
+            LinearLayout.LayoutParams artParams = new LinearLayout.LayoutParams(-1, d(205));
+            card.addView(art, artParams);
+            TextView title = labelRaw(displayTitle(season), 14, Color.WHITE, true);
+            title.setMaxLines(2);
+            title.setPadding(d(3), d(8), d(3), 0);
+            card.addView(title);
+            TextView meta = label(cardSubtitle(season), 11, MUTED, false);
+            meta.setPadding(d(3), d(3), d(3), 0);
+            card.addView(meta);
+            card.setTag("season-window:" + season.optString("id"));
+            card.setOnClickListener(v -> {
+                if (selectedSeason.optBoolean("is_placeholder")) return;
+                openSeasonFromWindow(series, selectedSeason);
+            });
+            if (!season.optBoolean("is_placeholder"))
+                card.setOnLongClickListener(v -> { showActions(selectedSeason); return true; });
+            LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(d(cardWidthDp), -2);
+            cardParams.setMargins(d(4), 0, d(4), 0);
+            row.addView(card, cardParams);
+            rowIndex++;
+        }
+        loadVisibleLazyRows();
+        if (isTelevision() && content.getChildCount() > 3
+                && content.getChildAt(3) instanceof ViewGroup) {
+            ViewGroup firstRow = (ViewGroup) content.getChildAt(3);
+            if (firstRow.getChildCount() > 0) firstRow.getChildAt(0).requestFocus();
+        }
+    }
+
+    JSONObject findSeasonByNumber(List<JSONObject> seasons, int number) {
+        for (JSONObject season : seasons)
+            if (season.optInt("season_number", -1) == number) return season;
+        return null;
+    }
+
+    void openSeasonFromWindow(JSONObject series, JSONObject season) {
+        String id = season.optString("id", "");
+        if (id.isEmpty()) return;
+        seasonDetailParentId = series.optString("id", "");
+        showingSeasons = false;
+        showingDetail = true;
+        showLoading(t("Cargando temporada…"));
+        io.execute(() -> {
+            try {
+                JSONObject fullSeason = getJson("/api/v1/catalog/" + enc(id));
+                runOnUiThread(() -> renderDetail(fullSeason));
+            } catch (Exception e) { runOnUiThread(() -> renderError(e.getMessage())); }
+        });
+    }
+
+    void returnFromSeasonWindow() {
+        showingSeasons = false;
+        seasonsSeriesId = "";
+        String screen = seasonsReturnScreen;
+        String detailId = seasonsReturnDetailId;
+        int scrollY = seasonsReturnScrollY;
+        String focusTag = seasonsReturnFocusTag;
+        seasonsReturnScreen = "";
+        seasonsReturnDetailId = "";
+        seasonsReturnFocusTag = "";
+        pendingFocusRestoreTag = focusTag;
+        if ("detail".equals(screen) && !detailId.isEmpty()) {
+            io.execute(() -> {
+                try {
+                    JSONObject node = getJson("/api/v1/catalog/" + enc(detailId));
+                    runOnUiThread(() -> renderDetail(node));
+                } catch (Exception e) { runOnUiThread(this::loadHome); }
+            });
+        } else if ("collection".equals(screen) && !breadcrumbs.isEmpty()) {
+            pendingListingRestoreY = scrollY;
+            showCollectionContents(breadcrumbs.get(breadcrumbs.size() - 1));
+        } else if ("library".equals(screen)) {
+            pendingListingRestoreY = scrollY;
+            openLibrary(currentLibrary);
+        } else if ("search".equals(screen) && lastSearchQuery != null) {
+            pendingListingRestoreY = scrollY;
+            performSearch(lastSearchQuery);
+        } else loadHome();
     }
 
     void addSeasonNavigator(JSONObject seriesNode, JSONArray children) {
@@ -6188,6 +6424,12 @@ public class MainActivity extends Activity {
             case "Acciones": return "Ekintzak";
             case "Pedir contenido": return "Edukia eskatu";
             case "Pedir temporadas restantes": return "Gainerako denboraldiak eskatu";
+            case "Ver temporadas": return "Denboraldiak ikusi";
+            case "Cargando temporadas…": return "Denboraldiak kargatzen…";
+            case "Cargando temporada…": return "Denboraldia kargatzen…";
+            case "Selecciona una temporada para ver sus capítulos.": return "Hautatu denboraldi bat haren atalak ikusteko.";
+            case "No se encontraron temporadas.": return "Ez da denboraldirik aurkitu.";
+            case "Editar metadata": return "Metadatuak editatu";
             case "Pedir temporada completa": return "Denboraldi osoa eskatu";
             case "Pedir capítulos restantes": return "Falta diren atalak eskatu";
             case "temporada completa": return "denboraldi osoa";
@@ -6450,6 +6692,10 @@ public class MainActivity extends Activity {
             case "El usuario debe tener al menos 3 caracteres y la contraseña 8.":
                 return "Erabiltzaileak gutxienez 3 karaktere eta pasahitzak 8 izan behar dituzte.";
             case "Ajustes de Zinema": return "Zinemaren ezarpenak";
+            case "Intro": return "Hasierako animazioa";
+            case "Sonido del intro": return "Introko soinua";
+            case "Activa o desactiva el sonido de la animación inicial.":
+                return "Hasierako animazioaren soinua aktibatu edo desaktibatu.";
             case "Configuración del servidor": return "Zerbitzariaren ezarpenak";
             case "Nombre del servidor": return "Zerbitzariaren izena";
             case "Dirección del servidor": return "Zerbitzariaren helbidea";
@@ -7992,6 +8238,27 @@ public class MainActivity extends Activity {
         languageButtons.addView(basque, basqueP);
         spanish.setOnClickListener(v -> changeLanguage("es"));
         basque.setOnClickListener(v -> changeLanguage("eu"));
+
+        LinearLayout introCard = settingsCard();
+        LinearLayout.LayoutParams introCardParams = new LinearLayout.LayoutParams(-1, -2);
+        introCardParams.topMargin = d(14);
+        screen.addView(introCard, introCardParams);
+        introCard.addView(label(t("Intro"), 14, Color.WHITE, true));
+        TextView introSoundHint = label(t("Activa o desactiva el sonido de la animación inicial."),
+                12, MUTED, false);
+        LinearLayout.LayoutParams introSoundHintParams = new LinearLayout.LayoutParams(-1, -2);
+        introSoundHintParams.topMargin = d(5);
+        introCard.addView(introSoundHint, introSoundHintParams);
+        Switch introSoundSwitch = new Switch(this);
+        introSoundSwitch.setText(t("Sonido del intro"));
+        introSoundSwitch.setTextColor(Color.WHITE);
+        introSoundSwitch.setButtonTintList(ColorStateList.valueOf(0xFFFF6B73));
+        introSoundSwitch.setChecked(prefs.getBoolean("intro_sound_enabled", true));
+        LinearLayout.LayoutParams introSoundSwitchParams = new LinearLayout.LayoutParams(-1, d(48));
+        introSoundSwitchParams.topMargin = d(7);
+        introCard.addView(introSoundSwitch, introSoundSwitchParams);
+        introSoundSwitch.setOnCheckedChangeListener((button, checked) ->
+                prefs.edit().putBoolean("intro_sound_enabled", checked).apply());
 
         LinearLayout playerCard = settingsCard();
         LinearLayout.LayoutParams playerCardParams = new LinearLayout.LayoutParams(-1, -2);
@@ -10562,6 +10829,27 @@ public class MainActivity extends Activity {
         }
         if (metadataEditorMode) {
             returnFromMetadataEditor();
+            return;
+        }
+        if (showingSeasons) {
+            returnFromSeasonWindow();
+            return;
+        }
+        if (showingDetail && !seasonDetailParentId.isEmpty()) {
+            String parentId = seasonDetailParentId;
+            seasonDetailParentId = "";
+            showingDetail = false;
+            showingSeasons = true;
+            seasonsSeriesId = parentId;
+            showLoading(t("Cargando temporadas…"));
+            io.execute(() -> {
+                try {
+                    JSONObject series = getJson("/api/v1/catalog/" + enc(parentId));
+                    runOnUiThread(() -> {
+                        if (showingSeasons && parentId.equals(seasonsSeriesId)) renderSeasonsWindow(series);
+                    });
+                } catch (Exception e) { runOnUiThread(this::loadHome); }
+            });
             return;
         }
         if (showingDetail && externalRecommendationReturnNode != null) {
