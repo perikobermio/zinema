@@ -19,6 +19,10 @@ import android.widget.Toast;
 import android.widget.VideoView;
 
 import java.util.Locale;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import org.json.JSONObject;
 
@@ -34,6 +38,9 @@ public class PlayerActivity extends Activity {
     private int seasonNumber;
     private String progressKey;
     private String profileId;
+    private String playbackSessionId;
+    private String playbackApiBase;
+    private String playbackApiToken;
     private VideoView videoView;
     private boolean internalPlayer;
     private boolean prepared;
@@ -42,6 +49,16 @@ public class PlayerActivity extends Activity {
     private TextView nextEpisodeButton;
     private JSONObject nextEpisode;
     private final Handler progressHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService playbackSessionIo = Executors.newSingleThreadExecutor();
+    private boolean playbackSessionReleased;
+    private boolean preservePlaybackSessionOnFinish;
+    private final Runnable playbackHeartbeat = new Runnable() {
+        @Override public void run() {
+            if (playbackSessionId == null || playbackSessionId.isEmpty() || playbackSessionReleased) return;
+            sendPlaybackSessionRequest("heartbeat");
+            progressHandler.postDelayed(this, 25000L);
+        }
+    };
     private final Runnable nextEpisodeTicker = new Runnable() {
         @Override public void run() {
             if (!internalPlayer || !prepared || videoView == null || nextEpisode == null) return;
@@ -74,12 +91,18 @@ public class PlayerActivity extends Activity {
         seasonNumber = getIntent().getIntExtra("season_number", 0);
         progressKey = getIntent().getStringExtra("progress_key");
         profileId = getIntent().getStringExtra("profile_id");
+        playbackSessionId = getIntent().getStringExtra("playback_session_id");
+        playbackApiBase = getIntent().getStringExtra("playback_api_base");
+        playbackApiToken = getIntent().getStringExtra("playback_api_token");
+        if (playbackSessionId != null && !playbackSessionId.isEmpty())
+            progressHandler.post(playbackHeartbeat);
         String nextRaw = getIntent().getStringExtra("next_episode_json");
         try { if (nextRaw != null && !nextRaw.isEmpty()) nextEpisode = new JSONObject(nextRaw); }
         catch (Exception ignored) { }
         if (progressKey == null || progressKey.isEmpty()) progressKey = "watch:" + path;
         long resumeAt = getIntent().getLongExtra("position", 0L);
         if (url == null || url.isEmpty()) {
+            releasePlaybackSession();
             finish();
             return;
         }
@@ -145,7 +168,7 @@ public class PlayerActivity extends Activity {
             nextEpisodeButton.setOnClickListener(v -> {
                 getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
                         .putString("auto_play_episode:" + profileId, nextEpisode.toString()).apply();
-                finishWithProgress(true);
+                finishWithProgress(true, false);
             });
         }
         setContentView(root);
@@ -241,6 +264,7 @@ public class PlayerActivity extends Activity {
                 markProfileStateDirty();
             }
         }
+        releasePlaybackSession();
         finish();
     }
 
@@ -280,11 +304,49 @@ public class PlayerActivity extends Activity {
     @Override protected void onDestroy() {
         progressHandler.removeCallbacks(nextEpisodeTicker);
         progressHandler.removeCallbacks(progressSaveTicker);
+        progressHandler.removeCallbacks(playbackHeartbeat);
+        if (isFinishing() && !preservePlaybackSessionOnFinish) releasePlaybackSession();
         super.onDestroy();
     }
 
+    private void sendPlaybackSessionRequest(String action) {
+        if (playbackApiBase == null || playbackApiToken == null
+                || playbackApiBase.isEmpty() || playbackApiToken.isEmpty()) return;
+        playbackSessionIo.execute(() -> {
+            HttpURLConnection connection = null;
+            try {
+                String endpoint = playbackApiBase + "/api/v1/playback-sessions/"
+                        + playbackSessionId + "/" + action;
+                connection = (HttpURLConnection) new URL(endpoint).openConnection();
+                connection.setRequestMethod("POST");
+                connection.setConnectTimeout(6000);
+                connection.setReadTimeout(6000);
+                connection.setRequestProperty("Authorization", "Bearer " + playbackApiToken);
+                connection.setDoOutput(true);
+                connection.getOutputStream().close();
+                connection.getResponseCode();
+            } catch (Exception ignored) {
+            } finally {
+                if (connection != null) connection.disconnect();
+            }
+        });
+    }
+
+    private void releasePlaybackSession() {
+        if (playbackSessionReleased || playbackSessionId == null || playbackSessionId.isEmpty()) return;
+        playbackSessionReleased = true;
+        progressHandler.removeCallbacks(playbackHeartbeat);
+        sendPlaybackSessionRequest("release");
+    }
+
     private void finishWithProgress(boolean completed) {
+        finishWithProgress(completed, true);
+    }
+
+    private void finishWithProgress(boolean completed, boolean reserveSeat) {
         playbackFinishing = true;
+        preservePlaybackSessionOnFinish = !reserveSeat;
+        if (reserveSeat) releasePlaybackSession();
         if (videoView == null) {
             finish();
             return;

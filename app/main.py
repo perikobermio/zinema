@@ -91,7 +91,9 @@ METADATA_RETRY_GLOBAL_LAST_REQUEST = 0.0
 METADATA_RETRY_GLOBAL_COOLDOWN_SECONDS = 10
 SCHEDULER_STARTED = False
 PLAYBACK_TICKET_TTL_SECONDS = 8 * 60 * 60
-PLAYBACK_TICKETS: dict[str, tuple[str, float, str]] = {}
+PLAYBACK_ACTIVE_TTL_SECONDS = 75
+PLAYBACK_COURTESY_SECONDS = 5 * 60
+PLAYBACK_TICKETS: dict[str, tuple[str, float, str, str]] = {}
 PLAYBACK_TICKET_LOCK = threading.Lock()
 EPISODE_THUMBNAIL_LOCK = threading.Lock()
 EPISODE_THUMBNAIL_RUNNING = False
@@ -185,6 +187,10 @@ class UserProfileRequest(BaseModel):
 
 class ActiveProfileRequest(BaseModel):
     profile_id: str = Field(min_length=1, max_length=100)
+
+
+class PlaybackLimitRequest(BaseModel):
+    max_users: int = Field(ge=1, le=32)
 
 
 class AccountCredentials(BaseModel):
@@ -385,6 +391,23 @@ def database() -> sqlite3.Connection:
     connection.execute("UPDATE accounts SET username=email WHERE username IS NULL OR username='' ")
     connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_username ON accounts(username COLLATE NOCASE)")
     connection.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    connection.execute(
+        "INSERT OR IGNORE INTO app_settings(key, value) VALUES ('playback_max_users', '3')"
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS playback_sessions (
+               device_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL UNIQUE,
+               item_id TEXT NOT NULL,
+               status TEXT NOT NULL CHECK(status IN ('active', 'reserved')),
+               expires_at REAL NOT NULL,
+               updated_at REAL NOT NULL
+           )"""
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_playback_sessions_expiry "
+        "ON playback_sessions(status, expires_at)"
+    )
     episode_art_migration = connection.execute(
         "SELECT value FROM app_settings WHERE key='episode_still_artwork_v1'"
     ).fetchone()
@@ -2317,6 +2340,9 @@ def disable_account(account_id: str, admin_device_id: Annotated[str, Depends(req
             "SELECT id FROM client_devices WHERE user_id=?", (account_id,),
         ).fetchall()]
         cursor = connection.execute("UPDATE accounts SET disabled=1 WHERE id=? AND disabled=0", (account_id,))
+        if device_ids:
+            connection.executemany("DELETE FROM playback_sessions WHERE device_id=?",
+                                    [(device_id,) for device_id in device_ids])
         connection.commit()
     if cursor.rowcount == 0:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -2342,6 +2368,9 @@ def _delete_account_data(account_id: str) -> bool:
         if profile_ids:
             connection.executemany("DELETE FROM profile_state WHERE profile_id=?",
                                    [(profile_id,) for profile_id in profile_ids])
+        if device_ids:
+            connection.executemany("DELETE FROM playback_sessions WHERE device_id=?",
+                                   [(device_id,) for device_id in device_ids])
         connection.execute("DELETE FROM user_profiles WHERE user_id=?", (account_id,))
         connection.execute("DELETE FROM client_devices WHERE user_id=?", (account_id,))
         connection.execute("DELETE FROM accounts WHERE id=?", (account_id,))
@@ -2390,6 +2419,7 @@ def list_client_devices() -> list[dict[str, object]]:
 def revoke_client_device(device_id: str) -> dict[str, bool]:
     with closing(database()) as connection:
         cursor = connection.execute("UPDATE client_devices SET revoked=1 WHERE id=?", (device_id,))
+        connection.execute("DELETE FROM playback_sessions WHERE device_id=?", (device_id,))
         connection.commit()
     with PLAYBACK_TICKET_LOCK:
         for ticket, grant in list(PLAYBACK_TICKETS.items()):
@@ -4162,19 +4192,184 @@ def metadata_review_queue() -> list[dict[str, object]]:
     ]
 
 
+def _device_is_admin(connection: sqlite3.Connection, device_id: str) -> bool:
+    row = connection.execute(
+        """SELECT 1 FROM client_devices d JOIN accounts a ON a.id=d.user_id
+           WHERE d.id=? AND d.revoked=0 AND a.disabled=0 AND a.is_admin=1""",
+        (device_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _playback_max_users(connection: sqlite3.Connection) -> int:
+    row = connection.execute(
+        "SELECT value FROM app_settings WHERE key='playback_max_users'"
+    ).fetchone()
+    try:
+        return max(1, min(32, int(row["value"]))) if row else 3
+    except (TypeError, ValueError):
+        return 3
+
+
+def _expire_playback_sessions(connection: sqlite3.Connection, now: float) -> None:
+    # A lost client heartbeat gets the same five minute courtesy as a clean stop.
+    connection.execute(
+        """UPDATE playback_sessions SET status='reserved', expires_at=?, updated_at=?
+           WHERE status='active' AND expires_at<=?""",
+        (now + PLAYBACK_COURTESY_SECONDS, now, now),
+    )
+    connection.execute(
+        "DELETE FROM playback_sessions WHERE status='reserved' AND expires_at<=?", (now,)
+    )
+
+
+def _playback_status(connection: sqlite3.Connection, device_id: str,
+                     now: float | None = None) -> dict[str, object]:
+    now = time.time() if now is None else now
+    _expire_playback_sessions(connection, now)
+    limit = _playback_max_users(connection)
+    rows = connection.execute(
+        "SELECT device_id, session_id, status, expires_at FROM playback_sessions "
+        "WHERE expires_at>? ORDER BY updated_at", (now,),
+    ).fetchall()
+    own = next((row for row in rows if row["device_id"] == device_id), None)
+    is_admin = _device_is_admin(connection, device_id)
+    playing = sum(1 for row in rows if row["status"] == "active")
+    occupied = len(rows)
+    own_reserved_seconds = max(0, int(own["expires_at"] - now)) \
+        if own is not None and own["status"] == "reserved" else 0
+    return {
+        "max_users": limit,
+        "playing_count": playing,
+        "reserved_count": occupied - playing,
+        "occupied_count": occupied,
+        "is_admin": is_admin,
+        "own_status": own["status"] if own is not None else "",
+        "own_session_id": own["session_id"] if own is not None else "",
+        "own_reserved_seconds": own_reserved_seconds,
+        "can_play": is_admin or own is not None or occupied < limit,
+    }
+
+
+@app.get("/api/v1/playback-capacity")
+def playback_capacity(device_id: str = Depends(require_client)) -> dict[str, object]:
+    now = time.time()
+    with closing(database()) as connection:
+        result = _playback_status(connection, device_id, now)
+        connection.commit()
+        return result
+
+
+@app.get("/api/v1/admin/playback-limit", dependencies=[Depends(require_admin)])
+def get_playback_limit() -> dict[str, int]:
+    with closing(database()) as connection:
+        return {"max_users": _playback_max_users(connection)}
+
+
+@app.post("/api/v1/admin/playback-limit", dependencies=[Depends(require_admin)])
+def set_playback_limit(payload: PlaybackLimitRequest) -> dict[str, int]:
+    with closing(database()) as connection:
+        connection.execute(
+            "INSERT INTO app_settings(key, value) VALUES ('playback_max_users', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(payload.max_users),),
+        )
+        connection.commit()
+    return {"max_users": payload.max_users}
+
+
+@app.post("/api/v1/playback-sessions/{session_id}/heartbeat")
+def playback_session_heartbeat(session_id: str,
+                               device_id: str = Depends(require_client)) -> dict[str, object]:
+    now = time.time()
+    with closing(database()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        _expire_playback_sessions(connection, now)
+        row = connection.execute(
+            "SELECT status, expires_at FROM playback_sessions WHERE session_id=? AND device_id=?",
+            (session_id, device_id),
+        ).fetchone()
+        if row is None or row["expires_at"] <= now:
+            connection.commit()
+            raise HTTPException(status_code=404, detail="Playback session expired")
+        connection.execute(
+            """UPDATE playback_sessions SET status='active', expires_at=?, updated_at=?
+               WHERE session_id=? AND device_id=?""",
+            (now + PLAYBACK_ACTIVE_TTL_SECONDS, now, session_id, device_id),
+        )
+        connection.commit()
+    return {"status": "active", "expires_in": PLAYBACK_ACTIVE_TTL_SECONDS}
+
+
+@app.post("/api/v1/playback-sessions/{session_id}/release")
+def release_playback_session(session_id: str,
+                             device_id: str = Depends(require_client)) -> dict[str, object]:
+    now = time.time()
+    with closing(database()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT status FROM playback_sessions WHERE session_id=? AND device_id=?",
+            (session_id, device_id),
+        ).fetchone()
+        if row is not None:
+            connection.execute(
+                """UPDATE playback_sessions SET status='reserved', expires_at=?, updated_at=?
+                   WHERE session_id=? AND device_id=?""",
+                (now + PLAYBACK_COURTESY_SECONDS, now, session_id, device_id),
+            )
+        connection.commit()
+    return {"status": "reserved", "courtesy_seconds": PLAYBACK_COURTESY_SECONDS}
+
+
 @app.post("/api/v1/items/{item_id}/playback-ticket")
 def create_playback_ticket(item_id: str, device_id: str = Depends(require_client)) -> dict[str, object]:
     get_media_file(item_id)
     now = time.time()
+    session_id = ""
+    with closing(database()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if not _device_is_admin(connection, device_id):
+            _expire_playback_sessions(connection, now)
+            existing = connection.execute(
+                "SELECT session_id, expires_at FROM playback_sessions WHERE device_id=?",
+                (device_id,),
+            ).fetchone()
+            if existing is not None and existing["expires_at"] > now:
+                session_id = uuid4().hex
+                connection.execute(
+                    """UPDATE playback_sessions SET session_id=?, status='active', item_id=?, expires_at=?, updated_at=?
+                       WHERE device_id=?""",
+                    (session_id, item_id, now + PLAYBACK_ACTIVE_TTL_SECONDS, now, device_id),
+                )
+            else:
+                occupied = connection.execute(
+                    "SELECT COUNT(*) FROM playback_sessions WHERE expires_at>?", (now,),
+                ).fetchone()[0]
+                maximum = _playback_max_users(connection)
+                if occupied >= maximum:
+                    connection.commit()
+                    raise HTTPException(status_code=409,
+                                        detail="All playback places are occupied. Try again later.")
+                session_id = uuid4().hex
+                connection.execute(
+                    """INSERT INTO playback_sessions
+                       (device_id, session_id, item_id, status, expires_at, updated_at)
+                       VALUES (?, ?, ?, 'active', ?, ?)""",
+                    (device_id, session_id, item_id, now + PLAYBACK_ACTIVE_TTL_SECONDS, now),
+                )
+        connection.commit()
+
     ticket = secrets.token_urlsafe(32)
     with PLAYBACK_TICKET_LOCK:
-        expired = [key for key, (_, expiry, _) in PLAYBACK_TICKETS.items() if expiry <= now]
+        expired = [key for key, (_, expiry, _, _) in PLAYBACK_TICKETS.items() if expiry <= now]
         for key in expired:
             PLAYBACK_TICKETS.pop(key, None)
-        PLAYBACK_TICKETS[ticket] = (item_id, now + PLAYBACK_TICKET_TTL_SECONDS, device_id)
+        PLAYBACK_TICKETS[ticket] = (item_id, now + PLAYBACK_TICKET_TTL_SECONDS,
+                                   device_id, session_id)
     return {
         "url": f"/api/v1/playback/{ticket}",
         "expires_in": PLAYBACK_TICKET_TTL_SECONDS,
+        "session_id": session_id,
     }
 
 
@@ -4186,12 +4381,38 @@ def stream_with_playback_ticket(ticket: str, request: Request):
         if grant is None or grant[1] <= now:
             PLAYBACK_TICKETS.pop(ticket, None)
             raise HTTPException(status_code=401, detail="Playback ticket expired or invalid")
-        item_id = grant[0]
+        item_id, _, device_id, session_id = grant
+    if session_id:
+        with closing(database()) as connection:
+            now = time.time()
+            _expire_playback_sessions(connection, now)
+            session = connection.execute(
+                "SELECT status, item_id, expires_at FROM playback_sessions WHERE session_id=? AND device_id=?",
+                (session_id, device_id),
+            ).fetchone()
+            connection.commit()
+        if session is None or session["status"] != "active" or session["expires_at"] <= now \
+                or session["item_id"] != item_id:
+            raise HTTPException(status_code=403, detail="Playback session is no longer active")
     return _stream_item(item_id, request)
 
 
-@app.get("/api/v1/items/{item_id}/stream", dependencies=[Depends(require_client)])
-def stream_item(item_id: str, request: Request):
+@app.get("/api/v1/items/{item_id}/stream")
+def stream_item(item_id: str, request: Request, device_id: str = Depends(require_client)):
+    with closing(database()) as connection:
+        admin = _device_is_admin(connection, device_id)
+        if not admin:
+            now = time.time()
+            _expire_playback_sessions(connection, now)
+            session = connection.execute(
+                """SELECT 1 FROM playback_sessions WHERE device_id=? AND item_id=?
+                   AND status='active' AND expires_at>?""",
+                (device_id, item_id, now),
+            ).fetchone()
+            connection.commit()
+            if session is None:
+                raise HTTPException(status_code=403,
+                                    detail="Acquire a playback place before streaming")
     return _stream_item(item_id, request)
 
 

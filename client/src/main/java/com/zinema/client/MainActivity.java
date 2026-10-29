@@ -174,6 +174,7 @@ public class MainActivity extends Activity {
     final Handler downloadProgressHandler = new Handler(Looper.getMainLooper());
     final Handler contentRequestSearchHandler = new Handler(Looper.getMainLooper());
     final Handler incomingDownloadStatusHandler = new Handler(Looper.getMainLooper());
+    final Handler playbackCapacityHandler = new Handler(Looper.getMainLooper());
     Runnable contentRequestSearchTask;
     Runnable adminSyncPollTask;
     Runnable incomingCatalogSyncPollTask;
@@ -181,9 +182,13 @@ public class MainActivity extends Activity {
     Runnable serverUpdatePollTask;
     Runnable catalogDownloadStatusTask;
     Runnable incomingDownloadStatusTask;
+    Runnable playbackCapacityTask;
     boolean catalogDownloadStatusRequestRunning;
     boolean catalogDownloadStatusLoaded;
     boolean incomingDownloadStatusRequestRunning;
+    boolean playbackCapacityRequestRunning;
+    boolean playbackCapacityLoaded;
+    JSONObject playbackCapacity = new JSONObject();
     String incomingStatusRefreshedDownloadId = "";
     JSONObject catalogDownloadStatus = new JSONObject();
     LinearLayout adminContentRequestsSlot;
@@ -211,6 +216,7 @@ public class MainActivity extends Activity {
     LinearLayout page;
     LinearLayout content;
     ScrollView contentScroller;
+    LinearLayout playbackCapacityBanner;
     TextView backButton;
     View brandButton;
     TextView searchButton;
@@ -641,6 +647,13 @@ public class MainActivity extends Activity {
         page.addView(navScroll, new LinearLayout.LayoutParams(-1, d(48)));
         if (showingAdmin || showingProfiles) navScroll.setVisibility(View.GONE);
 
+        playbackCapacityBanner = new LinearLayout(this);
+        playbackCapacityBanner.setOrientation(LinearLayout.VERTICAL);
+        playbackCapacityBanner.setPadding(d(16), d(10), d(16), d(10));
+        playbackCapacityBanner.setBackground(round(0xEE814F13, d(10)));
+        playbackCapacityBanner.setVisibility(View.GONE);
+        page.addView(playbackCapacityBanner, new LinearLayout.LayoutParams(-1, -2));
+
         contentScroller = new ScrollView(this);
         contentScroller.setFillViewport(true);
         contentScroller.setVerticalScrollBarEnabled(false);
@@ -662,6 +675,8 @@ public class MainActivity extends Activity {
                 loadVisibleLazyRows());
         page.addView(contentScroller, new LinearLayout.LayoutParams(-1, 0, 1));
         setContentView(frame);
+        refreshPlaybackCapacityUi();
+        startPlaybackCapacityPolling();
         frame.post(() -> {
             loadVisibleLazyRows();
             if (showingAdmin) {
@@ -844,6 +859,94 @@ public class MainActivity extends Activity {
         p.topMargin = d(16);
         box.addView(text, p);
         content.addView(box, new LinearLayout.LayoutParams(-1, d(320)));
+    }
+
+    boolean canStartPlayback() {
+        return !playbackCapacityLoaded || isAccountAdmin()
+                || playbackCapacity.optBoolean("can_play", true);
+    }
+
+    void refreshPlaybackCapacityUi() {
+        boolean canPlay = canStartPlayback();
+        setPlaybackControlsEnabled(content, canPlay);
+        if (playbackCapacityBanner == null) return;
+        playbackCapacityBanner.removeAllViews();
+        if (showingAdmin || showingProfiles || !playbackCapacityLoaded || isAccountAdmin()) {
+            playbackCapacityBanner.setVisibility(View.GONE);
+            return;
+        }
+        String message = "";
+        if (!canPlay) {
+            int occupied = playbackCapacity.optInt("occupied_count");
+            int maximum = playbackCapacity.optInt("max_users", 3);
+            message = t("Todas las plazas están ocupadas") + " · " + occupied + "/" + maximum
+                    + "\n" + t("Puedes navegar por el catálogo; espera a que se libere una plaza para reproducir.");
+            playbackCapacityBanner.setBackground(round(0xEE814F13, d(10)));
+        } else if ("reserved".equals(playbackCapacity.optString("own_status"))) {
+            int seconds = playbackCapacity.optInt("own_reserved_seconds");
+            message = t("Tu plaza está reservada durante") + " "
+                    + String.format(java.util.Locale.ROOT, "%d:%02d", seconds / 60, seconds % 60);
+            playbackCapacityBanner.setBackground(round(0xEE28735A, d(10)));
+        }
+        if (message.isEmpty()) {
+            playbackCapacityBanner.setVisibility(View.GONE);
+            return;
+        }
+        TextView notice = labelRaw(message, 13, Color.WHITE, true);
+        notice.setGravity(Gravity.CENTER_VERTICAL);
+        playbackCapacityBanner.addView(notice, new LinearLayout.LayoutParams(-1, -2));
+        playbackCapacityBanner.setVisibility(View.VISIBLE);
+    }
+
+    void setPlaybackControlsEnabled(View view, boolean enabled) {
+        if (view == null) return;
+        Object tag = view.getTag();
+        boolean playbackControl = "playback-control".equals(tag)
+                || (tag instanceof String && ((String) tag).startsWith("resume-item:"));
+        if (playbackControl) {
+            view.setEnabled(enabled);
+            view.setClickable(enabled);
+            view.setFocusable(enabled);
+            view.setAlpha(enabled ? 1f : 0.42f);
+        }
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++)
+                setPlaybackControlsEnabled(group.getChildAt(i), enabled);
+        }
+    }
+
+    void startPlaybackCapacityPolling() {
+        if (clientApiToken().isEmpty() || showingAdmin || showingProfiles || !activityResumed
+                || playbackCapacityRequestRunning) return;
+        if (playbackCapacityTask != null) playbackCapacityHandler.removeCallbacks(playbackCapacityTask);
+        playbackCapacityRequestRunning = true;
+        io.execute(() -> {
+            JSONObject result = null;
+            try { result = getJson("/api/v1/playback-capacity"); }
+            catch (Exception ignored) { }
+            JSONObject status = result;
+            runOnUiThread(() -> {
+                playbackCapacityRequestRunning = false;
+                if (status != null) {
+                    playbackCapacity = status;
+                    playbackCapacityLoaded = true;
+                    refreshPlaybackCapacityUi();
+                }
+                if (activityResumed && !showingAdmin && !showingProfiles) {
+                    long delay = playbackCapacityLoaded && !canStartPlayback() ? 5000L : 30000L;
+                    playbackCapacityTask = this::startPlaybackCapacityPolling;
+                    playbackCapacityHandler.postDelayed(playbackCapacityTask, delay);
+                }
+            });
+        });
+    }
+
+    void stopPlaybackCapacityPolling() {
+        if (playbackCapacityTask != null) {
+            playbackCapacityHandler.removeCallbacks(playbackCapacityTask);
+            playbackCapacityTask = null;
+        }
     }
 
     JSONObject getJson(String path) throws Exception {
@@ -2806,6 +2909,7 @@ public class MainActivity extends Activity {
             }
             addRow(genreLabel(genre), genreItems);
         }
+        refreshPlaybackCapacityUi();
         if (visibleMovies.isEmpty() && visibleSeries.isEmpty()) {
             TextView empty = label("Tu biblioteca está vacía. Sincroniza el catálogo en el servidor.", 16, MUTED, false);
             empty.setPadding(d(24), d(36), d(24), d(32));
@@ -4013,6 +4117,7 @@ public class MainActivity extends Activity {
         restoreListingScrollIfPending();
         restorePendingFocus();
         refreshVisibleDownloadPosters(content);
+        refreshPlaybackCapacityUi();
         startCatalogDownloadStatusPolling();
     }
 
@@ -5524,6 +5629,7 @@ public class MainActivity extends Activity {
         if (externalRecommendation) {
             primaryAction.setOnClickListener(v -> confirmRecommendationRequest(node, primaryAction));
         } else {
+            primaryAction.setTag("playback-control");
             primaryAction.setOnClickListener(v -> playDetailItem(node, false));
             primaryAction.setOnLongClickListener(v -> {
                 String[] options = {
@@ -5555,6 +5661,7 @@ public class MainActivity extends Activity {
         content.addView(banner, bp);
         if (isTelevision() && primaryAction.isEnabled())
             primaryAction.post(() -> primaryAction.requestFocus());
+        refreshPlaybackCapacityUi();
 
         JSONArray children = node.optJSONArray("children");
         if ("series".equals(node.optString("kind"))) {
@@ -5864,6 +5971,7 @@ public class MainActivity extends Activity {
                 });
             }
         }
+        refreshPlaybackCapacityUi();
     }
 
     void loadSeasonEpisodes(JSONObject seriesNode, JSONObject seasonStub, LinearLayout target) {
@@ -5981,6 +6089,21 @@ public class MainActivity extends Activity {
             case "capítulos": return "atal";
             case "Inicio": return "Hasiera";
             case "Lo más nuevo": return "Eduki berrienak";
+            case "Todas las plazas están ocupadas": return "Plaza guztiak beteta daude";
+            case "Puedes navegar por el catálogo; espera a que se libere una plaza para reproducir.":
+                return "Katalogoan nabiga dezakezu; erreproduzitzeko plaza bat libre egon arte itxaron.";
+            case "Tu plaza está reservada durante": return "Zure plaza gordeta dago denbora honetan:";
+            case "Todas las plazas están ocupadas. Espera a que se libere una.":
+                return "Plaza guztiak beteta daude. Itxaron bat libre geratu arte.";
+            case "Reproducciones simultáneas": return "Aldibereko erreprodukzioak";
+            case "Número máximo de dispositivos reproduciendo a la vez.":
+                return "Aldi berean erreproduzi dezaketen gailuen gehieneko kopurua.";
+            case "Máximo de usuarios": return "Gehieneko erabiltzaile kopurua";
+            case "Guardar límite": return "Muga gorde";
+            case "Introduce un límite entre 1 y 32.": return "Sartu 1 eta 32 arteko muga.";
+            case "Límite de reproducción guardado.": return "Erreprodukzio-muga gorde da.";
+            case "No se pudo cargar el límite de reproducción: ":
+                return "Ezin izan da erreprodukzio-muga kargatu: ";
             case "Favoritos": return "Gogokoenak";
             case "Añadir a favoritos": return "Gogokoetara gehitu";
             case "Quitar de favoritos": return "Gogokoetatik kendu";
@@ -6917,6 +7040,7 @@ public class MainActivity extends Activity {
                 pendingParams.setMargins(0, d(5), d(5), 0);
                 thumbnailFrame.addView(pending, pendingParams);
             } else {
+                item.setTag("playback-control");
                 item.setOnClickListener(v -> launchPlayer(file.optString("stream_url"),
                         file.optString("title", "Zinema"), file.optString("poster_url", fallbackPoster),
                         owner.optString("id", ""), file.optString("id", ""), owner.optString("kind", "")));
@@ -7298,7 +7422,9 @@ public class MainActivity extends Activity {
         play.setOnClickListener(v -> launchPlayer(episode.optString("stream_url"),
                 episode.optString("title", "Zinema"), episode.optString("poster_url", ""),
                 episode.optString("node_id", ""), episode.optString("id", ""), "season"));
+        play.setTag("playback-control");
         details.setOnClickListener(v -> showVideoFileDetails(episode, episode.optString("library", "")));
+        refreshPlaybackCapacityUi();
     }
 
     String searchSubtitle(JSONObject result) {
@@ -7669,6 +7795,7 @@ public class MainActivity extends Activity {
             return;
         }
         leaveStartupHomeWait();
+        stopPlaybackCapacityPolling();
         stopIncomingDownloadStatusPolling();
         if (!showingAdmin) adminReturnDetailId = showingDetail ? detailNodeId : "";
         showingAdmin = true;
@@ -7689,6 +7816,7 @@ public class MainActivity extends Activity {
             return;
         }
         leaveStartupHomeWait();
+        stopPlaybackCapacityPolling();
         if (!showingAdmin) adminReturnDetailId = showingDetail ? detailNodeId : "";
         showingAdmin = true;
         showingDownloadManagement = true;
@@ -7699,6 +7827,7 @@ public class MainActivity extends Activity {
 
     void showLoginScreen() {
         leaveStartupHomeWait();
+        stopPlaybackCapacityPolling();
         showingAdmin = false;
         showingDownloadManagement = false;
         showingProfiles = false;
@@ -7850,6 +7979,15 @@ public class MainActivity extends Activity {
         introP.bottomMargin = d(20);
         screen.addView(intro, introP);
 
+        if (prefs.getBoolean("account_is_admin", false)) {
+            LinearLayout playbackSlot = new LinearLayout(this);
+            playbackSlot.setOrientation(LinearLayout.VERTICAL);
+            LinearLayout.LayoutParams playbackSlotParams = new LinearLayout.LayoutParams(-1, -2);
+            playbackSlotParams.bottomMargin = d(14);
+            screen.addView(playbackSlot, playbackSlotParams);
+            loadPlaybackLimitControls(playbackSlot);
+        }
+
         LinearLayout languageCard = settingsCard();
         LinearLayout.LayoutParams languageP = new LinearLayout.LayoutParams(-1, -2);
         languageP.topMargin = d(14);
@@ -7899,6 +8037,76 @@ public class MainActivity extends Activity {
         });
 
         content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
+    }
+
+    void loadPlaybackLimitControls(LinearLayout slot) {
+        io.execute(() -> {
+            try {
+                JSONObject settings = getJson("/api/v1/admin/playback-limit");
+                runOnUiThread(() -> {
+                    if (!showingAdmin || slot.getParent() == null) return;
+                    LinearLayout card = settingsCard();
+                    card.addView(label(t("Reproducciones simultáneas"), 16, Color.WHITE, true));
+                    TextView hint = label(t("Número máximo de dispositivos reproduciendo a la vez."),
+                            12, MUTED, false);
+                    LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(-1, -2);
+                    hintParams.topMargin = d(5);
+                    card.addView(hint, hintParams);
+                    EditText limit = settingsField(String.valueOf(settings.optInt("max_users", 3)),
+                            t("Máximo de usuarios"), false);
+                    limit.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+                    LinearLayout.LayoutParams limitParams = new LinearLayout.LayoutParams(-1, d(48));
+                    limitParams.topMargin = d(10);
+                    card.addView(limit, limitParams);
+                    Button save = actionButton("Guardar límite", true);
+                    LinearLayout.LayoutParams saveParams = new LinearLayout.LayoutParams(-2, d(42));
+                    saveParams.topMargin = d(8);
+                    card.addView(save, saveParams);
+                    save.setOnClickListener(v -> {
+                        int maximum;
+                        try { maximum = Integer.parseInt(limit.getText().toString().trim()); }
+                        catch (NumberFormatException ignored) { maximum = 0; }
+                        if (maximum < 1 || maximum > 32) {
+                            Toast.makeText(this, t("Introduce un límite entre 1 y 32."),
+                                    Toast.LENGTH_LONG).show();
+                            return;
+                        }
+                        final int requestedMaximum = maximum;
+                        save.setEnabled(false);
+                        io.execute(() -> {
+                            try {
+                                JSONObject payload = new JSONObject();
+                                payload.put("max_users", requestedMaximum);
+                                JSONObject updated = postJson("/api/v1/admin/playback-limit", payload);
+                                runOnUiThread(() -> {
+                                    limit.setText(String.valueOf(updated.optInt("max_users", requestedMaximum)));
+                                    save.setEnabled(true);
+                                    Toast.makeText(this, t("Límite de reproducción guardado."),
+                                            Toast.LENGTH_SHORT).show();
+                                });
+                            } catch (Exception e) {
+                                runOnUiThread(() -> {
+                                    save.setEnabled(true);
+                                    Toast.makeText(this, t("No se pudo guardar: ") + e.getMessage(),
+                                            Toast.LENGTH_LONG).show();
+                                });
+                            }
+                        });
+                    });
+                    slot.removeAllViews();
+                    slot.addView(card);
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (!showingAdmin || slot.getParent() == null) return;
+                    slot.removeAllViews();
+                    LinearLayout card = settingsCard();
+                    card.addView(label(t("No se pudo cargar el límite de reproducción: ")
+                            + e.getMessage(), 13, 0xFFFF858A, false));
+                    slot.addView(card);
+                });
+            }
+        });
     }
 
     void renderDownloadManagementWindow() {
@@ -10010,6 +10218,11 @@ public class MainActivity extends Activity {
     void launchPlayer(String path, String title, String posterUrl,
                       String ownerNodeId, String mediaId, String ownerKind,
                       boolean fromBeginning) {
+        if (!canStartPlayback()) {
+            Toast.makeText(this, t("Todas las plazas están ocupadas. Espera a que se libere una."),
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
         if (isActiveKidProfile()) {
             JSONObject owner = findCatalogNodeById(ownerNodeId, movies);
             if (owner == null) owner = findCatalogNodeById(ownerNodeId, series);
@@ -10072,6 +10285,7 @@ public class MainActivity extends Activity {
         io.execute(() -> {
             try {
                 JSONObject ticket = postJson("/api/v1/items/" + enc(resolvedItemId) + "/playback-ticket");
+                String playbackSessionId = ticket.optString("session_id", "");
                 JSONObject nextEpisode = null;
                 String seriesId = "";
                 int seasonNumber = 0;
@@ -10097,11 +10311,18 @@ public class MainActivity extends Activity {
                 String playingSeriesId = seriesId;
                 int playingSeasonNumber = seasonNumber;
                 runOnUiThread(() -> startPlayerActivity(url, path, title, posterUrl, ownerNodeId,
-                        resolvedItemId, ownerKind, key, resumePosition, nextEpisodeJson,
+                        resolvedItemId, ownerKind, key, resumePosition, nextEpisodeJson, playbackSessionId,
                         playingSeriesId, playingSeasonNumber));
             } catch (Exception e) {
-                runOnUiThread(() -> Toast.makeText(this,
-                        t("No se pudo preparar el vídeo: ") + e.getMessage(), Toast.LENGTH_LONG).show());
+                String error = e.getMessage() == null ? "" : e.getMessage();
+                runOnUiThread(() -> {
+                    if (error.contains("HTTP 409")) {
+                        Toast.makeText(this, t("Todas las plazas están ocupadas. Espera a que se libere una."),
+                                Toast.LENGTH_LONG).show();
+                        startPlaybackCapacityPolling();
+                    } else Toast.makeText(this,
+                            t("No se pudo preparar el vídeo: ") + error, Toast.LENGTH_LONG).show();
+                });
             }
         });
     }
@@ -10109,6 +10330,7 @@ public class MainActivity extends Activity {
     void startPlayerActivity(String url, String path, String title, String posterUrl,
                              String ownerNodeId, String mediaId, String ownerKind,
                              String key, long position, String nextEpisodeJson,
+                             String playbackSessionId,
                              String seriesId, int seasonNumber) {
         Intent intent = new Intent(this, PlayerActivity.class);
         intent.putExtra("url", url);
@@ -10124,6 +10346,9 @@ public class MainActivity extends Activity {
         intent.putExtra("next_episode_json", nextEpisodeJson);
         intent.putExtra("series_id", seriesId);
         intent.putExtra("season_number", seasonNumber);
+        intent.putExtra("playback_session_id", playbackSessionId);
+        intent.putExtra("playback_api_base", server);
+        intent.putExtra("playback_api_token", clientApiToken());
         playerLaunched = true;
         startActivity(intent);
     }
@@ -10192,6 +10417,7 @@ public class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         activityResumed = true;
+        startPlaybackCapacityPolling();
         checkForClientUpdate(false);
         if (installAfterPermission && Build.VERSION.SDK_INT >= 26 && getPackageManager().canRequestPackageInstalls()) {
             installAfterPermission = false;
@@ -10229,6 +10455,7 @@ public class MainActivity extends Activity {
 
     @Override protected void onPause() {
         activityResumed = false;
+        stopPlaybackCapacityPolling();
         if (catalogDownloadStatusTask != null) {
             downloadProgressHandler.removeCallbacks(catalogDownloadStatusTask);
             catalogDownloadStatusTask = null;
