@@ -3364,7 +3364,7 @@ public class MainActivity extends Activity {
         cards.setPadding(d(16), 0, d(16), d(8));
         int count = Math.min(10, nodes.size());
         for (int i = 0; i < count; i++) cards.addView(posterCard(nodes.get(i), true));
-        LinearLayout.LayoutParams moreParams = new LinearLayout.LayoutParams(d(224), d(204));
+        LinearLayout.LayoutParams moreParams = new LinearLayout.LayoutParams(d(142), d(204));
         moreParams.setMargins(d(2), 0, d(12), 0);
         cards.addView(genreMoreCard(genre), moreParams);
         horizontal.addView(cards);
@@ -3382,9 +3382,9 @@ public class MainActivity extends Activity {
         card.setPadding(d(12), d(12), d(12), d(12));
         card.setBackground(round(PANEL, d(10)));
         card.setFocusable(false);
-        TextView moviesLink = genreMoreButton(t("Ver más películas"));
+        LinearLayout moviesLink = genreMoreButton(t("Ver más películas"), false);
         moviesLink.setOnClickListener(v -> openGenreLibrary("movies", genre));
-        TextView seriesLink = genreMoreButton(t("Ver más series"));
+        LinearLayout seriesLink = genreMoreButton(t("Ver más series"), true);
         seriesLink.setOnClickListener(v -> openGenreLibrary("series", genre));
         card.addView(moviesLink, new LinearLayout.LayoutParams(-1, d(58)));
         View divider = new View(this);
@@ -3396,14 +3396,98 @@ public class MainActivity extends Activity {
         return card;
     }
 
-    TextView genreMoreButton(String text) {
-        TextView link = label(text, 13, Color.WHITE, true);
+    LinearLayout genreMoreButton(String text, boolean series) {
+        LinearLayout link = new LinearLayout(this);
+        link.setOrientation(LinearLayout.HORIZONTAL);
         link.setGravity(Gravity.CENTER);
+        link.setPadding(d(9), d(6), d(9), d(6));
+        link.setBackground(round(series ? 0xFF584596 : 0xFF9C3139, d(8)));
         link.setFocusable(true);
         link.setClickable(true);
-        link.setBackground(round(0xFF252A35, d(8)));
+        link.setContentDescription(text);
         applyTvFocusStyle(link, false);
+        View icon = series ? seriesStripIcon() : movieClapperIcon();
+        TextView plus = labelRaw("+", 25, Color.WHITE, true);
+        plus.setGravity(Gravity.CENTER);
+        plus.setFocusable(false);
+        LinearLayout.LayoutParams plusParams = new LinearLayout.LayoutParams(d(26), d(36));
+        plusParams.setMargins(0, 0, d(3), 0);
+        link.addView(plus, plusParams);
+        LinearLayout.LayoutParams iconParams = new LinearLayout.LayoutParams(d(36), d(36));
+        link.addView(icon, iconParams);
         return link;
+    }
+
+    View seriesStripIcon() {
+        return new View(this) {
+            final Paint iconPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            @Override protected void onDraw(Canvas canvas) {
+                super.onDraw(canvas);
+                canvas.save();
+                canvas.translate(getWidth() / 2f, getHeight() / 2f);
+                canvas.scale(1.75f, 1.75f);
+                canvas.translate(-d(13), -d(12));
+                iconPaint.setColor(Color.WHITE);
+                iconPaint.setStyle(Paint.Style.STROKE);
+                iconPaint.setStrokeWidth(d(1.5f));
+                iconPaint.setStrokeCap(Paint.Cap.ROUND);
+                iconPaint.setStrokeJoin(Paint.Join.ROUND);
+                float left = d(7);
+                float top = d(8);
+                float right = d(19);
+                float bottom = d(16);
+                canvas.drawRoundRect(left, top, right, bottom,
+                        d(1.5f), d(1.5f), iconPaint);
+                canvas.drawLine(left + d(3), top - d(3), left + d(5), top, iconPaint);
+                canvas.drawLine(right - d(3), top - d(3), right - d(5), top, iconPaint);
+                canvas.drawLine(left + d(6), bottom + d(1), right - d(6), bottom + d(1), iconPaint);
+                canvas.restore();
+            }
+        };
+    }
+
+    View movieClapperIcon() {
+        return new View(this) {
+            final Paint iconPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            @Override protected void onDraw(Canvas canvas) {
+                super.onDraw(canvas);
+                float scale = Math.min(getWidth(), getHeight()) / 36f;
+                canvas.save();
+                canvas.scale(scale, scale);
+                iconPaint.setColor(Color.WHITE);
+                iconPaint.setStyle(Paint.Style.STROKE);
+                iconPaint.setStrokeWidth(2.1f);
+                iconPaint.setStrokeJoin(Paint.Join.ROUND);
+                iconPaint.setStrokeCap(Paint.Cap.ROUND);
+                Path board = new Path();
+                board.moveTo(7, 7);
+                board.lineTo(29, 7);
+                board.lineTo(32, 14);
+                board.lineTo(10, 14);
+                board.close();
+                canvas.drawPath(board, iconPaint);
+                canvas.drawRoundRect(7, 14, 29, 30, 2.5f, 2.5f, iconPaint);
+                canvas.drawLine(13, 18, 13, 26, iconPaint);
+                canvas.drawLine(19, 18, 19, 26, iconPaint);
+                canvas.drawLine(25, 18, 25, 26, iconPaint);
+                iconPaint.setStyle(Paint.Style.FILL);
+                Path stripe = new Path();
+                stripe.moveTo(11, 8);
+                stripe.lineTo(15, 8);
+                stripe.lineTo(18, 13);
+                stripe.lineTo(14, 13);
+                stripe.close();
+                canvas.drawPath(stripe, iconPaint);
+                stripe.reset();
+                stripe.moveTo(21, 8);
+                stripe.lineTo(25, 8);
+                stripe.lineTo(28, 13);
+                stripe.lineTo(24, 13);
+                stripe.close();
+                canvas.drawPath(stripe, iconPaint);
+                canvas.restore();
+            }
+        };
     }
 
     void openGenreLibrary(String library, String genre) {
