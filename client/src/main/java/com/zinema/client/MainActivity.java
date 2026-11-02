@@ -9697,9 +9697,15 @@ public class MainActivity extends Activity {
                             });
                         }
                         if (isEuskalRequest) {
-                            Button openForum = actionButton(t("Ir al detalle"), true);
+                            Button openForum = iconActionButton(
+                                    R.drawable.ic_euskal_encodings, "Ir al detalle", false, 24, false);
+                            android.graphics.drawable.Drawable openForumBackground = openForum.getBackground();
+                            if (openForumBackground instanceof android.graphics.drawable.LayerDrawable) {
+                                ((android.graphics.drawable.LayerDrawable) openForumBackground)
+                                        .setDrawable(0, round(0xFFE7E9EC, d(8)));
+                            }
                             LinearLayout.LayoutParams openForumParams =
-                                    new LinearLayout.LayoutParams(-2, d(40));
+                                    new LinearLayout.LayoutParams(d(44), d(40));
                             openForumParams.rightMargin = d(8);
                             actions.addView(openForum, openForumParams);
                             openForum.setOnClickListener(v -> {
