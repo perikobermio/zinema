@@ -409,6 +409,13 @@ def database() -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_playback_sessions_expiry "
         "ON playback_sessions(status, expires_at)"
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS catalog_view_counts (
+               item_id TEXT PRIMARY KEY,
+               view_count INTEGER NOT NULL DEFAULT 0,
+               updated_at TEXT NOT NULL
+           )"""
+    )
     episode_art_migration = connection.execute(
         "SELECT value FROM app_settings WHERE key='episode_still_artwork_v1'"
     ).fetchone()
@@ -2635,9 +2642,10 @@ def list_home_catalog() -> list[dict]:
     """Return every playable movie and series for the mixed home rows."""
     with closing(database()) as connection:
         rows = connection.execute(
-            """SELECT * FROM catalog_nodes
-               WHERE available=1 AND kind IN ('movie', 'series')
-               ORDER BY added_at DESC, title COLLATE NOCASE"""
+            """SELECT n.*, COALESCE(v.view_count, 0) AS view_count
+               FROM catalog_nodes n LEFT JOIN catalog_view_counts v ON v.item_id=n.id
+               WHERE n.available=1 AND n.kind IN ('movie', 'series')
+               ORDER BY n.added_at DESC, n.title COLLATE NOCASE"""
         ).fetchall()
         return [_node_payload(row, connection) for row in rows]
 
@@ -4358,6 +4366,19 @@ def create_playback_ticket(item_id: str, device_id: str = Depends(require_client
                        VALUES (?, ?, ?, 'active', ?, ?)""",
                     (device_id, session_id, item_id, now + PLAYBACK_ACTIVE_TTL_SECONDS, now),
                 )
+        viewed_node = connection.execute(
+            """SELECT COALESCE(li.series_node_id, li.node_id) AS node_id
+               FROM library_items li WHERE li.id=? AND li.available=1""", (item_id,),
+        ).fetchone()
+        if viewed_node is not None and viewed_node["node_id"]:
+            connection.execute(
+                """INSERT INTO catalog_view_counts(item_id, view_count, updated_at)
+                   SELECT id, 1, ? FROM catalog_nodes
+                   WHERE id=? AND kind IN ('movie','series') AND available=1
+                   ON CONFLICT(item_id) DO UPDATE SET
+                     view_count=view_count+1, updated_at=excluded.updated_at""",
+                (datetime.now(timezone.utc).isoformat(), viewed_node["node_id"]),
+            )
         connection.commit()
 
     ticket = secrets.token_urlsafe(32)

@@ -265,6 +265,7 @@ public class MainActivity extends Activity {
     List<JSONObject> startupSeries = new ArrayList<>();
     List<JSONObject> startupHomeCatalog = new ArrayList<>();
     List<JSONObject> homeCatalog = new ArrayList<>();
+    List<JSONObject> mostViewedCatalog = new ArrayList<>();
     JSONObject startupDownloadStatus;
     JSONArray startupRemoteProfiles;
     String startupPrefetchError;
@@ -521,6 +522,7 @@ public class MainActivity extends Activity {
         movies = movieList == null ? new ArrayList<>() : movieList;
         series = seriesList == null ? new ArrayList<>() : seriesList;
         homeCatalog = homeCatalogList == null ? rootPlayableItems(movies, series) : homeCatalogList;
+        mostViewedCatalog = mostViewedNodes(homeCatalog);
         if (downloadStatus != null) {
             catalogDownloadStatus = downloadStatus;
             catalogDownloadStatusLoaded = true;
@@ -2632,12 +2634,14 @@ public class MainActivity extends Activity {
                 try { homeCatalogList = toList(homeFuture.get()); }
                 catch (Exception ignored) { homeCatalogList = rootPlayableItems(movieList, seriesList); }
                 final List<JSONObject> resolvedHomeCatalog = homeCatalogList;
+                final List<JSONObject> resolvedMostViewed = mostViewedNodes(homeCatalogList);
                 sortNewestFirst(movieList);
                 sortNewestFirst(seriesList);
                 runOnUiThread(() -> {
                     movies = movieList;
                     series = seriesList;
                     homeCatalog = resolvedHomeCatalog;
+                    mostViewedCatalog = resolvedMostViewed;
                     putCatalogList("movies", null, movieList);
                     putCatalogList("series", null, seriesList);
                     catalogVersion = "";
@@ -2701,6 +2705,14 @@ public class MainActivity extends Activity {
     List<JSONObject> getCachedCatalogList(String library, String parentId) {
         List<JSONObject> cached = catalogCache.get(catalogCacheKey(library, parentId));
         return cached == null ? null : new ArrayList<>(cached);
+    }
+
+    List<JSONObject> mostViewedNodes(List<JSONObject> catalog) {
+        List<JSONObject> result = new ArrayList<>();
+        if (catalog == null) return result;
+        for (JSONObject node : catalog)
+            if (node != null && node.optInt("view_count") > 0) result.add(node);
+        return result;
     }
 
     void putCatalogList(String library, String parentId, List<JSONObject> rows) {
@@ -2925,6 +2937,16 @@ public class MainActivity extends Activity {
         newestItems.addAll(incomingItemsFrom(visibleSeries));
         sortNewestFirst(catalogItems);
         sortNewestFirst(newestItems);
+        List<JSONObject> viewedItems = new ArrayList<>();
+        for (JSONObject item : filterKidCatalog(mostViewedCatalog)) {
+            if ("movie".equals(item.optString("kind")) || "series".equals(item.optString("kind")))
+                viewedItems.add(item);
+        }
+        Collections.sort(viewedItems, (left, right) -> Integer.compare(
+                right.optInt("view_count"), left.optInt("view_count")));
+        if (!viewedItems.isEmpty()) addRow(t("Más vistos"), viewedItems.subList(0,
+                Math.min(15, viewedItems.size())), true);
+        if (newestItems.size() > 15) newestItems = new ArrayList<>(newestItems.subList(0, 15));
         addRow("Lo más nuevo", newestItems);
         sortPendingHomeItems(pendingItems);
         addRow("Pendientes de añadir", pendingItems);
@@ -2940,7 +2962,7 @@ public class MainActivity extends Activity {
                     }
                 }
             }
-            addRow(genreLabel(genre), genreItems);
+            addGenreRow(genre, genreItems);
         }
         refreshPlaybackCapacityUi();
         if (visibleMovies.isEmpty() && visibleSeries.isEmpty()) {
@@ -3289,10 +3311,14 @@ public class MainActivity extends Activity {
     }
 
     void addRow(String title, List<JSONObject> nodes) {
+        addRow(title, nodes, false);
+    }
+
+    void addRow(String title, List<JSONObject> nodes, boolean showViewCounts) {
         if (nodes == null || nodes.isEmpty()) return;
         LinearLayout section = new LinearLayout(this);
         section.setOrientation(LinearLayout.VERTICAL);
-        TextView heading = label(title, 22, Color.WHITE, true);
+        TextView heading = label(t(title), 22, Color.WHITE, true);
         heading.setPadding(d(20), d(8), d(20), d(12));
         section.addView(heading);
         HorizontalScrollView horizontal = new HorizontalScrollView(this);
@@ -3303,13 +3329,88 @@ public class MainActivity extends Activity {
         LinearLayout cards = new LinearLayout(this);
         cards.setClipChildren(false);
         cards.setPadding(d(16), 0, d(16), d(8));
-        for (JSONObject node : nodes) cards.addView(posterCard(node, true));
+        for (JSONObject node : nodes) {
+            JSONObject cardNode = node;
+            if (showViewCounts) {
+                try {
+                    cardNode = new JSONObject(node.toString());
+                    cardNode.put("home_show_view_count", true);
+                } catch (JSONException ignored) { }
+            }
+            cards.addView(posterCard(cardNode, true));
+        }
         horizontal.addView(cards);
         installLazyRowScroll(horizontal);
         section.addView(horizontal);
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
         p.bottomMargin = d(8);
         content.addView(section, p);
+    }
+
+    void addGenreRow(String genre, List<JSONObject> nodes) {
+        if (nodes == null || nodes.isEmpty()) return;
+        LinearLayout section = new LinearLayout(this);
+        section.setOrientation(LinearLayout.VERTICAL);
+        TextView heading = label(genreLabel(genre), 22, Color.WHITE, true);
+        heading.setPadding(d(20), d(8), d(20), d(12));
+        section.addView(heading);
+        HorizontalScrollView horizontal = new HorizontalScrollView(this);
+        horizontal.setHorizontalScrollBarEnabled(false);
+        horizontal.setClipChildren(false);
+        horizontal.setClipToPadding(false);
+        horizontal.setTag("zinema-lazy-posters");
+        LinearLayout cards = new LinearLayout(this);
+        cards.setClipChildren(false);
+        cards.setPadding(d(16), 0, d(16), d(8));
+        int count = Math.min(10, nodes.size());
+        for (int i = 0; i < count; i++) cards.addView(posterCard(nodes.get(i), true));
+        LinearLayout.LayoutParams moreParams = new LinearLayout.LayoutParams(d(224), d(204));
+        moreParams.setMargins(d(2), 0, d(12), 0);
+        cards.addView(genreMoreCard(genre), moreParams);
+        horizontal.addView(cards);
+        installLazyRowScroll(horizontal);
+        section.addView(horizontal);
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
+        p.bottomMargin = d(8);
+        content.addView(section, p);
+    }
+
+    View genreMoreCard(String genre) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setGravity(Gravity.CENTER);
+        card.setPadding(d(12), d(12), d(12), d(12));
+        card.setBackground(round(PANEL, d(10)));
+        card.setFocusable(false);
+        TextView moviesLink = genreMoreButton(t("Ver más películas"));
+        moviesLink.setOnClickListener(v -> openGenreLibrary("movies", genre));
+        TextView seriesLink = genreMoreButton(t("Ver más series"));
+        seriesLink.setOnClickListener(v -> openGenreLibrary("series", genre));
+        card.addView(moviesLink, new LinearLayout.LayoutParams(-1, d(58)));
+        View divider = new View(this);
+        divider.setBackgroundColor(0x553A3F4B);
+        LinearLayout.LayoutParams dividerParams = new LinearLayout.LayoutParams(-1, d(1));
+        dividerParams.setMargins(0, d(10), 0, d(10));
+        card.addView(divider, dividerParams);
+        card.addView(seriesLink, new LinearLayout.LayoutParams(-1, d(58)));
+        return card;
+    }
+
+    TextView genreMoreButton(String text) {
+        TextView link = label(text, 13, Color.WHITE, true);
+        link.setGravity(Gravity.CENTER);
+        link.setFocusable(true);
+        link.setClickable(true);
+        link.setBackground(round(0xFF252A35, d(8)));
+        applyTvFocusStyle(link, false);
+        return link;
+    }
+
+    void openGenreLibrary(String library, String genre) {
+        Set<String> selected = new HashSet<>();
+        selected.add(normalizeGenre(genre));
+        selectedGenresByLibrary.put(library, selected);
+        openLibrary(library);
     }
 
     TextView favoriteButton(JSONObject node) {
@@ -3501,7 +3602,13 @@ public class MainActivity extends Activity {
         name.setMaxLines(2);
         name.setPadding(d(2), d(7), d(2), 0);
         card.addView(name, new LinearLayout.LayoutParams(width, -2));
-        TextView meta = label(cardSubtitle(node), 11, MUTED, false);
+        String subtitle = cardSubtitle(node);
+        if (node.optBoolean("home_show_view_count") && node.optInt("view_count") > 0) {
+            String countText = node.optInt("view_count") + " " + t(
+                    node.optInt("view_count") == 1 ? "visualización" : "visualizaciones");
+            subtitle = subtitle.isEmpty() ? countText : subtitle + " · " + countText;
+        }
+        TextView meta = label(subtitle, 11, MUTED, false);
         meta.setPadding(d(2), d(3), d(2), 0);
         card.addView(meta);
         if (!placeholder) card.setOnLongClickListener(v -> { showActions(node); return true; });
@@ -6432,6 +6539,11 @@ public class MainActivity extends Activity {
             case "capítulos": return "atal";
             case "Inicio": return "Hasiera";
             case "Lo más nuevo": return "Eduki berrienak";
+            case "Más vistos": return "Ikusienak";
+            case "Ver más películas": return "Ikusi film gehiago";
+            case "Ver más series": return "Ikusi telesail gehiago";
+            case "visualización": return "ikustaldi";
+            case "visualizaciones": return "ikustaldi";
             case "Todas las plazas están ocupadas": return "Plaza guztiak beteta daude";
             case "Puedes navegar por el catálogo; espera a que se libere una plaza para reproducir.":
                 return "Katalogoan nabiga dezakezu; erreproduzitzeko plaza bat libre egon arte itxaron.";
