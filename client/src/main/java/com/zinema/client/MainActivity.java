@@ -2076,17 +2076,16 @@ public class MainActivity extends Activity {
             tile.setFocusable(true);
             tile.setClickable(true);
             tile.setBackground(round(PANEL, d(10)));
-            LinearLayout artwork = new LinearLayout(this);
-            artwork.setOrientation(LinearLayout.VERTICAL);
-            artwork.setGravity(Gravity.CENTER);
-            artwork.setBackground(round(0xFF30273B, d(8)));
-            TextView initials = labelRaw("EE", 28, 0xFFFFC857, true);
-            initials.setGravity(Gravity.CENTER);
-            artwork.addView(initials);
-            TextView sourceLabel = label("Euskal Encodings", 10, MUTED, false);
-            sourceLabel.setGravity(Gravity.CENTER);
-            artwork.addView(sourceLabel);
-            tile.addView(artwork, new LinearLayout.LayoutParams(-1, d(174)));
+            ImageView poster = new ImageView(this);
+            poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            poster.setBackground(round(0xFF30273B, d(8)));
+            tile.addView(poster, new LinearLayout.LayoutParams(-1, d(174)));
+            String coverUrl = candidate.optString("cover_url", "");
+            if (!coverUrl.isEmpty()) loadImage(coverUrl, poster, false);
+            else {
+                poster.setImageResource(R.drawable.ic_poster_placeholder);
+                poster.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            }
             TextView name = labelRaw(candidate.optString("title", ""), 13, Color.WHITE, true);
             name.setMaxLines(2);
             LinearLayout.LayoutParams nameParams = new LinearLayout.LayoutParams(-1, -2);
