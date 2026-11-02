@@ -9719,7 +9719,7 @@ public class MainActivity extends Activity {
                                 }
                             });
                         }
-                        if ("pending".equals(requestStatus)) {
+                        if ("pending".equals(requestStatus) && !isEuskalRequest) {
                             Button approve = iconActionButton(
                                     R.drawable.ic_request_approve, "Validar", true, 22, false);
                             actions.addView(approve, new LinearLayout.LayoutParams(d(44), d(40)));
