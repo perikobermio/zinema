@@ -1807,6 +1807,23 @@ public class MainActivity extends Activity {
         explanationParams.bottomMargin = d(14);
         screen.addView(explanation, explanationParams);
 
+        LinearLayout sourcePicker = new LinearLayout(this);
+        sourcePicker.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams sourcePickerParams = new LinearLayout.LayoutParams(-1, d(40));
+        sourcePickerParams.bottomMargin = d(8);
+        screen.addView(sourcePicker, sourcePickerParams);
+        boolean[] searchEuskalEncodings = {false};
+        Button tmdbSource = actionButton("TMDb", true);
+        Button euskalSource = actionButton("Euskal Encodings", false);
+        sourcePicker.addView(tmdbSource, new LinearLayout.LayoutParams(0, -1, 1));
+        LinearLayout.LayoutParams euskalSourceParams = new LinearLayout.LayoutParams(0, -1, 1);
+        euskalSourceParams.leftMargin = d(6);
+        sourcePicker.addView(euskalSource, euskalSourceParams);
+        Runnable updateSourcePicker = () -> {
+            tmdbSource.setBackground(round(searchEuskalEncodings[0] ? PANEL : 0xFF5A4165, d(9)));
+            euskalSource.setBackground(round(searchEuskalEncodings[0] ? 0xFF5A4165 : PANEL, d(9)));
+        };
+
         EditText query = settingsField("", t("Título de película o serie"), false);
         screen.addView(query, new LinearLayout.LayoutParams(-1, d(48)));
         LinearLayout results = new LinearLayout(this);
@@ -1836,6 +1853,21 @@ public class MainActivity extends Activity {
         screen.addView(submit, submitParams);
         content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
         if (isTelevision()) query.requestFocus();
+
+        tmdbSource.setOnClickListener(v -> {
+            if (!searchEuskalEncodings[0]) return;
+            searchEuskalEncodings[0] = false;
+            updateSourcePicker.run();
+            explanation.setText(t("Toca un resultado para añadirlo a la petición. Puedes elegir la temporada de cada serie y enviar varios títulos juntos."));
+            query.setText(query.getText().toString() + " ");
+        });
+        euskalSource.setOnClickListener(v -> {
+            if (searchEuskalEncodings[0]) return;
+            searchEuskalEncodings[0] = true;
+            updateSourcePicker.run();
+            explanation.setText(t("Toca un resultado para abrir su tema en Euskal Encodings."));
+            query.setText(query.getText().toString() + " ");
+        });
 
         ArrayList<JSONObject> requestItems = new ArrayList<>();
         JSONArray[] searchResults = {new JSONArray()};
@@ -1967,14 +1999,19 @@ public class MainActivity extends Activity {
                 searchProgress.setVisibility(View.GONE);
                 if (searchTerm.length() < 2) return;
                 contentRequestSearchTask = () -> {
+                    final boolean useEuskalEncodings = searchEuskalEncodings[0];
                     searchProgress.setVisibility(View.VISIBLE);
                     io.execute(() -> {
                     try {
-                        JSONArray found = getJson("/api/v1/content-requests/search?q=" + enc(searchTerm))
+                        String searchPath = useEuskalEncodings
+                                ? "/api/v1/content-requests/euskal-encodings/search?q="
+                                : "/api/v1/content-requests/search?q=";
+                        JSONArray found = getJson(searchPath + enc(searchTerm))
                                 .optJSONArray("results");
                         runOnUiThread(() -> {
                             if (!showingAdmin || results.getParent() == null
-                                    || !searchTerm.equals(query.getText().toString().trim())) return;
+                                    || !searchTerm.equals(query.getText().toString().trim())
+                                    || useEuskalEncodings != searchEuskalEncodings[0]) return;
                             searchProgress.setVisibility(View.GONE);
                             if (found == null || found.length() == 0) {
                                 results.removeAllViews();
@@ -1982,15 +2019,22 @@ public class MainActivity extends Activity {
                                 return;
                             }
                             searchResults[0] = found;
-                            renderGrid[0].run();
+                            if (useEuskalEncodings) {
+                                renderEuskalEncodingsGrid(results, found);
+                            } else {
+                                renderGrid[0].run();
+                            }
                         });
                     } catch (Exception e) {
                         runOnUiThread(() -> {
                             if (!showingAdmin || results.getParent() == null
-                                    || !searchTerm.equals(query.getText().toString().trim())) return;
+                                    || !searchTerm.equals(query.getText().toString().trim())
+                                    || useEuskalEncodings != searchEuskalEncodings[0]) return;
                             searchProgress.setVisibility(View.GONE);
                             results.removeAllViews();
-                            results.addView(label(t("No se pudo buscar en TMDb: ") + e.getMessage(),
+                            String provider = useEuskalEncodings
+                                    ? "Euskal Encodings: " : t("No se pudo buscar en TMDb: ");
+                            results.addView(label(provider + e.getMessage(),
                                     13, MUTED, false));
                         });
                     }
@@ -2007,6 +2051,69 @@ public class MainActivity extends Activity {
         if (posterPath == null || posterPath.trim().isEmpty() || "null".equalsIgnoreCase(posterPath)) return "";
         if (posterPath.startsWith("http")) return posterPath;
         return "https://image.tmdb.org/t/p/w342" + (posterPath.startsWith("/") ? posterPath : "/" + posterPath);
+    }
+
+    void renderEuskalEncodingsGrid(LinearLayout results, JSONArray candidates) {
+        results.removeAllViews();
+        int columns = Math.max(2, Math.min(5,
+                (getResources().getDisplayMetrics().widthPixels - d(48)) / d(158)));
+        LinearLayout gridRow = null;
+        int inRow = 0;
+        for (int i = 0; i < candidates.length(); i++) {
+            JSONObject candidate = candidates.optJSONObject(i);
+            if (candidate == null) continue;
+            if (gridRow == null || inRow == columns) {
+                gridRow = new LinearLayout(this);
+                gridRow.setGravity(Gravity.TOP);
+                LinearLayout.LayoutParams gridRowParams = new LinearLayout.LayoutParams(-1, -2);
+                gridRowParams.topMargin = d(8);
+                results.addView(gridRow, gridRowParams);
+                inRow = 0;
+            }
+            LinearLayout tile = new LinearLayout(this);
+            tile.setOrientation(LinearLayout.VERTICAL);
+            tile.setPadding(d(5), d(5), d(5), d(7));
+            tile.setFocusable(true);
+            tile.setClickable(true);
+            tile.setBackground(round(PANEL, d(10)));
+            LinearLayout artwork = new LinearLayout(this);
+            artwork.setOrientation(LinearLayout.VERTICAL);
+            artwork.setGravity(Gravity.CENTER);
+            artwork.setBackground(round(0xFF30273B, d(8)));
+            TextView initials = labelRaw("EE", 28, 0xFFFFC857, true);
+            initials.setGravity(Gravity.CENTER);
+            artwork.addView(initials);
+            TextView sourceLabel = label("Euskal Encodings", 10, MUTED, false);
+            sourceLabel.setGravity(Gravity.CENTER);
+            artwork.addView(sourceLabel);
+            tile.addView(artwork, new LinearLayout.LayoutParams(-1, d(174)));
+            TextView name = labelRaw(candidate.optString("title", ""), 13, Color.WHITE, true);
+            name.setMaxLines(2);
+            LinearLayout.LayoutParams nameParams = new LinearLayout.LayoutParams(-1, -2);
+            nameParams.topMargin = d(6);
+            tile.addView(name, nameParams);
+            String year = candidate.isNull("year") ? "" : candidate.optString("year");
+            tile.addView(label(t("Película") + (year.isEmpty() ? "" : " · " + year),
+                    11, MUTED, false));
+            tile.setOnClickListener(v -> {
+                String url = candidate.optString("url", "");
+                if (url.isEmpty()) return;
+                try {
+                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+                } catch (Exception e) {
+                    Toast.makeText(this, "No se pudo abrir el tema de Euskal Encodings.",
+                            Toast.LENGTH_LONG).show();
+                }
+            });
+            applyTvFocusStyle(tile, false);
+            LinearLayout.LayoutParams tileParams = new LinearLayout.LayoutParams(0, -2, 1);
+            tileParams.setMargins(d(3), 0, d(3), d(5));
+            gridRow.addView(tile, tileParams);
+            inRow++;
+        }
+        if (gridRow != null) {
+            while (inRow++ < columns) gridRow.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+        }
     }
 
     void renderContentRequestGrid(LinearLayout results, JSONArray candidates, JSONObject selected,
@@ -6762,6 +6869,8 @@ public class MainActivity extends Activity {
             case "No se pudo mover el fichero: ": return "Ezin izan da fitxategia mugitu: ";
             case "Toca un resultado para añadirlo a la petición. Puedes elegir la temporada de cada serie y enviar varios títulos juntos.":
                 return "Ukitu emaitza bat eskaerara gehitzeko. Telesail bakoitzaren denboraldia aukeratu eta hainbat titulu batera bidal ditzakezu.";
+            case "Toca un resultado para abrir su tema en Euskal Encodings.":
+                return "Ukitu emaitza Euskal Encodings-eko gaia irekitzeko.";
             case "Título de película o serie": return "Filmaren edo telesailaren izenburua";
             case "Contenido seleccionado": return "Hautatutako edukia";
             case "Selecciona un resultado para continuar.": return "Hautatu emaitza bat jarraitzeko.";

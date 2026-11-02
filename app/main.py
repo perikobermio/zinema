@@ -28,6 +28,7 @@ from pwdlib import PasswordHash
 from starlette.responses import FileResponse, Response, StreamingResponse
 
 from app.catalog import EPISODE_RE, VIDEO_EXTENSIONS, scan_catalog
+from app.euskal_encodings import search_films as search_euskal_encodings_films
 from app.telegram import send_telegram_message
 from app.tmdb import (apply_tmdb_id, enrich_pending, get_candidate_details,
                       get_movie_age_limits, get_similar_content, search_content_requests,
@@ -3097,6 +3098,17 @@ def search_content_request_titles(q: str = Query(min_length=2, max_length=100)) 
         results = search_content_requests(q, TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, TMDB_KEY)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"TMDb search failed: {str(exc)[:300]}") from None
+    return {"results": results}
+
+
+@app.get("/api/v1/content-requests/euskal-encodings/search",
+         dependencies=[Depends(require_client)])
+def search_euskal_encoding_titles(q: str = Query(min_length=2, max_length=100)) -> dict[str, object]:
+    try:
+        results = search_euskal_encodings_films(q)
+    except Exception as exc:
+        raise HTTPException(status_code=502,
+                            detail=f"Euskal Encodings search failed: {str(exc)[:200]}") from None
     return {"results": results}
 
 
