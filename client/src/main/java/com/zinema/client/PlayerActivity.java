@@ -251,7 +251,8 @@ public class PlayerActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != VLC_REQUEST) return;
+        if (requestCode != VLC_REQUEST || playbackFinishing) return;
+        playbackFinishing = true;
         // VLC can return the playback extras with RESULT_CANCELED when the user
         // leaves the player with Back. Keep the last position in either case.
         if (data != null) {
@@ -344,6 +345,7 @@ public class PlayerActivity extends Activity {
     }
 
     private void finishWithProgress(boolean completed, boolean reserveSeat) {
+        if (playbackFinishing) return;
         playbackFinishing = true;
         preservePlaybackSessionOnFinish = !reserveSeat;
         if (reserveSeat) releasePlaybackSession();

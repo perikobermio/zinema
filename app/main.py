@@ -63,6 +63,7 @@ SYNC_LOCK = threading.Lock()
 SYNC_RETRY_LOCK = threading.Lock()
 SYNC_RETRY_SCHEDULED = False
 INCOMING_MOVE_LOCK = threading.Lock()
+CATALOG_DELETE_LOCK = threading.Lock()
 NAS_DOWNLOAD_LOCK = threading.Lock()
 SERVER_UPDATE_LOCK = threading.Lock()
 SERVER_UPDATE_STATE_PATH = DATABASE_PATH.parent / "server-update.json"
@@ -4464,10 +4465,128 @@ def _stream_item(item_id: str, request: Request):
 
 @app.post("/api/v1/admin/scan", response_model=ScanResult, dependencies=[Depends(require_admin)])
 def scan_library() -> ScanResult:
+    if not CATALOG_DELETE_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="A catalog file operation is in progress")
+    if not SYNC_LOCK.acquire(blocking=False):
+        CATALOG_DELETE_LOCK.release()
+        raise HTTPException(status_code=409, detail="Catalog synchronization is in progress")
     try:
         with closing(database()) as connection:
             result = scan_catalog(connection, MEDIA_ROOTS)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
+    finally:
+        SYNC_LOCK.release()
+        CATALOG_DELETE_LOCK.release()
     _start_episode_thumbnail_job()
     return ScanResult(**result)
+
+
+def _delete_library_media(item_ids: list[str], extra_directories: list[Path] | None = None) -> dict[str, int]:
+    if not item_ids:
+        raise HTTPException(status_code=404, detail="No media files found for this item")
+    if not CATALOG_DELETE_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another catalog deletion is in progress")
+    if not SYNC_LOCK.acquire(blocking=False):
+        CATALOG_DELETE_LOCK.release()
+        raise HTTPException(status_code=409, detail="Catalog synchronization is in progress")
+    try:
+        with closing(database()) as connection:
+            placeholders = ",".join("?" for _ in item_ids)
+            rows = connection.execute(
+                f"SELECT id, library, relative_path, extension FROM library_items "
+                f"WHERE available=1 AND id IN ({placeholders})",
+                item_ids,
+            ).fetchall()
+            if len(rows) != len(set(item_ids)):
+                raise HTTPException(status_code=404, detail="One or more media files were not found")
+            active = connection.execute(
+                f"SELECT item_id FROM playback_sessions WHERE item_id IN ({placeholders}) "
+                "AND status IN ('active', 'reserved') AND expires_at>? LIMIT 1",
+                (*item_ids, time.time()),
+            ).fetchone()
+            if active is not None:
+                raise HTTPException(status_code=409, detail="A user is currently using this video")
+
+            paths: list[Path] = []
+            directories: set[Path] = set(extra_directories or [])
+            for row in rows:
+                root = MEDIA_ROOTS.get(row["library"])
+                relative = Path(row["relative_path"])
+                if root is None or relative.is_absolute() or ".." in relative.parts:
+                    raise HTTPException(status_code=400, detail="Media path is invalid")
+                source = root / relative
+                cursor = source
+                while cursor != root:
+                    if cursor.is_symlink():
+                        raise HTTPException(status_code=400, detail="Refusing to delete through a symbolic link")
+                    cursor = cursor.parent
+                try:
+                    resolved = source.resolve(strict=True)
+                    resolved.relative_to(root)
+                except (OSError, ValueError):
+                    raise HTTPException(status_code=404, detail="Media file is missing or outside its library") from None
+                if not resolved.is_file() or resolved.suffix.lower() not in VIDEO_EXTENSIONS:
+                    raise HTTPException(status_code=400, detail="Target is not a supported video file")
+                paths.append(resolved)
+                directory = resolved.parent
+                while directory != root:
+                    directories.add(directory)
+                    directory = directory.parent
+
+            for path in paths:
+                path.unlink()
+            for directory in sorted(directories, key=lambda value: len(value.parts), reverse=True):
+                if directory in MEDIA_ROOTS.values():
+                    continue
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+
+            try:
+                scan_catalog(connection, MEDIA_ROOTS)
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from None
+        _start_episode_thumbnail_job()
+        return {"deleted_count": len(paths)}
+    finally:
+        SYNC_LOCK.release()
+        CATALOG_DELETE_LOCK.release()
+
+
+@app.delete("/api/v1/admin/library-items/{item_id}", dependencies=[Depends(require_admin)])
+def delete_library_item(item_id: str) -> dict[str, int]:
+    return _delete_library_media([item_id])
+
+
+@app.delete("/api/v1/admin/catalog-nodes/{node_id}/media",
+            dependencies=[Depends(require_admin)])
+def delete_catalog_node_media(node_id: str) -> dict[str, int]:
+    with closing(database()) as connection:
+        node = connection.execute(
+            "SELECT id, kind, library, relative_path FROM catalog_nodes "
+            "WHERE id=? AND available=1", (node_id,),
+        ).fetchone()
+        if node is None:
+            raise HTTPException(status_code=404, detail="Catalog item not found")
+        if node["kind"] not in {"movie", "series"}:
+            raise HTTPException(status_code=422, detail="Only movies and series can be deleted here")
+        if node["kind"] == "movie":
+            rows = connection.execute(
+                "SELECT id FROM library_items WHERE node_id=? AND available=1", (node_id,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT id FROM library_items WHERE series_node_id=? AND available=1", (node_id,),
+            ).fetchall()
+        item_ids = [row["id"] for row in rows]
+        root = MEDIA_ROOTS.get(node["library"])
+        relative = Path(node["relative_path"])
+        if root is None or relative.is_absolute() or ".." in relative.parts:
+            raise HTTPException(status_code=400, detail="Catalog path is invalid")
+        node_path = root / relative
+        if node["kind"] == "movie" and node_path.suffix.lower() in VIDEO_EXTENSIONS:
+            node_path = node_path.parent
+        extra_directories = [node_path]
+    return _delete_library_media(item_ids, extra_directories)

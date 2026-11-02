@@ -15,8 +15,6 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
-import android.graphics.ColorMatrix;
-import android.graphics.ColorMatrixColorFilter;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
@@ -249,6 +247,7 @@ public class MainActivity extends Activity {
     boolean hasResumedOnce;
     boolean activityResumed;
     boolean playerLaunched;
+    long ignoreBackUntilMs;
     boolean seriesSuggestionBackfillRunning;
     boolean libraryMode;
     boolean showingDetail;
@@ -295,6 +294,7 @@ public class MainActivity extends Activity {
     final Map<String, Set<String>> selectedGenresByLibrary = new HashMap<>();
     final Set<String> kidAllowedSeasonIds = new HashSet<>();
     final Map<ImageView, String> requestedImages = new WeakHashMap<>();
+    final Map<View, Float> tvFocusOriginalAlphas = new WeakHashMap<>();
     final List<JSONObject> breadcrumbs = new ArrayList<>();
     final List<Integer> breadcrumbScrollPositions = new ArrayList<>();
     final Map<Character, View> alphabetAnchors = new HashMap<>();
@@ -802,7 +802,7 @@ public class MainActivity extends Activity {
                 outline.setStroke(d(hasFocus ? 2 : 1), hasFocus ? focusColor : Color.TRANSPARENT);
                 focusedView.setForeground(outline);
             } else {
-                setPosterBrightness(focusedView, hasFocus);
+                setTvFocusSiblingsDimmed(focusedView, hasFocus);
             }
             focusedView.animate().cancel();
             float scale = hasFocus && scaleOnFocus && isTelevision() ? 1.035f : 1f;
@@ -811,22 +811,32 @@ public class MainActivity extends Activity {
         });
     }
 
-    void setPosterBrightness(View root, boolean focused) {
-        if (root instanceof ImageView) {
-            ImageView image = (ImageView) root;
-            if (focused) {
-                ColorMatrix matrix = new ColorMatrix(new float[]{
-                        1.12f, 0, 0, 0, 5,
-                        0, 1.12f, 0, 0, 5,
-                        0, 0, 1.12f, 0, 5,
-                        0, 0, 0, 1, 0
-                });
-                image.setColorFilter(new ColorMatrixColorFilter(matrix));
-            } else image.clearColorFilter();
-        } else if (root instanceof ViewGroup) {
-            ViewGroup group = (ViewGroup) root;
-            for (int i = 0; i < group.getChildCount(); i++) setPosterBrightness(group.getChildAt(i), focused);
+    void setTvFocusSiblingsDimmed(View focusedView, boolean focused) {
+        if (!focused) {
+            restoreTvFocusSiblingAlphas();
+            return;
         }
+        restoreTvFocusSiblingAlphas();
+        if (!(focusedView.getParent() instanceof ViewGroup)) return;
+        ViewGroup siblings = (ViewGroup) focusedView.getParent();
+        for (int i = 0; i < siblings.getChildCount(); i++) {
+            View sibling = siblings.getChildAt(i);
+            if (sibling == focusedView) continue;
+            float alpha = sibling.getAlpha();
+            tvFocusOriginalAlphas.put(sibling, alpha);
+            sibling.animate().cancel();
+            sibling.animate().alpha(alpha * 0.58f).setDuration(140L).start();
+        }
+    }
+
+    void restoreTvFocusSiblingAlphas() {
+        for (Map.Entry<View, Float> entry : tvFocusOriginalAlphas.entrySet()) {
+            View sibling = entry.getKey();
+            if (sibling == null) continue;
+            sibling.animate().cancel();
+            sibling.animate().alpha(entry.getValue()).setDuration(120L).start();
+        }
+        tvFocusOriginalAlphas.clear();
     }
 
     View navChip(String title, Runnable action, boolean active) {
@@ -2778,10 +2788,15 @@ public class MainActivity extends Activity {
             refreshVisibleDownloadPosters(content);
             boolean active = "starting".equals(catalogDownloadStatus.optString("status"))
                     || "running".equals(catalogDownloadStatus.optString("status"));
-            scheduleCatalogDownloadStatusPolling(active ? 2000L : 30000L);
+            if (active) scheduleCatalogDownloadStatusPolling(2000L);
             return;
         }
         requestCatalogDownloadStatus();
+    }
+
+    void invalidateCatalogDownloadStatus() {
+        catalogDownloadStatusLoaded = false;
+        stopCatalogDownloadStatusPolling();
     }
 
     void requestCatalogDownloadStatus() {
@@ -2803,9 +2818,17 @@ public class MainActivity extends Activity {
                 }
                 boolean active = result != null && ("starting".equals(result.optString("status"))
                         || "running".equals(result.optString("status")));
-                scheduleCatalogDownloadStatusPolling(active ? 2000L : 30000L);
+                if (active) scheduleCatalogDownloadStatusPolling(2000L);
+                else stopCatalogDownloadStatusPolling();
             });
         });
+    }
+
+    void stopCatalogDownloadStatusPolling() {
+        if (catalogDownloadStatusTask != null) {
+            downloadProgressHandler.removeCallbacks(catalogDownloadStatusTask);
+            catalogDownloadStatusTask = null;
+        }
     }
 
     void scheduleCatalogDownloadStatusPolling(long delayMs) {
@@ -4540,6 +4563,8 @@ public class MainActivity extends Activity {
             if (canAccessAdminTools()) {
                 actions.add("Reintentar metadata (TMDb)");
                 handlers.add(() -> retryMetadata(node));
+                actions.add("series".equals(kind) ? "Borrar serie completa" : "Borrar película");
+                handlers.add(() -> confirmDeleteCatalogNode(node));
             }
         }
         if (kind.equals("collection") && node.optBoolean("poster_is_assigned")) {
@@ -4790,11 +4815,93 @@ public class MainActivity extends Activity {
             actions.add("Metadata manual");
             handlers.add(() -> showMetadataEditor(metadataNode, new JSONArray()));
         }
+        if (canAccessAdminTools()) {
+            actions.add("Borrar capítulo");
+            handlers.add(() -> confirmDeleteLibraryItem(media, owner));
+        }
         actions.add("Marcar como visto");
         handlers.add(() -> setMediaWatched(media, owner, true));
         actions.add("Marcar como no visto");
         handlers.add(() -> setMediaWatched(media, owner, false));
         showStyledActionDialog(t("Acciones"), actions, index -> handlers.get(index).run());
+    }
+
+    void confirmDeleteCatalogNode(JSONObject node) {
+        if (!canAccessAdminTools() || node == null) return;
+        String kind = node.optString("kind", "");
+        boolean seriesItem = "series".equals(kind);
+        if (!seriesItem && !"movie".equals(kind)) return;
+        String title = displayTitle(node);
+        new AlertDialog.Builder(this)
+                .setTitle(t(seriesItem ? "Borrar serie completa" : "Borrar película"))
+                .setMessage(t(seriesItem
+                        ? "Se borrarán físicamente todos los episodios de la serie y las carpetas que queden vacías: "
+                        : "Se borrarán físicamente los vídeos de la película y las carpetas que queden vacías: ")
+                        + title)
+                .setNegativeButton(t("Cancelar"), null)
+                .setPositiveButton(t("Borrar"), (dialog, which) -> deleteCatalogNodeMedia(node, seriesItem))
+                .show();
+    }
+
+    void deleteCatalogNodeMedia(JSONObject node, boolean seriesItem) {
+        if (!canAccessAdminTools() || node == null) return;
+        String nodeId = node.optString("id", "");
+        if (nodeId.isEmpty()) return;
+        io.execute(() -> {
+            try {
+                authorizedProfileRequest("DELETE", "/api/v1/admin/catalog-nodes/"
+                        + enc(nodeId) + "/media", null);
+                runOnUiThread(() -> {
+                    clearCatalogCache();
+                    catalogVersion = "";
+                    lastCatalogVersionCheckMs = 0L;
+                    showingDetail = false;
+                    if (!breadcrumbs.isEmpty())
+                        showCollectionContents(breadcrumbs.get(breadcrumbs.size() - 1));
+                    else if (libraryMode) openLibrary(currentLibrary);
+                    else loadHome();
+                    Toast.makeText(this, t(seriesItem ? "Serie y vídeos borrados." : "Película borrada."),
+                            Toast.LENGTH_LONG).show();
+                });
+            } catch (Exception error) {
+                String detail = error.getMessage() == null ? "" : error.getMessage();
+                runOnUiThread(() -> Toast.makeText(this,
+                        t("No se pudo borrar el contenido: ") + detail, Toast.LENGTH_LONG).show());
+            }
+        });
+    }
+
+    void confirmDeleteLibraryItem(JSONObject media, JSONObject owner) {
+        if (!canAccessAdminTools() || media == null || owner == null) return;
+        String itemId = media.optString("id", "");
+        if (itemId.isEmpty()) return;
+        String title = displayTitle(media);
+        if (title.isEmpty()) title = media.optString("filename", t("este capítulo"));
+        new AlertDialog.Builder(this)
+                .setTitle(t("Borrar capítulo"))
+                .setMessage(t("Se borrará físicamente el vídeo y su carpeta si queda vacía: ") + title)
+                .setNegativeButton(t("Cancelar"), null)
+                .setPositiveButton(t("Borrar"), (dialog, which) -> {
+                    io.execute(() -> {
+                        try {
+                            authorizedProfileRequest("DELETE", "/api/v1/admin/library-items/"
+                                    + enc(itemId), null);
+                            runOnUiThread(() -> {
+                                removeContinueForFiles(new JSONArray().put(media));
+                                clearCatalogCache();
+                                catalogVersion = "";
+                                lastCatalogVersionCheckMs = 0L;
+                                refreshCurrentScreen();
+                                Toast.makeText(this, t("Capítulo borrado."), Toast.LENGTH_LONG).show();
+                            });
+                        } catch (Exception error) {
+                            String detail = error.getMessage() == null ? "" : error.getMessage();
+                            runOnUiThread(() -> Toast.makeText(this,
+                                    t("No se pudo borrar el contenido: ") + detail,
+                                    Toast.LENGTH_LONG).show());
+                        }
+                    });
+                }).show();
     }
 
     JSONObject episodeFavoriteNode(JSONObject media, JSONObject owner) {
@@ -6519,6 +6626,20 @@ public class MainActivity extends Activity {
             case "Reenviar a Telegram": return "Birbidali";
             case "Telegram enviado": return "Telegramera bidali da";
             case "Borrar": return "Ezabatu";
+            case "Borrar película": return "Filma ezabatu";
+            case "Borrar serie completa": return "Telesail osoa ezabatu";
+            case "Borrar capítulo": return "Atala ezabatu";
+            case "este capítulo": return "atal hau";
+            case "Se borrarán físicamente los vídeos de la película y las carpetas que queden vacías: ":
+                return "Filmaren bideoak eta hutsik geratzen diren karpetak ezabatuko dira: ";
+            case "Se borrarán físicamente todos los episodios de la serie y las carpetas que queden vacías: ":
+                return "Telesailaren atal guztiak eta hutsik geratzen diren karpetak ezabatuko dira: ";
+            case "Se borrará físicamente el vídeo y su carpeta si queda vacía: ":
+                return "Bideoa eta karpeta hutsik geratzen bada, ezabatu egingo dira: ";
+            case "Película borrada.": return "Filma ezabatu da.";
+            case "Serie y vídeos borrados.": return "Telesaila eta bideoak ezabatu dira.";
+            case "Capítulo borrado.": return "Atala ezabatu da.";
+            case "No se pudo borrar el contenido: ": return "Ezin izan da edukia ezabatu: ";
             case "Borrar solicitud": return "Eskaera ezabatu";
             case "¿Borrar la solicitud de ": return "Ezabatu nahi duzu honen eskaera: ";
             case "No se pudo actualizar la solicitud: ": return "Ezin izan da eskaera eguneratu: ";
@@ -8674,6 +8795,7 @@ public class MainActivity extends Activity {
     }
 
     void startNasDownload(TextView status, ProgressBar progress, Button start) {
+        invalidateCatalogDownloadStatus();
         start.setEnabled(false);
         start.setAlpha(0.38f);
         start.setText(t("Descarga en curso…"));
@@ -9465,6 +9587,7 @@ public class MainActivity extends Activity {
         if (candidate == null || button == null) return;
         int messageId = candidate.optInt("message_id");
         if (messageId <= 0) return;
+        invalidateCatalogDownloadStatus();
         boolean episode = candidate.optInt("season_number") > 0
                 && candidate.optInt("episode_number") > 0;
         button.setEnabled(false);
@@ -9656,6 +9779,7 @@ public class MainActivity extends Activity {
         String requestId = request.optString("id", "");
         int messageId = candidate.optInt("message_id");
         if (requestId.isEmpty() || messageId <= 0) return;
+        invalidateCatalogDownloadStatus();
         boolean isEpisodeDownload = candidate.optInt("season_number") > 0
                 && candidate.optInt("episode_number") > 0;
         String initialText = button.getText().toString();
@@ -10677,6 +10801,8 @@ public class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         activityResumed = true;
+        boolean returnedFromPlayer = false;
+        boolean playerReturnRefreshed = false;
         startPlaybackCapacityPolling();
         checkForClientUpdate(false);
         if (installAfterPermission && Build.VERSION.SDK_INT >= 26 && getPackageManager().canRequestPackageInstalls()) {
@@ -10685,10 +10811,11 @@ public class MainActivity extends Activity {
             if (apk.isFile()) startApkInstall(apk);
         }
         if (hasResumedOnce) {
-            boolean returnedFromPlayer = playerLaunched;
+            returnedFromPlayer = playerLaunched;
             playerLaunched = false;
-            processPlayerReturn();
-            if (returnedFromPlayer && showingDetail) refreshCurrentScreen();
+            if (returnedFromPlayer) ignoreBackUntilMs = System.currentTimeMillis() + 1200L;
+            playerReturnRefreshed = processPlayerReturn();
+            if (returnedFromPlayer && showingDetail && !playerReturnRefreshed) refreshCurrentScreen();
             String activeId = activeProfileId();
             if (!activeId.isEmpty() && prefs.getBoolean(profileStateDirtyKey(activeId), false)) {
                 scheduleProfileStateSync();
@@ -10700,7 +10827,8 @@ public class MainActivity extends Activity {
         } else hasResumedOnce = true;
         if (prefs != null && page != null && "home".equals(selectedSection)
                 && !showingDetail && !showingAdmin && content != null
-                && movies.size() + series.size() > 0) {
+                && movies.size() + series.size() > 0
+                && !(returnedFromPlayer && playerReturnRefreshed)) {
             int scrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
             renderHome();
             if (contentScroller != null) contentScroller.post(() -> contentScroller.scrollTo(0, scrollY));
@@ -10724,14 +10852,14 @@ public class MainActivity extends Activity {
         super.onPause();
     }
 
-    void processPlayerReturn() {
+    boolean processPlayerReturn() {
         String profileId = activeProfileId();
-        if (profileId.isEmpty() || advancingCompletedEpisode) return;
+        if (profileId.isEmpty() || advancingCompletedEpisode) return false;
         String completedMedia = prefs.getString("completed_media:" + profileId, "");
         String completedOwner = prefs.getString("completed_owner:" + profileId, "");
         String completedKind = prefs.getString("completed_kind:" + profileId, "");
         String autoPlay = prefs.getString("auto_play_episode:" + profileId, "");
-        if (completedMedia.isEmpty() && autoPlay.isEmpty()) return;
+        if (completedMedia.isEmpty() && autoPlay.isEmpty()) return false;
         prefs.edit().remove("completed_media:" + profileId).remove("completed_owner:" + profileId)
                 .remove("completed_kind:" + profileId).remove("auto_play_episode:" + profileId)
                 .apply();
@@ -10783,9 +10911,11 @@ public class MainActivity extends Activity {
                         next.optString("owner_kind", "season"));
             } catch (JSONException ignored) { }
         }
+        return true;
     }
 
     @Override public void onBackPressed() {
+        if (System.currentTimeMillis() < ignoreBackUntilMs) return;
         if (introShowing) return;
         if (clientApiToken().isEmpty()) {
             finishAndRemoveTask();
