@@ -1865,7 +1865,7 @@ public class MainActivity extends Activity {
             if (searchEuskalEncodings[0]) return;
             searchEuskalEncodings[0] = true;
             updateSourcePicker.run();
-            explanation.setText(t("Toca un resultado para abrir su tema en Euskal Encodings."));
+            explanation.setText(t("Toca un resultado para añadirlo a la petición."));
             query.setText(query.getText().toString() + " ");
         });
 
@@ -1873,36 +1873,50 @@ public class MainActivity extends Activity {
         JSONArray[] searchResults = {new JSONArray()};
         Runnable[] renderGrid = {null};
         Runnable[] renderQueue = {null};
+        ContentRequestCandidateHandler addRequestItem = candidate -> {
+            String source = candidate.optString("source", "tmdb");
+            String type = candidate.optString("content_type", "movie");
+            long tmdbId = candidate.optLong("tmdb_id");
+            String externalUrl = candidate.optString("url", "");
+            for (JSONObject item : requestItems) {
+                boolean duplicate = "euskal_encodings".equals(source)
+                        ? "euskal_encodings".equals(item.optString("source"))
+                            && externalUrl.equals(item.optString("external_url"))
+                        : !"euskal_encodings".equals(item.optString("source"))
+                            && item.optString("content_type").equals(type)
+                            && item.optLong("tmdb_id") == tmdbId;
+                if (duplicate) {
+                    Toast.makeText(this, t("Ese contenido ya está en la petición."), Toast.LENGTH_SHORT).show();
+                    return;
+                }
+            }
+            if (requestItems.size() >= 20) {
+                Toast.makeText(this, t("Puedes añadir hasta 20 elementos."), Toast.LENGTH_SHORT).show();
+                return;
+            }
+            try {
+                JSONObject queued = new JSONObject();
+                queued.put("source", source);
+                queued.put("content_type", type);
+                if (tmdbId > 0) queued.put("tmdb_id", tmdbId);
+                if ("euskal_encodings".equals(source)) {
+                    queued.put("external_url", externalUrl);
+                    queued.put("cover_url", candidate.optString("cover_url", ""));
+                } else {
+                    queued.put("poster_path", candidate.optString("poster_path", ""));
+                }
+                queued.put("title", candidate.optString("title", ""));
+                queued.put("year", candidate.opt("year"));
+                queued.put("season_number", -1);
+                requestItems.add(queued);
+            } catch (JSONException ignored) { return; }
+            searchResults[0] = new JSONArray();
+            query.setText("");
+            renderGrid[0].run();
+            renderQueue[0].run();
+        };
         renderGrid[0] = () -> renderContentRequestGrid(results, searchResults[0],
-                null, candidate -> {
-                    String type = candidate.optString("content_type");
-                    long tmdbId = candidate.optLong("tmdb_id");
-                    for (JSONObject item : requestItems) {
-                        if (item.optString("content_type").equals(type)
-                                && item.optLong("tmdb_id") == tmdbId) {
-                            Toast.makeText(this, t("Ese contenido ya está en la petición."), Toast.LENGTH_SHORT).show();
-                            return;
-                        }
-                    }
-                    if (requestItems.size() >= 20) {
-                        Toast.makeText(this, t("Puedes añadir hasta 20 elementos."), Toast.LENGTH_SHORT).show();
-                        return;
-                    }
-                    try {
-                        JSONObject queued = new JSONObject();
-                        queued.put("content_type", type);
-                        queued.put("tmdb_id", tmdbId);
-                        queued.put("title", candidate.optString("title", ""));
-                        queued.put("year", candidate.opt("year"));
-                        queued.put("poster_path", candidate.optString("poster_path", ""));
-                        queued.put("season_number", -1);
-                        requestItems.add(queued);
-                    } catch (JSONException ignored) { return; }
-                    searchResults[0] = new JSONArray();
-                    query.setText("");
-                    renderGrid[0].run();
-                    renderQueue[0].run();
-                });
+                null, addRequestItem);
         renderQueue[0] = () -> {
             queue.removeAllViews();
             queueHeading.setText(t("Elementos en la petición") + " · " + requestItems.size());
@@ -1917,15 +1931,20 @@ public class MainActivity extends Activity {
                 ImageView poster = new ImageView(this);
                 poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
                 row.addView(poster, new LinearLayout.LayoutParams(d(48), d(68)));
-                loadImage(tmdbPosterUrl(item.optString("poster_path", "")), poster, false);
+                String coverUrl = "euskal_encodings".equals(item.optString("source"))
+                        ? item.optString("cover_url", "")
+                        : tmdbPosterUrl(item.optString("poster_path", ""));
+                if (!coverUrl.isEmpty()) loadImage(coverUrl, poster, false);
                 LinearLayout textBox = new LinearLayout(this);
                 textBox.setOrientation(LinearLayout.VERTICAL);
                 LinearLayout.LayoutParams textBoxParams = new LinearLayout.LayoutParams(0, -2, 1);
                 textBoxParams.leftMargin = d(10);
                 row.addView(textBox, textBoxParams);
                 textBox.addView(labelRaw(item.optString("title", ""), 14, Color.WHITE, true));
-                String subtitle = "movie".equals(item.optString("content_type"))
-                        ? t("Película") : t("Serie");
+                String subtitle = "euskal_encodings".equals(item.optString("source"))
+                        ? "Euskal Encodings"
+                        : ("movie".equals(item.optString("content_type"))
+                            ? t("Película") : t("Serie"));
                 textBox.addView(label(subtitle, 12, MUTED, false));
                 if ("tv".equals(item.optString("content_type"))) {
                     int season = item.optInt("season_number", -1);
@@ -1956,10 +1975,19 @@ public class MainActivity extends Activity {
                 JSONArray items = new JSONArray();
                 for (JSONObject item : requestItems) {
                     JSONObject entry = new JSONObject();
+                    String source = item.optString("source", "tmdb");
+                    entry.put("source", source);
                     entry.put("content_type", item.optString("content_type"));
-                    entry.put("tmdb_id", item.optLong("tmdb_id"));
-                    int season = item.optInt("season_number", -1);
-                    if (season > 0) entry.put("season_number", season);
+                    if ("euskal_encodings".equals(source)) {
+                        entry.put("external_url", item.optString("external_url"));
+                        entry.put("title", item.optString("title"));
+                        if (!item.isNull("year")) entry.put("year", item.optInt("year"));
+                        entry.put("cover_url", item.optString("cover_url", ""));
+                    } else {
+                        entry.put("tmdb_id", item.optLong("tmdb_id"));
+                        int season = item.optInt("season_number", -1);
+                        if (season > 0) entry.put("season_number", season);
+                    }
                     items.put(entry);
                 }
                 payload.put("items", items);
@@ -2020,7 +2048,7 @@ public class MainActivity extends Activity {
                             }
                             searchResults[0] = found;
                             if (useEuskalEncodings) {
-                                renderEuskalEncodingsGrid(results, found);
+                                renderEuskalEncodingsGrid(results, found, addRequestItem);
                             } else {
                                 renderGrid[0].run();
                             }
@@ -2053,7 +2081,8 @@ public class MainActivity extends Activity {
         return "https://image.tmdb.org/t/p/w342" + (posterPath.startsWith("/") ? posterPath : "/" + posterPath);
     }
 
-    void renderEuskalEncodingsGrid(LinearLayout results, JSONArray candidates) {
+    void renderEuskalEncodingsGrid(LinearLayout results, JSONArray candidates,
+                                  ContentRequestCandidateHandler handler) {
         results.removeAllViews();
         int columns = Math.max(2, Math.min(5,
                 (getResources().getDisplayMetrics().widthPixels - d(48)) / d(158)));
@@ -2094,16 +2123,7 @@ public class MainActivity extends Activity {
             String year = candidate.isNull("year") ? "" : candidate.optString("year");
             tile.addView(label(t("Película") + (year.isEmpty() ? "" : " · " + year),
                     11, MUTED, false));
-            tile.setOnClickListener(v -> {
-                String url = candidate.optString("url", "");
-                if (url.isEmpty()) return;
-                try {
-                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
-                } catch (Exception e) {
-                    Toast.makeText(this, "No se pudo abrir el tema de Euskal Encodings.",
-                            Toast.LENGTH_LONG).show();
-                }
-            });
+            tile.setOnClickListener(v -> handler.onSelected(candidate));
             applyTvFocusStyle(tile, false);
             LinearLayout.LayoutParams tileParams = new LinearLayout.LayoutParams(0, -2, 1);
             tileParams.setMargins(d(3), 0, d(3), d(5));
@@ -4125,6 +4145,10 @@ public class MainActivity extends Activity {
         connection.setConnectTimeout(10000);
         connection.setReadTimeout(15000);
         connection.setInstanceFollowRedirects(true);
+        if (url.startsWith("https://www.euskal-encodings.eus/")) {
+            connection.setRequestProperty("Referer", "https://www.euskal-encodings.eus/aurkibidea/filmak");
+            connection.setRequestProperty("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8");
+        }
         if (url.startsWith(server + "/") && !clientApiToken().isEmpty()) {
             connection.setRequestProperty("Authorization", "Bearer " + clientApiToken());
         }
@@ -6868,8 +6892,13 @@ public class MainActivity extends Activity {
             case "No se pudo mover el fichero: ": return "Ezin izan da fitxategia mugitu: ";
             case "Toca un resultado para añadirlo a la petición. Puedes elegir la temporada de cada serie y enviar varios títulos juntos.":
                 return "Ukitu emaitza bat eskaerara gehitzeko. Telesail bakoitzaren denboraldia aukeratu eta hainbat titulu batera bidal ditzakezu.";
+            case "Toca un resultado para añadirlo a la petición.":
+                return "Ukitu emaitza bat eskaerara gehitzeko.";
             case "Toca un resultado para abrir su tema en Euskal Encodings.":
                 return "Ukitu emaitza Euskal Encodings-eko gaia irekitzeko.";
+            case "No se pudo abrir el tema de Euskal Encodings.":
+                return "Ezin izan da Euskal Encodings-eko gaia ireki.";
+            case "Validando…": return "Egiaztatzen…";
             case "Título de película o serie": return "Filmaren edo telesailaren izenburua";
             case "Contenido seleccionado": return "Hautatutako edukia";
             case "Selecciona un resultado para continuar.": return "Hautatu emaitza bat jarraitzeko.";
@@ -9473,7 +9502,10 @@ public class MainActivity extends Activity {
                         TextView title = labelRaw(request.optString("title", ""), 16, Color.WHITE, true);
                         detailsColumn.addView(title);
                         String typeLabel;
-                        if ("remaining_seasons".equals(request.optString("request_type"))) {
+                        boolean isEuskalRequest = "euskal_encodings".equals(request.optString("source"));
+                        if (isEuskalRequest) {
+                            typeLabel = "Euskal Encodings · " + t("Película");
+                        } else if ("remaining_seasons".equals(request.optString("request_type"))) {
                             typeLabel = t("Temporadas restantes");
                             JSONObject details = request.optJSONObject("details");
                             JSONArray missing = details == null ? null : details.optJSONArray("missing_seasons");
@@ -9513,7 +9545,8 @@ public class MainActivity extends Activity {
                         String requestStatus = request.optString("status");
                         typeLabel += " · " + ("approved".equals(requestStatus)
                                 ? t("Validada") : ("sending".equals(requestStatus)
-                                ? t("Enviando a Telegram…") : t("Pendiente")));
+                                ? (isEuskalRequest ? t("Validando…") : t("Enviando a Telegram…"))
+                                : t("Pendiente")));
                         TextView info = label(typeLabel, 12, MUTED, false);
                         LinearLayout.LayoutParams infoParams = new LinearLayout.LayoutParams(-1, -2);
                         infoParams.topMargin = d(4);
@@ -9663,13 +9696,30 @@ public class MainActivity extends Activity {
                                         .setNegativeButton(t("Cancelar"), null).show();
                             });
                         }
+                        if (isEuskalRequest) {
+                            Button openForum = actionButton(t("Ir al detalle"), true);
+                            LinearLayout.LayoutParams openForumParams =
+                                    new LinearLayout.LayoutParams(-2, d(40));
+                            openForumParams.rightMargin = d(8);
+                            actions.addView(openForum, openForumParams);
+                            openForum.setOnClickListener(v -> {
+                                String url = request.optString("source_url", "");
+                                if (url.isEmpty()) return;
+                                try {
+                                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+                                } catch (Exception e) {
+                                    Toast.makeText(this, t("No se pudo abrir el tema de Euskal Encodings."),
+                                            Toast.LENGTH_LONG).show();
+                                }
+                            });
+                        }
                         if ("pending".equals(requestStatus)) {
                             Button approve = iconActionButton(
                                     R.drawable.ic_request_approve, "Validar", true, 22, false);
                             actions.addView(approve, new LinearLayout.LayoutParams(d(44), d(40)));
                             approve.setOnClickListener(v -> updateContentRequest(
                                     request.optString("id"), "approve", approve, slot));
-                        } else if ("approved".equals(requestStatus)) {
+                        } else if ("approved".equals(requestStatus) && !isEuskalRequest) {
                             Button resend = iconActionButton(
                                     R.drawable.ic_request_resend, "Reenviar a Telegram", true, 22, false);
                             actions.addView(resend, new LinearLayout.LayoutParams(d(44), d(40)));

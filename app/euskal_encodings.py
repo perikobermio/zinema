@@ -82,6 +82,7 @@ def search_films(query: str, limit: int = 20) -> list[dict[str, object]]:
         year_match = re.search(r"(?:19|20)\d{2}", year_value)
         cover = str(movie.get("cover") or "").strip()
         result: dict[str, object] = {
+            "source": "euskal_encodings",
             "id": str(movie.get("id") or topic),
             "title": title,
             "original_title": original_title,

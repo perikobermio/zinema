@@ -19,6 +19,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -158,9 +159,14 @@ class ManualMetadataRequest(BaseModel):
 
 
 class ContentRequestItem(BaseModel):
+    source: str = Field(default="tmdb", pattern="^(tmdb|euskal_encodings)$")
     content_type: str = Field(pattern="^(movie|tv)$")
-    tmdb_id: int = Field(gt=0)
+    tmdb_id: int | None = Field(default=None, gt=0)
     season_number: int | None = Field(default=None, ge=1)
+    external_url: str | None = Field(default=None, max_length=500)
+    title: str | None = Field(default=None, max_length=300)
+    year: int | None = Field(default=None, ge=1800, le=2200)
+    cover_url: str | None = Field(default=None, max_length=1000)
 
 
 class ContentRequestCreate(BaseModel):
@@ -361,6 +367,8 @@ def database() -> sqlite3.Connection:
                requester_name TEXT NOT NULL,
                request_type TEXT NOT NULL,
                content_type TEXT NOT NULL,
+               source TEXT NOT NULL DEFAULT 'tmdb',
+               source_url TEXT,
                tmdb_id INTEGER,
                title TEXT NOT NULL,
                year INTEGER,
@@ -377,6 +385,10 @@ def database() -> sqlite3.Connection:
            )"""
     )
     request_columns = {row["name"] for row in connection.execute("PRAGMA table_info(content_requests)")}
+    for name, column_type in (("source", "TEXT NOT NULL DEFAULT 'tmdb'"),
+                              ("source_url", "TEXT")):
+        if name not in request_columns:
+            connection.execute(f"ALTER TABLE content_requests ADD COLUMN {name} {column_type}")
     for name in ("telegram_sent_at", "telegram_message_id", "telegram_error"):
         if name not in request_columns:
             column_type = "INTEGER" if name == "telegram_message_id" else "TEXT"
@@ -572,7 +584,7 @@ def _catalog_request_placeholder(request: sqlite3.Row | dict, kind: str,
     if kind == "season":
         title = f"Temporada {season_number:02d}" if season_number else "Capítulos pendientes"
     poster_path = details.get("poster_path")
-    poster_url = details.get("poster_url")
+    poster_url = details.get("poster_url") or details.get("cover_url")
     if not poster_url and isinstance(poster_path, str) and poster_path.startswith("/"):
         poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}"
     return {
@@ -584,6 +596,8 @@ def _catalog_request_placeholder(request: sqlite3.Row | dict, kind: str,
         "display_title": title,
         "year": request["year"],
         "tmdb_id": request["tmdb_id"],
+        "source": request["source"],
+        "source_url": request["source_url"],
         "season_number": season_number,
         "request_type": request["request_type"],
         "request_status": request["status"],
@@ -1235,6 +1249,8 @@ def _match_incoming_request(connection: sqlite3.Connection,
     ).fetchall()
     matches = []
     for request in rows:
+        if request["source"] == "euskal_encodings":
+            continue
         if request["request_type"] == "new_content":
             if request["content_type"] != request_type:
                 continue
@@ -3151,6 +3167,16 @@ def get_content_request_title(content_type: str, tmdb_id: int) -> dict[str, obje
     }
 
 
+def _canonical_euskal_encodings_url(value: str | None) -> str:
+    parsed = urlsplit(str(value or "").strip())
+    topic = parse_qs(parsed.query).get("topic", [""])[0]
+    if (parsed.scheme != "https" or parsed.hostname != "www.euskal-encodings.eus"
+            or parsed.path != "/index.php"
+            or not re.fullmatch(r"\d+(?:\.\d+)?", topic)):
+        raise HTTPException(status_code=422, detail="Invalid Euskal Encodings item URL")
+    return f"https://www.euskal-encodings.eus/index.php?topic={topic}"
+
+
 @app.post("/api/v1/content-requests", status_code=201,
           dependencies=[Depends(require_client)])
 def create_content_request(request: ContentRequestCreate,
@@ -3231,6 +3257,8 @@ def create_content_request(request: ContentRequestCreate,
             records.append({
                 "request_type": request.request_type,
                 "content_type": "tv",
+                "source": "tmdb",
+                "source_url": None,
                 "tmdb_id": series["tmdb_id"],
                 "title": series["metadata_title"] or series["title"],
                 "year": series["year"],
@@ -3251,26 +3279,82 @@ def create_content_request(request: ContentRequestCreate,
                     tmdb_id=request.tmdb_id,
                     season_number=request.season_number,
                 )]
-            if not TMDB_CONFIGURED:
-                raise HTTPException(status_code=503, detail="TMDb credentials are not configured")
-            selected_keys: list[tuple[str, int, int | None]] = []
+            selected_keys: list[tuple[str, str, int | None]] = []
             for item in selected_items:
+                source = item.source
+                if source == "euskal_encodings":
+                    if (item.content_type != "movie" or item.tmdb_id is not None
+                            or item.season_number is not None):
+                        raise HTTPException(status_code=422,
+                                            detail="Euskal Encodings requests must be a movie")
+                    external_url = _canonical_euskal_encodings_url(item.external_url)
+                    title = str(item.title or "").strip()
+                    if not title:
+                        raise HTTPException(status_code=422,
+                                            detail="Euskal Encodings item title is required")
+                    identity = (source, external_url, None)
+                    if identity in selected_keys:
+                        raise HTTPException(status_code=409,
+                                            detail="This content has already been requested")
+                    selected_keys.append(identity)
+                    already_requested = connection.execute(
+                        """SELECT 1 FROM content_requests
+                           WHERE source=? AND source_url=?
+                             AND status IN ('pending', 'sending', 'approved') LIMIT 1""",
+                        (source, external_url),
+                    ).fetchone()
+                    if already_requested:
+                        raise HTTPException(status_code=409,
+                                            detail="This content has already been requested")
+                    cover_url = str(item.cover_url or "").strip()
+                    if cover_url:
+                        cover = urlsplit(cover_url)
+                        if (cover.scheme != "https" or cover.hostname != "www.euskal-encodings.eus"
+                                or cover.username or cover.password or not cover.path.startswith("/")):
+                            raise HTTPException(status_code=422,
+                                                detail="Invalid Euskal Encodings cover URL")
+                    details = {
+                        "source": source,
+                        "cover_url": cover_url,
+                        "poster_url": cover_url or None,
+                    }
+                    records.append({
+                        "request_type": request.request_type,
+                        "content_type": "movie",
+                        "source": source,
+                        "source_url": external_url,
+                        "tmdb_id": None,
+                        "title": title,
+                        "year": item.year,
+                        "season_number": None,
+                        "catalog_node_id": None,
+                        "details": details,
+                    })
+                    continue
+
+                if item.tmdb_id is None:
+                    raise HTTPException(status_code=422, detail="Select a movie or series from TMDb")
                 if item.content_type == "movie" and item.season_number is not None:
                     raise HTTPException(status_code=422, detail="Movies do not have seasons")
-                if any(content_type == item.content_type and tmdb_id == item.tmdb_id
-                       and (season is None or item.season_number is None or season == item.season_number)
-                       for content_type, tmdb_id, season in selected_keys):
+                identity = (source, f"{item.content_type}:{item.tmdb_id}", item.season_number)
+                if any(old_source == source and old_id == identity[1]
+                       and (old_season is None or item.season_number is None
+                            or old_season == item.season_number)
+                       for old_source, old_id, old_season in selected_keys):
                     raise HTTPException(status_code=409, detail="This content has already been requested")
-                selected_keys.append((item.content_type, item.tmdb_id, item.season_number))
+                selected_keys.append(identity)
                 already_requested = connection.execute(
                     """SELECT 1 FROM content_requests
-                       WHERE request_type='new_content' AND content_type=? AND tmdb_id=?
+                       WHERE request_type='new_content' AND source='tmdb'
+                         AND content_type=? AND tmdb_id=?
                          AND (season_number IS NULL OR ? IS NULL OR season_number=?)
                        LIMIT 1""",
                     (item.content_type, item.tmdb_id, item.season_number, item.season_number),
                 ).fetchone()
                 if already_requested:
                     raise HTTPException(status_code=409, detail="This content has already been requested")
+                if not TMDB_CONFIGURED:
+                    raise HTTPException(status_code=503, detail="TMDb credentials are not configured")
                 try:
                     candidate = get_candidate_details(
                         item.content_type, item.tmdb_id,
@@ -3290,6 +3374,8 @@ def create_content_request(request: ContentRequestCreate,
                 records.append({
                     "request_type": request.request_type,
                     "content_type": item.content_type,
+                    "source": "tmdb",
+                    "source_url": None,
                     "tmdb_id": item.tmdb_id,
                     "title": str(candidate.get("metadata_title") or "").strip(),
                     "year": candidate.get("year"),
@@ -3305,11 +3391,12 @@ def create_content_request(request: ContentRequestCreate,
             connection.execute(
                 """INSERT INTO content_requests(
                        id, requester_account_id, requester_name, request_type, content_type,
-                       tmdb_id, title, year, season_number, catalog_node_id, details_json,
+                       source, source_url, tmdb_id, title, year, season_number, catalog_node_id, details_json,
                        status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
                 (request_id, requester_id, account["name"], record["request_type"],
-                 record["content_type"], record["tmdb_id"], record["title"], record["year"],
+                 record["content_type"], record["source"], record["source_url"],
+                 record["tmdb_id"], record["title"], record["year"],
                  record["season_number"], record["catalog_node_id"],
                  json.dumps(record["details"], ensure_ascii=False), now),
             )
@@ -3376,6 +3463,8 @@ def _download_match_tokens(value: object) -> list[str]:
 
 def _request_telegram_downloads(request: dict[str, object],
                                 media: list[dict[str, object]]) -> list[dict[str, object]]:
+    if request.get("source") == "euskal_encodings":
+        return []
     details = request.get("details") or {}
     if not isinstance(details, dict):
         details = {}
@@ -3452,7 +3541,7 @@ def _requested_telegram_message_ids(media: list[dict[str, object]]) -> set[int]:
         except (TypeError, json.JSONDecodeError):
             details = {}
         payload = {key: row[key] for key in (
-            "id", "request_type", "content_type", "tmdb_id", "title", "year",
+            "id", "request_type", "content_type", "source", "source_url", "tmdb_id", "title", "year",
             "season_number", "catalog_node_id",
         )}
         payload["details"] = details
@@ -3593,16 +3682,18 @@ def list_content_requests() -> list[dict[str, object]]:
         except HTTPException:
             pass
     results = []
-    saved_media = _telegram_saved_media() if rows else []
+    saved_media = (_telegram_saved_media()
+                   if any(row["source"] != "euskal_encodings" for row in rows) else [])
     for row in rows:
         details = json.loads(row["details_json"] or "{}")
         request_payload = {**{key: row[key] for key in (
-        "id", "requester_name", "request_type", "content_type", "tmdb_id",
+        "id", "requester_name", "request_type", "content_type", "source", "source_url", "tmdb_id",
         "title", "year", "season_number", "catalog_node_id", "status", "created_at",
         "telegram_sent_at",
         )}, "details": details,
         "poster_path": details.get("poster_path"),
-        "poster_url": details.get("poster_url")}
+        "poster_url": details.get("poster_url") or details.get("cover_url"),
+        "cover_url": details.get("cover_url")}
         telegram_downloads = _request_telegram_downloads(
             request_payload, saved_media,
         )
@@ -3646,8 +3737,12 @@ def start_content_request_download(request_id: str,
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Content request not found")
+    if row["source"] == "euskal_encodings":
+        raise HTTPException(status_code=409,
+                            detail="Euskal Encodings requests open their forum topic instead")
     request_payload = {key: row[key] for key in (
-        "id", "requester_name", "request_type", "content_type", "tmdb_id", "title",
+        "id", "requester_name", "request_type", "content_type", "source", "source_url",
+        "tmdb_id", "title",
         "year", "season_number", "catalog_node_id",
     )}
     try:
@@ -3733,7 +3828,7 @@ def content_request_telegram_caption(request: sqlite3.Row,
 @app.post("/api/v1/admin/content-requests/{request_id}/approve",
           dependencies=[Depends(require_admin)])
 def approve_content_request(request_id: str,
-                            device_id: Annotated[str, Depends(require_admin)]) -> dict[str, bool]:
+                            device_id: Annotated[str, Depends(require_admin)]) -> dict[str, object]:
     reviewer_id = account_for_device(device_id)
     with closing(database()) as connection:
         request = connection.execute(
@@ -3744,6 +3839,18 @@ def approve_content_request(request_id: str,
         if request["status"] != "pending":
             raise HTTPException(status_code=409, detail="Content request is not pending")
         now = datetime.now(timezone.utc).isoformat()
+        if request["source"] == "euskal_encodings":
+            cursor = connection.execute(
+                """UPDATE content_requests SET status='approved', reviewed_at=?,
+                       reviewed_by_account_id=?, telegram_error=NULL
+                   WHERE id=? AND status='pending'""",
+                (now, reviewer_id, request_id),
+            )
+            connection.commit()
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=409,
+                                    detail="Content request is already being reviewed")
+            return {"approved": True, "source_url": request["source_url"]}
         cursor = connection.execute(
             """UPDATE content_requests SET status='sending', reviewed_at=?,
                    reviewed_by_account_id=?, telegram_error=NULL
@@ -3793,6 +3900,9 @@ def resend_content_request(request_id: str) -> dict[str, bool]:
         ).fetchone()
         if request is None:
             raise HTTPException(status_code=404, detail="Validated content request not found")
+        if request["source"] == "euskal_encodings":
+            raise HTTPException(status_code=409,
+                                detail="Euskal Encodings requests open their forum topic instead")
         request_data = dict(request)
         details = json.loads(request_data["details_json"] or "{}")
 
