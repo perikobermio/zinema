@@ -836,7 +836,7 @@ public class MainActivity extends Activity {
             View sibling = entry.getKey();
             if (sibling == null) continue;
             sibling.animate().cancel();
-            sibling.animate().alpha(entry.getValue()).setDuration(120L).start();
+            sibling.setAlpha(entry.getValue());
         }
         tvFocusOriginalAlphas.clear();
     }
