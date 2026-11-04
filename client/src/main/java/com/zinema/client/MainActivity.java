@@ -3482,7 +3482,7 @@ public class MainActivity extends Activity {
         heading.setPadding(d(20), d(8), d(20), d(8));
         TextView title = label(genreLabel(genre), 22, Color.WHITE, true);
         heading.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView popular = labelRaw("★", 22, 0xFFFFC857, true);
+        TextView popular = labelRaw("★", 22, Color.WHITE, true);
         popular.setGravity(Gravity.CENTER);
         popular.setFocusable(true);
         popular.setClickable(true);
@@ -3646,12 +3646,21 @@ public class MainActivity extends Activity {
         TextView name = labelRaw(cleanDisplayText(item.optString("title", "")), 12, Color.WHITE, true);
         name.setMaxLines(2);
         name.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        name.setPadding(d(2), d(3), d(2), 0);
-        card.addView(name, new LinearLayout.LayoutParams(-1, -2));
+        name.setGravity(Gravity.TOP | Gravity.LEFT);
+        name.setPadding(d(2), d(4), d(2), 0);
+        card.addView(name, new LinearLayout.LayoutParams(-1, d(38)));
+        TextView description = labelRaw(cleanDisplayText(item.optString("overview", "")),
+                10, MUTED, false);
+        description.setMaxLines(2);
+        description.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        description.setGravity(Gravity.TOP | Gravity.LEFT);
+        description.setPadding(d(2), d(2), d(2), 0);
+        card.addView(description, new LinearLayout.LayoutParams(-1, d(34)));
         int year = item.optInt("year", 0);
         TextView meta = labelRaw(year > 0 ? Integer.toString(year) : "", 10, MUTED, false);
-        meta.setPadding(d(2), d(3), d(2), 0);
-        card.addView(meta);
+        meta.setGravity(Gravity.CENTER_VERTICAL | Gravity.LEFT);
+        meta.setPadding(d(2), 0, d(2), 0);
+        card.addView(meta, new LinearLayout.LayoutParams(-1, d(20)));
         Button request = new Button(this);
         boolean inCatalog = item.optBoolean("in_catalog", false);
         boolean requested = item.optBoolean("requested", false);
