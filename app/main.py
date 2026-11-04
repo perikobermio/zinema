@@ -32,7 +32,7 @@ from app.catalog import EPISODE_RE, VIDEO_EXTENSIONS, scan_catalog
 from app.euskal_encodings import search_films as search_euskal_encodings_films
 from app.telegram import send_telegram_message
 from app.tmdb import (apply_tmdb_id, enrich_pending, get_candidate_details,
-                      get_movie_age_limits, get_similar_content, search_content_requests,
+                      get_movie_age_limits, get_popular_by_genre, get_similar_content, search_content_requests,
                       search_image_options, search_metadata_candidates,
                       _image_config, _save_image, normalize_genres)
 from app.video_thumbnails import extract_episode_thumbnails
@@ -2850,6 +2850,77 @@ TMDB_GENRE_NAMES = {
     10764: "Reality", 10765: "Ciencia ficción y fantasía", 10766: "Telenovela",
     10767: "Talk show", 10768: "Guerra y política", 10770: "Película de TV",
 }
+
+
+@app.get("/api/v1/tmdb/popular-by-genre", dependencies=[Depends(require_client)])
+def get_tmdb_popular_by_genre(
+        genre: str = Query(min_length=1, max_length=80)) -> dict[str, object]:
+    """Return TMDb's popularity-ranked movies and series matching a genre."""
+    if not TMDB_CONFIGURED:
+        raise HTTPException(status_code=503, detail="TMDb credentials are not configured")
+    try:
+        data = get_popular_by_genre(
+            genre, TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, TMDB_KEY,
+        )
+    except Exception:
+        raise HTTPException(status_code=502,
+                            detail="Could not load popular titles from TMDb") from None
+    all_ids = [("movie" if item["media_type"] == "movie" else "tv", int(item["id"]))
+               for item in data["items"]]
+    requested: set[tuple[str, int]] = set()
+    in_catalog: set[tuple[str, int]] = set()
+    movie_age_limits = get_movie_age_limits(
+        [tmdb_id for content_type, tmdb_id in all_ids if content_type == "movie"],
+        TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, TMDB_KEY,
+    )
+    if all_ids:
+        movie_ids = [tmdb_id for kind, tmdb_id in all_ids if kind == "movie"]
+        tv_ids = [tmdb_id for kind, tmdb_id in all_ids if kind == "tv"]
+        with closing(database()) as connection:
+            for content_type, ids in (("movie", movie_ids), ("tv", tv_ids)):
+                if not ids:
+                    continue
+                placeholders = ",".join("?" for _ in ids)
+                rows = connection.execute(
+                    f"""SELECT DISTINCT tmdb_id FROM content_requests
+                        WHERE request_type='new_content' AND content_type=?
+                          AND tmdb_id IN ({placeholders})""",
+                    (content_type, *ids),
+                ).fetchall()
+                requested.update((content_type, int(row["tmdb_id"])) for row in rows)
+                kind = "movie" if content_type == "movie" else "series"
+                catalog_rows = connection.execute(
+                    f"""SELECT DISTINCT tmdb_id FROM catalog_nodes
+                        WHERE available=1 AND kind=? AND tmdb_id IN ({placeholders})""",
+                    (kind, *ids),
+                ).fetchall()
+                in_catalog.update((content_type, int(row["tmdb_id"])) for row in catalog_rows)
+    items: list[dict[str, object]] = []
+    for result in data["items"]:
+        content_type = str(result["media_type"])
+        tmdb_id = int(result["id"])
+        genre_ids = result.get("genre_ids") or []
+        poster_path = result.get("poster_path")
+        backdrop_path = result.get("backdrop_path")
+        items.append({
+            "id": f"tmdb-{content_type}-{tmdb_id}",
+            "tmdb_id": tmdb_id,
+            "kind": "movie" if content_type == "movie" else "series",
+            "title": result["title"],
+            "year": result.get("year"),
+            "age_limit": movie_age_limits.get(tmdb_id) if content_type == "movie" else None,
+            "genres": [TMDB_GENRE_NAMES[int(genre_id)] for genre_id in genre_ids
+                       if str(genre_id).isdigit() and int(genre_id) in TMDB_GENRE_NAMES],
+            "overview": result.get("overview") or "",
+            "popularity": result.get("popularity") or 0,
+            "requested": (content_type, tmdb_id) in requested,
+            "in_catalog": (content_type, tmdb_id) in in_catalog,
+            "poster_url": (f"https://image.tmdb.org/t/p/w342{poster_path}"
+                           if isinstance(poster_path, str) and poster_path.startswith("/") else None),
+            "backdrop_url": (f"https://image.tmdb.org/t/p/w1280{backdrop_path}"
+                             if isinstance(backdrop_path, str) and backdrop_path.startswith("/") else None),
+        })
+    return {"items": items, "source": "tmdb-popularity", "total": len(items)}
 
 
 @app.get("/api/v1/catalog/{node_id}/recommendations",

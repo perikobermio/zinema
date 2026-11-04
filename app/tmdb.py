@@ -23,6 +23,12 @@ SIMILAR_CACHE: dict[tuple[str, int, str, int], tuple[float, dict]] = {}
 AGE_RATING_CACHE_TTL_SECONDS = 24 * 60 * 60
 AGE_RATING_CACHE_LOCK = threading.Lock()
 AGE_RATING_CACHE: dict[tuple[int, str], tuple[float, int | None]] = {}
+GENRE_LIST_CACHE_TTL_SECONDS = 24 * 60 * 60
+GENRE_LIST_CACHE_LOCK = threading.Lock()
+GENRE_LIST_CACHE: dict[tuple[str, str], tuple[float, dict[str, int]]] = {}
+POPULAR_GENRE_CACHE_TTL_SECONDS = 60 * 60
+POPULAR_GENRE_CACHE_LOCK = threading.Lock()
+POPULAR_GENRE_CACHE: dict[tuple[str, str, str, int], tuple[float, dict]] = {}
 
 
 def _normalise(value: str) -> str:
@@ -468,6 +474,73 @@ def get_similar_content(kind: str, tmdb_id: int, access_token: str, language: st
             if len(SIMILAR_CACHE) >= 256:
                 SIMILAR_CACHE.pop(next(iter(SIMILAR_CACHE)))
         SIMILAR_CACHE[cache_key] = (now + SIMILAR_CACHE_TTL_SECONDS, payload)
+    return payload
+
+
+def get_popular_by_genre(genre: str, access_token: str, language: str,
+                         api_key: str = "", page: int = 1) -> dict:
+    """Return popular movie and TV titles for a localized genre label."""
+    normalized = _normalise(genre)
+    if not normalized:
+        return {"items": [], "page": page, "total_pages": 0}
+    cache_key = (normalized, language, "all", int(page))
+    now = time.monotonic()
+    with POPULAR_GENRE_CACHE_LOCK:
+        cached = POPULAR_GENRE_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+
+    headers = {"accept": "application/json"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    results: list[dict] = []
+    total_pages = 0
+    with httpx.Client(headers=headers, timeout=httpx.Timeout(20.0), follow_redirects=True) as client:
+        for entity_kind in ("movie", "tv"):
+            list_key = (entity_kind, language)
+            with GENRE_LIST_CACHE_LOCK:
+                genre_cache = GENRE_LIST_CACHE.get(list_key)
+                genre_map = genre_cache[1] if genre_cache and genre_cache[0] > now else None
+            if genre_map is None:
+                data = _api_get(client, f"/genre/{entity_kind}/list",
+                                {"language": language}, api_key)
+                genre_map = {
+                    _normalise(str(item.get("name") or "")): int(item["id"])
+                    for item in data.get("genres", [])
+                    if isinstance(item, dict) and item.get("id") is not None and item.get("name")
+                }
+                with GENRE_LIST_CACHE_LOCK:
+                    GENRE_LIST_CACHE[list_key] = (now + GENRE_LIST_CACHE_TTL_SECONDS, genre_map)
+            genre_id = genre_map.get(normalized)
+            if genre_id is None:
+                continue
+            data = _api_get(client, f"/discover/{entity_kind}", {
+                "language": language,
+                "page": int(page),
+                "include_adult": "false",
+                "with_genres": genre_id,
+                "sort_by": "popularity.desc",
+            }, api_key)
+            total_pages = max(total_pages, int(data.get("total_pages") or 0))
+            for item in data.get("results", []):
+                if not isinstance(item, dict) or item.get("id") is None or item.get("adult") is True:
+                    continue
+                title = item.get("title") if entity_kind == "movie" else item.get("name")
+                date = item.get("release_date") if entity_kind == "movie" else item.get("first_air_date")
+                results.append({**item, "media_type": entity_kind,
+                                "title": str(title or "").strip(),
+                                "year": int(date[:4]) if isinstance(date, str) and len(date) >= 4
+                                and date[:4].isdigit() else None})
+    results.sort(key=lambda item: float(item.get("popularity") or 0), reverse=True)
+    payload = {"items": results, "page": int(page), "total_pages": total_pages}
+    with POPULAR_GENRE_CACHE_LOCK:
+        if len(POPULAR_GENRE_CACHE) >= 128:
+            expired = [key for key, (expiry, _) in POPULAR_GENRE_CACHE.items() if expiry <= now]
+            for key in expired:
+                POPULAR_GENRE_CACHE.pop(key, None)
+            if len(POPULAR_GENRE_CACHE) >= 128:
+                POPULAR_GENRE_CACHE.pop(next(iter(POPULAR_GENRE_CACHE)))
+        POPULAR_GENRE_CACHE[cache_key] = (now + POPULAR_GENRE_CACHE_TTL_SECONDS, payload)
     return payload
 
 

@@ -3477,8 +3477,22 @@ public class MainActivity extends Activity {
         if (nodes == null || nodes.isEmpty()) return;
         LinearLayout section = new LinearLayout(this);
         section.setOrientation(LinearLayout.VERTICAL);
-        TextView heading = label(genreLabel(genre), 22, Color.WHITE, true);
-        heading.setPadding(d(20), d(8), d(20), d(12));
+        LinearLayout heading = new LinearLayout(this);
+        heading.setGravity(Gravity.CENTER_VERTICAL);
+        heading.setPadding(d(20), d(8), d(20), d(8));
+        TextView title = label(genreLabel(genre), 22, Color.WHITE, true);
+        heading.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView popular = labelRaw("↗", 23, Color.WHITE, true);
+        popular.setGravity(Gravity.CENTER);
+        popular.setFocusable(true);
+        popular.setClickable(true);
+        popular.setContentDescription(t("TMDb populares"));
+        popular.setBackground(round(PANEL, d(10)));
+        applyTvFocusStyle(popular, false);
+        popular.setOnClickListener(v -> openPopularGenreWindow(genre));
+        LinearLayout.LayoutParams popularParams = new LinearLayout.LayoutParams(d(42), d(38));
+        popularParams.leftMargin = d(8);
+        heading.addView(popular, popularParams);
         section.addView(heading);
         HorizontalScrollView horizontal = new HorizontalScrollView(this);
         horizontal.setHorizontalScrollBarEnabled(false);
@@ -3499,6 +3513,161 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
         p.bottomMargin = d(8);
         content.addView(section, p);
+    }
+
+    void openPopularGenreWindow(String genre) {
+        AlertDialog dialog = new AlertDialog.Builder(this).create();
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(d(18), d(16), d(18), d(12));
+        panel.setBackground(round(BG, d(18)));
+
+        LinearLayout header = new LinearLayout(this);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = label(genreLabel(genre), 23, Color.WHITE, true);
+        header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView close = labelRaw("×", 28, MUTED, true);
+        close.setGravity(Gravity.CENTER);
+        close.setFocusable(true);
+        close.setClickable(true);
+        close.setContentDescription(t("Cerrar"));
+        applyTvFocusStyle(close, false);
+        close.setOnClickListener(v -> dialog.dismiss());
+        header.addView(close, new LinearLayout.LayoutParams(d(44), d(42)));
+        panel.addView(header);
+
+        TextView source = label(t("Películas y series ordenadas por popularidad de TMDb"),
+                13, MUTED, false);
+        source.setPadding(0, d(2), 0, d(10));
+        panel.addView(source);
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.setVerticalScrollBarEnabled(false);
+        TextView status = label(t("Cargando títulos de TMDb…"), 15, MUTED, false);
+        status.setGravity(Gravity.CENTER);
+        status.setPadding(d(16), d(40), d(16), d(40));
+        scroll.addView(status, new ScrollView.LayoutParams(-1, -2));
+        panel.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        dialog.setView(panel);
+        dialog.show();
+        if (dialog.getWindow() != null) {
+            int width = Math.min(getResources().getDisplayMetrics().widthPixels - d(36), d(1180));
+            int height = Math.min(getResources().getDisplayMetrics().heightPixels - d(56), d(820));
+            dialog.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+            dialog.getWindow().setDimAmount(0.68f);
+            dialog.getWindow().setLayout(width, height);
+        }
+        io.execute(() -> {
+            try {
+                JSONObject response = getJson("/api/v1/tmdb/popular-by-genre?genre=" + enc(genre));
+                JSONArray results = response.optJSONArray("items");
+                List<JSONObject> items = toList(results);
+                runOnUiThread(() -> renderPopularGenreGrid(scroll, status, dialog, items, ""));
+            } catch (Exception e) {
+                runOnUiThread(() -> renderPopularGenreGrid(scroll, status, dialog,
+                        new ArrayList<>(), e.getMessage() == null ? "" : e.getMessage()));
+            }
+        });
+    }
+
+    void renderPopularGenreGrid(ScrollView scroll, TextView status, AlertDialog dialog,
+                                List<JSONObject> items, String error) {
+        scroll.removeAllViews();
+        if (!error.isEmpty()) {
+            status.setText(t("No se pudieron cargar los títulos de TMDb: ") + error);
+            status.setGravity(Gravity.CENTER);
+            scroll.addView(status, new ScrollView.LayoutParams(-1, -2));
+            return;
+        }
+        items = filterKidCatalog(items);
+        if (items.isEmpty()) {
+            status.setText(t("TMDb no devolvió títulos para esta temática"));
+            status.setGravity(Gravity.CENTER);
+            scroll.addView(status, new ScrollView.LayoutParams(-1, -2));
+            return;
+        }
+        int screenWidthDp = Math.round(getResources().getDisplayMetrics().widthPixels
+                / getResources().getDisplayMetrics().density);
+        int panelWidth = Math.min(screenWidthDp - 36, 1180);
+        int columns = isTelevision()
+                ? Math.max(2, Math.min(7, (panelWidth - 36) / 154))
+                : (getResources().getConfiguration().orientation == 2 ? 5 : 3);
+        int cellWidth = Math.max(1, (panelWidth - d(36) - d(columns * 8)) / columns);
+        LinearLayout grid = new LinearLayout(this);
+        grid.setOrientation(LinearLayout.VERTICAL);
+        grid.setPadding(d(2), d(2), d(2), d(12));
+        LinearLayout row = null;
+        for (int i = 0; i < items.size(); i++) {
+            if (i % columns == 0) {
+                row = new LinearLayout(this);
+                row.setGravity(Gravity.TOP);
+                LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(-1, -2);
+                rowParams.bottomMargin = d(10);
+                grid.addView(row, rowParams);
+            }
+            JSONObject item = items.get(i);
+            row.addView(popularGenreCard(item, dialog), new LinearLayout.LayoutParams(cellWidth, -2));
+        }
+        scroll.addView(grid, new ScrollView.LayoutParams(-1, -2));
+        scroll.post(() -> loadDeferredPosters(grid));
+    }
+
+    View popularGenreCard(JSONObject item, AlertDialog dialog) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(d(4), d(4), d(4), d(8));
+        ImageView poster = new ImageView(this);
+        poster.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        poster.setBackground(round(PANEL, d(9)));
+        poster.setClipToOutline(true);
+        showPoster(item.optString("poster_url", ""), poster, true);
+        poster.setFocusable(isTelevision());
+        poster.setClickable(true);
+        poster.setContentDescription(cleanDisplayText(item.optString("title", ""))
+                + ", " + t("Abrir detalle"));
+        applyTvFocusStyle(poster, true);
+        poster.setOnClickListener(v -> {
+            dialog.dismiss();
+            openExternalRecommendation(item);
+        });
+        card.addView(poster, new LinearLayout.LayoutParams(-1, d(180)));
+
+        String kind = item.optString("kind", "movie");
+        TextView type = label(kindLabel(kind),
+                9, "series".equals(kind) ? 0xFFB9A5FF : 0xFFFFB0A8, true);
+        type.setPadding(d(2), d(6), d(2), 0);
+        card.addView(type);
+        TextView name = labelRaw(cleanDisplayText(item.optString("title", "")), 12, Color.WHITE, true);
+        name.setMaxLines(2);
+        name.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        name.setPadding(d(2), d(3), d(2), 0);
+        card.addView(name, new LinearLayout.LayoutParams(-1, -2));
+        int year = item.optInt("year", 0);
+        TextView meta = labelRaw(year > 0 ? Integer.toString(year) : "", 10, MUTED, false);
+        meta.setPadding(d(2), d(3), d(2), 0);
+        card.addView(meta);
+        Button request = new Button(this);
+        boolean inCatalog = item.optBoolean("in_catalog", false);
+        boolean requested = item.optBoolean("requested", false);
+        request.setText(t(inCatalog ? "En biblioteca" : requested ? "Solicitado" : "Pedir"));
+        request.setTextSize(11);
+        request.setTextColor(Color.WHITE);
+        request.setAllCaps(false);
+        request.setTypeface(activeProfileTypeface(true));
+        request.setPadding(d(3), 0, d(3), 0);
+        request.setMinWidth(0);
+        request.setMinHeight(0);
+        request.setBackground(round(inCatalog || requested ? 0xCC286B4C : RED, d(7)));
+        request.setContentDescription(t(inCatalog ? "Ya disponible en la biblioteca"
+                : requested ? "Ya solicitado" : "Pedir contenido"));
+        request.setEnabled(!inCatalog && !requested);
+        applyTvFocusStyle(request, false);
+        LinearLayout.LayoutParams requestParams = new LinearLayout.LayoutParams(-1, d(34));
+        requestParams.topMargin = d(6);
+        card.addView(request, requestParams);
+        if (!inCatalog && !requested)
+            request.setOnClickListener(v -> confirmRecommendationRequest(item, request));
+        return card;
     }
 
     View genreMoreCard(String genre) {
@@ -6780,6 +6949,16 @@ public class MainActivity extends Activity {
             case "Eliminado de favoritos": return "Gogokoetatik kenduta";
             case "Más como esto en tu catálogo": return "Antzeko gehiago zure katalogoan";
             case "Más sugerencias de TMDb": return "TMDb-ko iradokizun gehiago";
+            case "TMDb populares": return "TMDb-ko ezagunenak";
+            case "Películas y series ordenadas por popularidad de TMDb":
+                return "TMDb-ko ospearen arabera ordenatutako filmak eta telesailak";
+            case "Cargando títulos de TMDb…": return "TMDb-ko tituluak kargatzen…";
+            case "TMDb no devolvió títulos para esta temática":
+                return "TMDb-k ez du gai honetarako titulurik itzuli";
+            case "No se pudieron cargar los títulos de TMDb: ":
+                return "Ezin izan dira TMDb-ko tituluak kargatu: ";
+            case "En biblioteca": return "Liburutegian";
+            case "Ya disponible en la biblioteca": return "Dagoeneko liburutegian dago";
             case "Reproducir normalmente": return "Erreproduzitu normalean";
             case "Opciones de reproducción": return "Erreprodukzio-aukerak";
             case "Vídeo en curso": return "Abian dagoen bideoa";
@@ -7537,7 +7716,7 @@ public class MainActivity extends Activity {
         String contentType = "movie".equals(kind) ? "movie" : "tv";
         long tmdbId = item.optLong("tmdb_id", 0);
         if (tmdbId <= 0) return;
-        externalRecommendationReturnNode = currentDetailNode;
+        externalRecommendationReturnNode = showingDetail ? currentDetailNode : null;
         externalRecommendationReturnScrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
         externalRecommendationReturnFocusTag = focusedTagWithPrefix("recommendation:");
         detailReturnScrollY = externalRecommendationReturnScrollY;
