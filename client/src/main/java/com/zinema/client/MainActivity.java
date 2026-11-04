@@ -3482,11 +3482,11 @@ public class MainActivity extends Activity {
         heading.setPadding(d(20), d(8), d(20), d(8));
         TextView title = label(genreLabel(genre), 22, Color.WHITE, true);
         heading.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView popular = labelRaw("↗", 23, Color.WHITE, true);
+        TextView popular = labelRaw("★", 22, 0xFFFFC857, true);
         popular.setGravity(Gravity.CENTER);
         popular.setFocusable(true);
         popular.setClickable(true);
-        popular.setContentDescription(t("TMDb populares"));
+        popular.setContentDescription(t("Más populares en TMDb"));
         popular.setBackground(round(PANEL, d(10)));
         applyTvFocusStyle(popular, false);
         popular.setOnClickListener(v -> openPopularGenreWindow(genre));
@@ -3586,13 +3586,16 @@ public class MainActivity extends Activity {
             scroll.addView(status, new ScrollView.LayoutParams(-1, -2));
             return;
         }
-        int screenWidthDp = Math.round(getResources().getDisplayMetrics().widthPixels
-                / getResources().getDisplayMetrics().density);
-        int panelWidth = Math.min(screenWidthDp - 36, 1180);
+        float density = getResources().getDisplayMetrics().density;
+        int dialogWidthPx = Math.min(getResources().getDisplayMetrics().widthPixels - d(36), d(1180));
+        int gridWidthPx = dialogWidthPx - d(40); // Dialog padding plus the grid's own padding.
+        int availableWidthDp = Math.max(1, Math.round(gridWidthPx / density));
         int columns = isTelevision()
-                ? Math.max(2, Math.min(7, (panelWidth - 36) / 154))
-                : (getResources().getConfiguration().orientation == 2 ? 5 : 3);
-        int cellWidth = Math.max(1, (panelWidth - d(36) - d(columns * 8)) / columns);
+                ? Math.max(2, Math.min(7, availableWidthDp / 154))
+                : (getResources().getConfiguration().orientation == 2
+                    ? Math.max(2, Math.min(5, availableWidthDp / 120))
+                    : Math.max(2, Math.min(3, availableWidthDp / 100)));
+        int cellWidth = Math.max(d(90), (gridWidthPx - d(columns * 8)) / columns);
         LinearLayout grid = new LinearLayout(this);
         grid.setOrientation(LinearLayout.VERTICAL);
         grid.setPadding(d(2), d(2), d(2), d(12));
@@ -3606,13 +3609,15 @@ public class MainActivity extends Activity {
                 grid.addView(row, rowParams);
             }
             JSONObject item = items.get(i);
-            row.addView(popularGenreCard(item, dialog), new LinearLayout.LayoutParams(cellWidth, -2));
+            LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(cellWidth, -2);
+            cardParams.setMargins(d(4), 0, d(4), 0);
+            row.addView(popularGenreCard(item, dialog, cellWidth), cardParams);
         }
         scroll.addView(grid, new ScrollView.LayoutParams(-1, -2));
         scroll.post(() -> loadDeferredPosters(grid));
     }
 
-    View popularGenreCard(JSONObject item, AlertDialog dialog) {
+    View popularGenreCard(JSONObject item, AlertDialog dialog, int cellWidth) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(d(4), d(4), d(4), d(8));
@@ -3630,7 +3635,8 @@ public class MainActivity extends Activity {
             dialog.dismiss();
             openExternalRecommendation(item);
         });
-        card.addView(poster, new LinearLayout.LayoutParams(-1, d(180)));
+        card.addView(poster, new LinearLayout.LayoutParams(-1,
+                Math.max(d(132), Math.round((cellWidth - d(8)) * 1.48f))));
 
         String kind = item.optString("kind", "movie");
         TextView type = label(kindLabel(kind),
@@ -6950,6 +6956,7 @@ public class MainActivity extends Activity {
             case "Más como esto en tu catálogo": return "Antzeko gehiago zure katalogoan";
             case "Más sugerencias de TMDb": return "TMDb-ko iradokizun gehiago";
             case "TMDb populares": return "TMDb-ko ezagunenak";
+            case "Más populares en TMDb": return "TMDb-ko ezagunenak";
             case "Películas y series ordenadas por popularidad de TMDb":
                 return "TMDb-ko ospearen arabera ordenatutako filmak eta telesailak";
             case "Cargando títulos de TMDb…": return "TMDb-ko tituluak kargatzen…";
