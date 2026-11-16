@@ -1213,13 +1213,22 @@ def _incoming_guess(path: Path) -> dict[str, object]:
     stem = path.stem
     episode = EPISODE_RE.search(stem)
     if episode:
-        series_title = _clean_media_title(stem[:episode.start()]) or _clean_media_title(stem)
+        # Drop "@channel" / "@release_group" tags (e.g. "@la_comunidad").
+        stem = re.sub(r"(?:^|(?<=[\s._-]))@\w+", " ", stem)
+        stem = re.sub(r"\s+", " ", stem).strip()
+        episode = EPISODE_RE.search(stem) or episode
+        before = _clean_media_title(stem[:episode.start()])
+        after = _clean_media_title(stem[episode.end():])
+        if before:
+            series_title, episode_title = before, after
+        else:
+            # "2x10 Ted Lasso": the series name follows the episode marker.
+            series_title, episode_title = after or _clean_media_title(stem), ""
         series_title = re.sub(r"\s*\(?\b(?:19|20)\d{2}\)?$", "", series_title).strip(" -_.")
         if episode.group(1) is not None:
             season_number, episode_number = int(episode.group(1)), int(episode.group(2))
         else:
             season_number, episode_number = int(episode.group(3)), int(episode.group(4))
-        episode_title = _clean_media_title(stem[episode.end():])
         return {
             "library": "series", "kind": "episode", "title": series_title,
             "year": None, "season_number": season_number,
