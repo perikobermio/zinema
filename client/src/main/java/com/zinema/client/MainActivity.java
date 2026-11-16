@@ -7262,6 +7262,11 @@ public class MainActivity extends Activity {
             case "Ajustes": return "Ezarpenak";
             case "No se encontraron pósteres.": return "Ez da posterik aurkitu.";
             case "Reproductor": return "Erreproduzitzailea";
+            case "Reproducción de series": return "Telesailen erreprodukzioa";
+            case "Reproducir automáticamente el siguiente episodio":
+                return "Hurrengo atala automatikoki erreproduzitu";
+            case "Activa esta opción para que al terminar un capítulo se inicie el siguiente de la misma temporada.":
+                return "Aktibatu aukera hau atal bat amaitzean denboraldi bereko hurrengoa hasteko.";
             case "Zinema prioriza el audio en euskera y después en español; inicia sin subtítulos. VLC usa sus propias preferencias.":
                 return "Zinemak euskarazko audioari ematen dio lehentasuna, eta ondoren gaztelaniazkoari; azpititulurik gabe hasten da. VLCk bere hobespenak erabiltzen ditu.";
             case "Reproductor de Zinema": return "Zinemaren erreproduzitzailea";
@@ -8937,6 +8942,31 @@ public class MainActivity extends Activity {
                     ? t("Se usará VLC. Si no está instalado, se abrirá el reproductor de Zinema.")
                     : t("Se usará el reproductor de Zinema."), Toast.LENGTH_SHORT).show();
         });
+
+        String profileId = activeProfileId();
+        if (!profileId.isEmpty()) {
+            LinearLayout seriesPlaybackCard = settingsCard();
+            LinearLayout.LayoutParams seriesPlaybackParams = new LinearLayout.LayoutParams(-1, -2);
+            seriesPlaybackParams.topMargin = d(14);
+            screen.addView(seriesPlaybackCard, seriesPlaybackParams);
+            seriesPlaybackCard.addView(label(t("Reproducción de series"), 14, Color.WHITE, true));
+            TextView autoNextHint = label(
+                    t("Activa esta opción para que al terminar un capítulo se inicie el siguiente de la misma temporada."),
+                    12, MUTED, false);
+            LinearLayout.LayoutParams autoNextHintParams = new LinearLayout.LayoutParams(-1, -2);
+            autoNextHintParams.topMargin = d(5);
+            seriesPlaybackCard.addView(autoNextHint, autoNextHintParams);
+            Switch autoNextSwitch = new Switch(this);
+            autoNextSwitch.setText(t("Reproducir automáticamente el siguiente episodio"));
+            autoNextSwitch.setTextColor(Color.WHITE);
+            autoNextSwitch.setButtonTintList(ColorStateList.valueOf(0xFFFF6B73));
+            autoNextSwitch.setChecked(prefs.getBoolean(autoNextEpisodeKey(profileId), false));
+            LinearLayout.LayoutParams autoNextSwitchParams = new LinearLayout.LayoutParams(-1, d(52));
+            autoNextSwitchParams.topMargin = d(7);
+            seriesPlaybackCard.addView(autoNextSwitch, autoNextSwitchParams);
+            autoNextSwitch.setOnCheckedChangeListener((button, checked) ->
+                    prefs.edit().putBoolean(autoNextEpisodeKey(profileId), checked).apply());
+        }
 
         content.addView(screen, new LinearLayout.LayoutParams(-1, -2));
     }
@@ -11009,6 +11039,7 @@ public class MainActivity extends Activity {
     }
 
     String nextEpisodeKey() { return "next_episode:" + activeProfileId(); }
+    String autoNextEpisodeKey(String profileId) { return "auto_next_episode:" + profileId; }
     String seriesNextEpisodePrefix() { return "series_next_episode:" + activeProfileId() + ":"; }
     String seriesNextEpisodeKey(String seriesId) { return seriesNextEpisodePrefix() + seriesId; }
 
@@ -11413,6 +11444,7 @@ public class MainActivity extends Activity {
         String completedOwner = prefs.getString("completed_owner:" + profileId, "");
         String completedKind = prefs.getString("completed_kind:" + profileId, "");
         String autoPlay = prefs.getString("auto_play_episode:" + profileId, "");
+        boolean autoAdvanceEnabled = prefs.getBoolean(autoNextEpisodeKey(profileId), false);
         if (completedMedia.isEmpty() && autoPlay.isEmpty()) return false;
         prefs.edit().remove("completed_media:" + profileId).remove("completed_owner:" + profileId)
                 .remove("completed_kind:" + profileId).remove("auto_play_episode:" + profileId)
@@ -11449,6 +11481,16 @@ public class MainActivity extends Activity {
                         scheduleProfileStateSync();
                         advancingCompletedEpisode = false;
                         refreshCurrentScreen();
+                        if (autoAdvanceEnabled && next != null
+                                && completedOwner.equals(next.optString("owner_node_id"))
+                                && profileId.equals(activeProfileId())) {
+                            launchPlayer(next.optString("stream", next.optString("stream_url", "")),
+                                    next.optString("title", "Siguiente capítulo"),
+                                    next.optString("poster_url", ""),
+                                    next.optString("owner_node_id", ""),
+                                    next.optString("media_id", next.optString("id", "")),
+                                    next.optString("owner_kind", "season"));
+                        }
                     });
                 } catch (Exception ignored) {
                     runOnUiThread(() -> advancingCompletedEpisode = false);
