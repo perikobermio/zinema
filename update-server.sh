@@ -8,19 +8,26 @@ fail() {
     exit 1
 }
 
-command -v git >/dev/null 2>&1 || fail "Falta git."
-command -v docker >/dev/null 2>&1 || fail "Falta docker."
-docker compose version >/dev/null 2>&1 || fail "Se necesita Docker Compose v2 (docker compose)."
+main() {
+    command -v git >/dev/null 2>&1 || fail "Falta git."
+    command -v docker >/dev/null 2>&1 || fail "Falta docker."
+    docker compose version >/dev/null 2>&1 || fail "Se necesita Docker Compose v2 (docker compose)."
 
-cd "$PROJECT_DIR"
-[ -d .git ] || fail "No se encontró un repositorio Git en $PROJECT_DIR."
-[ -f compose.yaml ] || fail "No se encontró compose.yaml en $PROJECT_DIR."
+    cd "$PROJECT_DIR"
+    [ -d .git ] || fail "No se encontró un repositorio Git en $PROJECT_DIR."
+    [ -f compose.yaml ] || fail "No se encontró compose.yaml en $PROJECT_DIR."
 
-printf '==> git pull --ff-only\n'
-git pull --ff-only || fail "git pull falló (¿cambios locales o historial divergente?)."
+    printf '==> git pull --ff-only\n'
+    git pull --ff-only || fail "git pull falló (¿cambios locales o historial divergente?)."
 
-printf '==> Reconstruyendo y recreando el servicio zinema\n'
-docker compose up -d --build --force-recreate zinema || fail "docker compose falló."
+    printf '==> Reconstruyendo y recreando el servicio zinema\n'
+    docker compose up -d --build --force-recreate zinema || fail "docker compose falló."
 
-docker compose ps zinema
-printf 'Servidor actualizado.\n'
+    docker compose ps zinema
+    printf 'Servidor actualizado.\n'
+}
+
+# Todo el script está en main() y se sale justo después: así un git pull que
+# reemplace este fichero no afecta a la ejecución en curso.
+main "$@"
+exit $?

@@ -100,12 +100,15 @@ def process(state: dict) -> None:
             raise RuntimeError(f"No se encontró un repositorio Git en {PROJECT_ROOT}")
         if not (PROJECT_ROOT / "compose.yaml").is_file():
             raise RuntimeError(f"No se encontró compose.yaml en {PROJECT_ROOT}")
-        run_step(state, "Descargando cambios (git pull)",
-                 ["git", "pull", "--ff-only"], 600)
-        run_step(state, "Reconstruyendo y recreando el servidor",
-                 ["docker", "compose", "-f", str(PROJECT_ROOT / "compose.yaml"),
-                  "--project-directory", str(PROJECT_ROOT), "up", "-d", "--build",
-                  "--force-recreate", "zinema"], 1800)
+        script = PROJECT_ROOT / "update-server.sh"
+        if not script.is_file():
+            # First run after a checkout that predates the script: pull to get it.
+            run_step(state, "Descargando cambios (git pull)",
+                     ["git", "pull", "--ff-only"], 600)
+        if not script.is_file():
+            raise RuntimeError(f"No se encontró update-server.sh en {PROJECT_ROOT}")
+        run_step(state, "Actualizando servidor (update-server.sh)",
+                 ["sh", str(script)], 2400)
         state.update(status="completed", stage="Actualización completada", error=None)
     except Exception as error:  # Preserve the reason and command output for the admin.
         state.update(status="failed", stage="Actualización fallida", error=str(error))
