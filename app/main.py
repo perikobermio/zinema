@@ -26,6 +26,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 import httpx
 from pydantic import BaseModel, Field
 from pwdlib import PasswordHash
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import FileResponse, Response, StreamingResponse
 
 from app.catalog import EPISODE_RE, VIDEO_EXTENSIONS, scan_catalog
@@ -106,6 +107,46 @@ SEASON_ART_CACHE_TTL_SECONDS = 6 * 60 * 60
 
 app = FastAPI(title="Zinema Server", version="0.1.0",
               docs_url=None, redoc_url=None, openapi_url=None)
+
+
+class _ApiGZipMiddleware:
+    """Gzip only JSON API traffic; never touch media streams or ranged requests."""
+
+    def __init__(self, inner):
+        self.plain = inner
+        self.gzip = GZipMiddleware(inner, minimum_size=1024)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            headers = dict(scope.get("headers") or [])
+            if (path.startswith("/api/") and not path.startswith("/api/v1/playback/")
+                    and b"range" not in headers):
+                return await self.gzip(scope, receive, send)
+        return await self.plain(scope, receive, send)
+
+
+@app.middleware("http")
+async def catalog_etag_middleware(request: Request, call_next):
+    """Let clients revalidate catalog lists with If-None-Match and skip the payload."""
+    response = await call_next(request)
+    if (request.method != "GET" or response.status_code != 200
+            or not request.url.path.startswith("/api/v1/catalog")
+            or request.url.path.endswith("/version")):
+        return response
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    etag = '"' + hashlib.sha1(body).hexdigest() + '"'
+    headers = {k: v for k, v in response.headers.items()
+               if k.lower() not in ("content-length", "etag")}
+    headers["ETag"] = etag
+    headers["Cache-Control"] = "private, no-cache"
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": headers["Cache-Control"]})
+    return Response(content=body, status_code=200, headers=headers,
+                    media_type=response.media_type)
+
+
+app.add_middleware(_ApiGZipMiddleware)
 
 
 class LibraryItem(BaseModel):
@@ -2143,6 +2184,19 @@ def get_item(item_id: str) -> LibraryItem:
 
 @app.get("/api/v1/catalog/version", dependencies=[Depends(require_client)])
 def get_catalog_version() -> dict[str, str]:
+    now = time.monotonic()
+    cached = _CATALOG_VERSION_CACHE
+    if cached[1] and now - cached[0] < 5.0:
+        return {"version": cached[1]}
+    version = _compute_catalog_version()
+    _CATALOG_VERSION_CACHE[:] = [now, version]
+    return {"version": version}
+
+
+_CATALOG_VERSION_CACHE: list = [0.0, ""]
+
+
+def _compute_catalog_version() -> str:
     with closing(database()) as connection:
         nodes = connection.execute(
             """SELECT id, library, kind, relative_path, parent_id, title, season_number,
@@ -2169,7 +2223,7 @@ def get_catalog_version() -> dict[str, str]:
          [tuple(row) for row in requests], _incoming_catalog_signature()],
         ensure_ascii=False, separators=(",", ":"),
     )
-    return {"version": hashlib.sha256(state.encode("utf-8")).hexdigest()}
+    return hashlib.sha256(state.encode("utf-8")).hexdigest()
 
 
 def _account_login(credentials: AccountCredentials, register: bool) -> dict[str, object]:

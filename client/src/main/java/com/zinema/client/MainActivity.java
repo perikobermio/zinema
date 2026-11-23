@@ -580,9 +580,38 @@ public class MainActivity extends Activity {
         JSONArray remoteProfiles;
         String error;
         synchronized (this) {
-            if (!startupPrefetchPending || !startupPrefetchReady || !startupHomeAwaiting) return;
+            boolean revalidating = startupDiskHomeShown;
+            if (!startupPrefetchPending || !startupPrefetchReady || (!startupHomeAwaiting && !revalidating)) return;
             startupPrefetchPending = false;
             startupHomeAwaiting = false;
+            startupDiskHomeShown = false;
+            if (revalidating) {
+                if (startupPrefetchError == null && startupMovies != null && startupSeries != null) {
+                    final List<JSONObject> newMovies = startupMovies, newSeries = startupSeries;
+                    final List<JSONObject> newHome = startupHomeCatalog;
+                    if (startupDownloadStatus != null) {
+                        catalogDownloadStatus = startupDownloadStatus;
+                        catalogDownloadStatusLoaded = true;
+                    }
+                    movies = newMovies;
+                    series = newSeries;
+                    homeCatalog = newHome == null ? rootPlayableItems(movies, series) : newHome;
+                    mostViewedCatalog = mostViewedNodes(homeCatalog);
+                    putCatalogList("movies", null, movies);
+                    putCatalogList("series", null, series);
+                    writeCatalogDisk("home", homeCatalog);
+                    catalogVersion = "";
+                    lastCatalogVersionCheckMs = System.currentTimeMillis();
+                    if (!showingAdmin && !showingDetail && !showingProfiles
+                            && !libraryMode && "home".equals(selectedSection)) {
+                        int scrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
+                        renderHome();
+                        if (contentScroller != null)
+                            contentScroller.post(() -> contentScroller.scrollTo(0, scrollY));
+                    }
+                }
+                return;
+            }
             movieList = startupMovies;
             seriesList = startupSeries;
             homeCatalogList = startupHomeCatalog;
@@ -620,6 +649,8 @@ public class MainActivity extends Activity {
         if (remoteProfiles != null) mergeRemoteProfiles(remoteProfiles);
         putCatalogList("movies", null, movies);
         putCatalogList("series", null, series);
+        writeCatalogDisk("home", homeCatalog);
+        pruneCatalogDisk();
         catalogVersion = "";
         lastCatalogVersionCheckMs = System.currentTimeMillis();
         if (readProfiles().isEmpty()) {
@@ -1107,13 +1138,24 @@ public class MainActivity extends Activity {
         connection.setReadTimeout(20000);
         connection.setRequestProperty("Accept", "application/json");
         connection.setRequestProperty("Authorization", "Bearer " + token);
+        boolean revalidate = path.startsWith("/api/v1/catalog");
+        String[] known = revalidate ? arrayEtagCache.get(path) : null;
+        if (known != null) connection.setRequestProperty("If-None-Match", known[0]);
         int status = connection.getResponseCode();
+        if (status == 304 && known != null) {
+            connection.disconnect();
+            return new JSONArray(known[1]);
+        }
         InputStream input = status < 400 ? connection.getInputStream() : connection.getErrorStream();
         String body = readText(input);
+        String etag = connection.getHeaderField("ETag");
         connection.disconnect();
         if (status < 200 || status >= 300) throw new Exception("HTTP " + status + (body.isEmpty() ? "" : ": " + body));
+        if (revalidate && etag != null && !etag.isEmpty()) arrayEtagCache.put(path, new String[]{etag, body});
         return new JSONArray(body);
     }
+
+    final Map<String, String[]> arrayEtagCache = java.util.Collections.synchronizedMap(new HashMap<>());
 
     String clientApiToken() {
         if (prefs == null) return "";
@@ -1246,6 +1288,19 @@ public class MainActivity extends Activity {
         if (cachedMovies != null && cachedSeries != null) {
             movies = cachedMovies;
             series = cachedSeries;
+            if (catalogServedFromDisk) {
+                catalogServedFromDisk = false;
+                List<JSONObject> diskHome = readCatalogDisk("home");
+                homeCatalog = diskHome != null ? diskHome : rootPlayableItems(movies, series);
+                mostViewedCatalog = mostViewedNodes(homeCatalog);
+                startupDiskHomeShown = true;
+                startupHomeAwaiting = false;
+                renderHome();
+                // Revalida en segundo plano: usa el prefetch de arranque o lanza una recarga.
+                if (startupPrefetchStarted && startupPrefetchPending) consumeStartupPrefetch();
+                else { startupDiskHomeShown = false; refreshCatalogAfterSync(); }
+                return;
+            }
             renderHome();
             return;
         }
@@ -2861,6 +2916,7 @@ public class MainActivity extends Activity {
                     mostViewedCatalog = resolvedMostViewed;
                     putCatalogList("movies", null, movieList);
                     putCatalogList("series", null, seriesList);
+                    writeCatalogDisk("home", resolvedHomeCatalog);
                     catalogVersion = "";
                     lastCatalogVersionCheckMs = System.currentTimeMillis();
                     renderHome();
@@ -2920,8 +2976,89 @@ public class MainActivity extends Activity {
     }
 
     List<JSONObject> getCachedCatalogList(String library, String parentId) {
-        List<JSONObject> cached = catalogCache.get(catalogCacheKey(library, parentId));
+        String key = catalogCacheKey(library, parentId);
+        List<JSONObject> cached = catalogCache.get(key);
+        if (cached == null) {
+            // Memoria vacía (arranque en frío): se pinta lo último guardado en disco y se revalida en segundo plano.
+            cached = readCatalogDisk(key);
+            if (cached != null) {
+                catalogCache.put(key, new ArrayList<>(cached));
+                catalogCacheUpdatedAt.put(key, 0L);
+                catalogServedFromDisk = true;
+            }
+        }
         return cached == null ? null : new ArrayList<>(cached);
+    }
+
+    // ---- Caché de catálogo persistente en disco (stale-while-revalidate) ----
+    final ExecutorService catalogDiskIo = Executors.newSingleThreadExecutor();
+    volatile boolean catalogServedFromDisk;
+    boolean startupDiskHomeShown;
+
+    File catalogDiskDir() {
+        File dir = new File(getFilesDir(), "catalog-cache");
+        if (!dir.isDirectory()) dir.mkdirs();
+        return dir;
+    }
+
+    String catalogDiskPrefix() {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-1");
+            byte[] hash = digest.digest((server + "|" + clientApiToken() + "|" + activeProfileId())
+                    .getBytes(StandardCharsets.UTF_8));
+            StringBuilder out = new StringBuilder();
+            for (int i = 0; i < 6; i++) out.append(String.format("%02x", hash[i]));
+            return out.toString();
+        } catch (Exception e) { return "default"; }
+    }
+
+    File catalogDiskFile(String key) {
+        String safe = Integer.toHexString(key.hashCode()) + "-" + Integer.toHexString(key.length());
+        return new File(catalogDiskDir(), catalogDiskPrefix() + "_" + safe + ".json");
+    }
+
+    List<JSONObject> readCatalogDisk(String key) {
+        try {
+            File file = catalogDiskFile(key);
+            if (!file.isFile()) return null;
+            JSONObject wrapper = new JSONObject(readText(new java.io.FileInputStream(file)));
+            if (!key.equals(wrapper.optString("key"))) return null;
+            JSONArray rows = wrapper.optJSONArray("rows");
+            return rows == null ? null : toList(rows);
+        } catch (Exception ignored) { return null; }
+    }
+
+    void writeCatalogDisk(String key, List<JSONObject> rows) {
+        final List<JSONObject> snapshot = new ArrayList<>(rows);
+        final File file = catalogDiskFile(key);
+        catalogDiskIo.execute(() -> {
+            try {
+                JSONObject wrapper = new JSONObject();
+                wrapper.put("key", key);
+                wrapper.put("rows", new JSONArray(snapshot));
+                File tmp = new File(file.getParentFile(), file.getName() + ".tmp");
+                try (FileOutputStream out = new FileOutputStream(tmp)) {
+                    out.write(wrapper.toString().getBytes(StandardCharsets.UTF_8));
+                }
+                if (!tmp.renameTo(file)) { file.delete(); tmp.renameTo(file); }
+            } catch (Exception ignored) { }
+        });
+    }
+
+    void wipeCatalogDisk() {
+        catalogDiskIo.execute(() -> {
+            File[] files = catalogDiskDir().listFiles();
+            if (files != null) for (File f : files) f.delete();
+        });
+    }
+
+    /** Borra la caché de otras cuentas/perfiles/servidores para que no crezca sin límite. */
+    void pruneCatalogDisk() {
+        final String prefix = catalogDiskPrefix() + "_";
+        catalogDiskIo.execute(() -> {
+            File[] files = catalogDiskDir().listFiles();
+            if (files != null) for (File f : files) if (!f.getName().startsWith(prefix)) f.delete();
+        });
     }
 
     List<JSONObject> mostViewedNodes(List<JSONObject> catalog) {
@@ -2936,11 +3073,13 @@ public class MainActivity extends Activity {
         String key = catalogCacheKey(library, parentId);
         catalogCache.put(key, new ArrayList<>(rows));
         catalogCacheUpdatedAt.put(key, System.currentTimeMillis());
+        writeCatalogDisk(key, rows);
     }
 
     void clearCatalogCache() {
         catalogCache.clear();
         catalogCacheUpdatedAt.clear();
+        wipeCatalogDisk();
     }
 
     String fetchCatalogVersionSafely() {
@@ -8764,6 +8903,7 @@ public class MainActivity extends Activity {
                     homeCatalog = homeSnapshot;
                     putCatalogList("movies", null, movies);
                     putCatalogList("series", null, series);
+                    writeCatalogDisk("home", homeSnapshot);
                     if (!version.isEmpty()) catalogVersion = version;
                     lastCatalogVersionCheckMs = System.currentTimeMillis();
                     if (!showingAdmin && !showingDetail && !showingProfiles
