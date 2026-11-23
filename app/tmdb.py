@@ -616,6 +616,7 @@ def get_candidate_details(kind: str, tmdb_id: int, access_token: str,
     return {
         "tmdb_id": int(details["id"]),
         "metadata_title": details.get("title") or details.get("name") or "",
+        "original_title": details.get("original_title") or details.get("original_name") or "",
         "overview": details.get("overview") or "",
         "year": int(release[:4]) if release and len(release) >= 4 and release[:4].isdigit() else None,
         "genres": [item["name"] for item in details.get("genres", []) if item.get("name")],

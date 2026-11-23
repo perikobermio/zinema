@@ -168,6 +168,12 @@ public class MainActivity extends Activity {
     static final long CATALOG_CACHE_TTL_MS = 30000L;
     static final long IMAGE_DISK_CACHE_MAX_BYTES = 160L * 1024L * 1024L;
     final ExecutorService io = Executors.newFixedThreadPool(4);
+    // Imágenes en su propio pool (LIFO: lo último que se pide es lo que está en pantalla) para que
+    // decenas de carátulas no bloqueen las llamadas a la API ni el botón Atrás.
+    final ExecutorService imageIo = newImageExecutor();
+    boolean lazyScanPending;
+    boolean deferredScanPending;
+    boolean deferredScanListenerInstalled;
     final Handler adminSyncHandler = new Handler(Looper.getMainLooper());
     final Handler nasDownloadHandler = new Handler(Looper.getMainLooper());
     final Handler downloadProgressHandler = new Handler(Looper.getMainLooper());
@@ -247,6 +253,7 @@ public class MainActivity extends Activity {
     boolean hasResumedOnce;
     boolean activityResumed;
     boolean playerLaunched;
+    long lastPlayerLaunchMs;
     long ignoreBackUntilMs;
     boolean seriesSuggestionBackfillRunning;
     boolean libraryMode;
@@ -308,8 +315,61 @@ public class MainActivity extends Activity {
     boolean advancingCompletedEpisode;
 
     static int bitmapCacheBytes() {
-        return (int) Math.min(32L * 1024L * 1024L,
-                Math.max(8L * 1024L * 1024L, Runtime.getRuntime().maxMemory() / 10L));
+        return (int) Math.min(48L * 1024L * 1024L,
+                Math.max(12L * 1024L * 1024L, Runtime.getRuntime().maxMemory() / 8L));
+    }
+
+    static ExecutorService newImageExecutor() {
+        java.util.concurrent.LinkedBlockingDeque<Runnable> lifo =
+                new java.util.concurrent.LinkedBlockingDeque<Runnable>() {
+                    @Override public boolean offer(Runnable task) { return offerFirst(task); }
+                    @Override public boolean add(Runnable task) { addFirst(task); return true; }
+                };
+        java.util.concurrent.ThreadPoolExecutor pool = new java.util.concurrent.ThreadPoolExecutor(
+                3, 3, 30L, java.util.concurrent.TimeUnit.SECONDS, lifo, runnable -> {
+                    Thread thread = new Thread(() -> {
+                        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                        runnable.run();
+                    }, "zinema-image");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+        pool.allowCoreThreadTimeOut(true);
+        return pool;
+    }
+
+    @Override public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level >= TRIM_MEMORY_RUNNING_LOW) {
+            if (level >= TRIM_MEMORY_BACKGROUND) imageCache.evictAll();
+            else imageCache.trimToSize(imageCache.maxSize() / 2);
+        }
+    }
+
+    @Override public void onLowMemory() {
+        super.onLowMemory();
+        imageCache.evictAll();
+    }
+
+    /** Decodifica reduciendo la resolución a lo que realmente se pinta (la TV tiene poca RAM). */
+    static Bitmap decodeSampled(byte[] bytes, File file, boolean backdrop) {
+        int maxEdge = backdrop ? 1280 : 640;
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        if (bytes != null) BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
+        else BitmapFactory.decodeFile(file.getAbsolutePath(), bounds);
+        int longest = Math.max(bounds.outWidth, bounds.outHeight);
+        int sample = 1;
+        while (longest / (sample * 2) >= maxEdge) sample *= 2;
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inSampleSize = sample;
+        if (!backdrop) options.inPreferredConfig = Bitmap.Config.RGB_565;
+        try {
+            return bytes != null ? BitmapFactory.decodeByteArray(bytes, 0, bytes.length, options)
+                    : BitmapFactory.decodeFile(file.getAbsolutePath(), options);
+        } catch (OutOfMemoryError error) {
+            return null;
+        }
     }
 
     @Override public void onCreate(Bundle state) {
@@ -386,6 +446,17 @@ public class MainActivity extends Activity {
         getWindow().getDecorView().setSystemUiVisibility(flags);
     }
 
+    @Override public boolean onKeyDown(int keyCode, android.view.KeyEvent event) {
+        if (introShowing && (keyCode == android.view.KeyEvent.KEYCODE_DPAD_CENTER
+                || keyCode == android.view.KeyEvent.KEYCODE_ENTER
+                || keyCode == android.view.KeyEvent.KEYCODE_SPACE
+                || keyCode == android.view.KeyEvent.KEYCODE_BUTTON_A)) {
+            finishIntro();
+            return true;
+        }
+        return super.onKeyDown(keyCode, event);
+    }
+
     @Override public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) hideSystemBars();
@@ -393,7 +464,26 @@ public class MainActivity extends Activity {
 
     void showIntro() {
         introShowing = true;
+        // En TV el WebView de la intro cuesta memoria y segundos de arranque: se omite por defecto.
+        if (!prefs.getBoolean("intro_enabled", !isTelevision())) {
+            finishIntro();
+            return;
+        }
         introWebView = new WebView(this);
+        introWebView.setOnKeyListener((v, keyCode, event) -> {
+            if (event.getAction() == android.view.KeyEvent.ACTION_DOWN
+                    && (keyCode == android.view.KeyEvent.KEYCODE_DPAD_CENTER
+                    || keyCode == android.view.KeyEvent.KEYCODE_ENTER
+                    || keyCode == android.view.KeyEvent.KEYCODE_BUTTON_A)) {
+                finishIntro();
+                return true;
+            }
+            return false;
+        });
+        introWebView.setOnTouchListener((v, event) -> {
+            if (event.getAction() == android.view.MotionEvent.ACTION_UP) finishIntro();
+            return false;
+        });
         introWebView.setBackgroundColor(BG);
         introWebView.setVerticalScrollBarEnabled(false);
         introWebView.setHorizontalScrollBarEnabled(false);
@@ -598,8 +688,8 @@ public class MainActivity extends Activity {
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setPadding(d(20), d(20), d(16), d(8));
         bar.setBackgroundColor(kidTheme ? 0xF12A3767 : 0xF0141721);
-        bar.setElevation(d(24));
-        bar.setTranslationZ(d(24));
+        bar.setElevation(d(8));
+        bar.setTranslationZ(d(8));
         backButton = navAction("‹", "Atrás", v -> onBackPressed());
         backButton.setTextSize(30);
         boolean libraryRoot = libraryMode && !showingDetail && breadcrumbs.isEmpty()
@@ -643,8 +733,8 @@ public class MainActivity extends Activity {
 
         navScroll = new HorizontalScrollView(this);
         navScroll.setHorizontalScrollBarEnabled(false);
-        navScroll.setElevation(d(22));
-        navScroll.setTranslationZ(d(22));
+        navScroll.setElevation(d(6));
+        navScroll.setTranslationZ(d(6));
         navScroll.setBackgroundColor(kidTheme ? 0xF1373978 : 0xF0141721);
         LinearLayout nav = new LinearLayout(this);
         nav.setPadding(d(16), 0, d(16), d(8));
@@ -684,7 +774,7 @@ public class MainActivity extends Activity {
         content.setPadding(0, 0, 0, d(28));
         contentScroller.addView(content);
         contentScroller.setOnScrollChangeListener((View view, int x, int y, int oldX, int oldY) ->
-                loadVisibleLazyRows());
+                scheduleLazyScan());
         page.addView(contentScroller, new LinearLayout.LayoutParams(-1, 0, 1));
         setContentView(frame);
         refreshPlaybackCapacityUi();
@@ -808,8 +898,9 @@ public class MainActivity extends Activity {
             }
             focusedView.animate().cancel();
             float scale = hasFocus && scaleOnFocus && isTelevision() ? 1.035f : 1f;
-            focusedView.animate().scaleX(scale).scaleY(scale).setDuration(120).start();
-            focusedView.setElevation(hasFocus ? d(7) : 0);
+            focusedView.animate().scaleX(scale).scaleY(scale).setDuration(90).start();
+            // La sombra por elevación obliga a recalcular el contorno en cada foco; en TV se evita.
+            if (!isTelevision()) focusedView.setElevation(hasFocus ? d(7) : 0);
         });
     }
 
@@ -827,7 +918,7 @@ public class MainActivity extends Activity {
             float alpha = sibling.getAlpha();
             tvFocusOriginalAlphas.put(sibling, alpha);
             sibling.animate().cancel();
-            sibling.animate().alpha(alpha * 0.58f).setDuration(140L).start();
+            sibling.setAlpha(alpha * 0.58f);
         }
     }
 
@@ -4315,10 +4406,10 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) { return null; }
     }
 
-    Bitmap readDiskImage(String url) {
+    Bitmap readDiskImage(String url, boolean backdrop) {
         File file = imageDiskFile(url);
         if (file == null || !file.isFile()) return null;
-        Bitmap bitmap = BitmapFactory.decodeFile(file.getAbsolutePath());
+        Bitmap bitmap = decodeSampled(null, file, backdrop);
         if (bitmap == null) file.delete();
         else file.setLastModified(System.currentTimeMillis());
         return bitmap;
@@ -4415,33 +4506,34 @@ public class MainActivity extends Activity {
         deferredImageRequests.remove(target);
         target.setTag(url);
         requestedImages.put(target, url);
-        Bitmap cached = imageCache.get(url);
+        String cacheKey = backdrop ? url + "#b" : url;
+        Bitmap cached = imageCache.get(cacheKey);
         if (cached != null) { target.setImageBitmap(cached); return; }
         showPosterPlaceholder(target);
-        List<ImageView> pending = pendingImageTargets.get(url);
+        List<ImageView> pending = pendingImageTargets.get(cacheKey);
         if (pending != null) {
             pending.add(target);
             return;
         }
         pending = new ArrayList<>();
         pending.add(target);
-        pendingImageTargets.put(url, pending);
-        io.execute(() -> {
+        pendingImageTargets.put(cacheKey, pending);
+        imageIo.execute(() -> {
             Bitmap bitmap = null;
             try {
-                bitmap = readDiskImage(url);
+                bitmap = readDiskImage(url, backdrop);
                 if (bitmap == null) {
                     byte[] bytes = downloadImage(url);
-                    bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+                    bitmap = decodeSampled(bytes, null, backdrop);
                     if (bitmap != null) writeDiskImage(url, bytes);
                 }
             } catch (Exception ignored) {
             }
             Bitmap result = bitmap;
             runOnUiThread(() -> {
-                List<ImageView> targets = pendingImageTargets.remove(url);
+                List<ImageView> targets = pendingImageTargets.remove(cacheKey);
                 if (targets == null) return;
-                if (result != null) imageCache.put(url, result);
+                if (result != null) imageCache.put(cacheKey, result);
                 for (ImageView image : targets) {
                     if (!url.equals(image.getTag())) continue;
                     if (result != null) image.setImageBitmap(result);
@@ -4460,25 +4552,35 @@ public class MainActivity extends Activity {
         return target.getGlobalVisibleRect(visible) && visible.width() > 0 && visible.height() > 0;
     }
 
+    /** Un único listener de scroll para toda la ventana (antes había uno por carátula). */
     void watchDeferredImageScroll(ImageView target) {
-        if (target == null || !lazyImageScrollWatchers.add(target)) return;
-        android.view.ViewTreeObserver.OnScrollChangedListener scrollListener =
-                () -> loadDeferredImageIfVisible(target);
-        target.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
-            @Override public void onViewAttachedToWindow(View view) {
-                if (target.getViewTreeObserver().isAlive())
-                    target.getViewTreeObserver().addOnScrollChangedListener(scrollListener);
-                loadDeferredImageIfVisible(target);
+        if (!deferredScanListenerInstalled) {
+            android.view.ViewTreeObserver observer = getWindow().getDecorView().getViewTreeObserver();
+            if (observer.isAlive()) {
+                observer.addOnScrollChangedListener(this::scheduleDeferredImageScan);
+                deferredScanListenerInstalled = true;
             }
-            @Override public void onViewDetachedFromWindow(View view) {
-                if (scrollListener != null && target.getViewTreeObserver().isAlive())
-                    target.getViewTreeObserver().removeOnScrollChangedListener(scrollListener);
-            }
-        });
-        if (target.isAttachedToWindow()) {
-            if (target.getViewTreeObserver().isAlive())
-                target.getViewTreeObserver().addOnScrollChangedListener(scrollListener);
         }
+    }
+
+    void scheduleDeferredImageScan() {
+        if (deferredScanPending || deferredImageRequests.isEmpty()) return;
+        deferredScanPending = true;
+        getWindow().getDecorView().postDelayed(() -> {
+            deferredScanPending = false;
+            if (deferredImageRequests.isEmpty()) return;
+            for (ImageView image : new ArrayList<>(deferredImageRequests.keySet()))
+                loadDeferredImageIfVisible(image);
+        }, 90L);
+    }
+
+    void scheduleLazyScan() {
+        if (lazyScanPending) return;
+        lazyScanPending = true;
+        getWindow().getDecorView().postDelayed(() -> {
+            lazyScanPending = false;
+            loadVisibleLazyRows();
+        }, 90L);
     }
 
     void loadDeferredImageIfVisible(ImageView target) {
@@ -4640,7 +4742,7 @@ public class MainActivity extends Activity {
                 addCollectionListingHeader(collection, title, subtitle);
             else addSectionHeader(title, subtitle);
         }
-        addGrid(visibleNodes);
+        addGrid(visibleNodes, true);
         boolean showAlphabetRail = showAlphabet && alphabetVisible;
         content.setPadding(0, 0, showAlphabetRail ? d(42) : 0, d(28));
         if (showAlphabetRail) addAlphabetRail(); else removeAlphabetRail();
@@ -4846,7 +4948,9 @@ public class MainActivity extends Activity {
         content.addView(sub);
     }
 
-    void addGrid(List<JSONObject> nodes) {
+    void addGrid(List<JSONObject> nodes) { addGrid(nodes, false); }
+
+    void addGrid(List<JSONObject> nodes, boolean progressive) {
         alphabetAnchors.clear();
         boolean reserveAlphabetRail = alphabetVisible && libraryMode && !showingDetail
                 && breadcrumbs.isEmpty()
@@ -4860,16 +4964,58 @@ public class MainActivity extends Activity {
         int gridWidth = getResources().getDisplayMetrics().widthPixels - d(32)
                 - (reserveAlphabetRail ? d(42) : 0);
         int cellWidth = Math.max(1, (gridWidth - d(columns * 8)) / columns);
-        LinearLayout row = null;
-        int count = 0;
-        for (JSONObject node : nodes) {
-            if (count % columns == 0) {
+        // Construir cientos de tarjetas de golpe bloquea la UI (sobre todo en TV y al volver con Atrás):
+        // se pintan primero las filas necesarias y el resto se añade por tandas entre fotogramas.
+        int rowHeight = d(262);
+        int screenHeight = getResources().getDisplayMetrics().heightPixels;
+        int neededRows = 4 + (screenHeight / Math.max(1, rowHeight));
+        if (pendingListingRestoreY > 0) neededRows = Math.max(neededRows,
+                (pendingListingRestoreY + screenHeight) / Math.max(1, rowHeight) + 2);
+        if (!pendingFocusRestoreTag.isEmpty()) {
+            for (int i = 0; i < nodes.size(); i++) {
+                String nodeId = nodes.get(i).optString("id", "");
+                if (!nodeId.isEmpty() && pendingFocusRestoreTag.endsWith(nodeId)) {
+                    neededRows = Math.max(neededRows, i / columns + 3);
+                    break;
+                }
+            }
+        }
+        int syncCount = (!progressive || reserveAlphabetRail || nodes.size() <= 60) ? nodes.size() : neededRows * columns;
+        final View[] firstRow = new View[1];
+        appendGridRows(nodes, 0, syncCount, columns, cellWidth, firstRow);
+        if (syncCount < nodes.size()) {
+            final int token = ++gridBuildToken;
+            final int batch = columns * 3;
+            Runnable next = new Runnable() {
+                int from = syncCount;
+                @Override public void run() {
+                    if (token != gridBuildToken || firstRow[0] == null
+                            || firstRow[0].getParent() != content || isFinishing()) return;
+                    int to = Math.min(nodes.size(), from + batch);
+                    appendGridRows(nodes, from, to, columns, cellWidth, firstRow);
+                    from = to;
+                    if (from < nodes.size()) content.postDelayed(this, 16L);
+                }
+            };
+            content.postDelayed(next, 16L);
+        } else gridBuildToken++;
+    }
+
+    int gridBuildToken;
+    LinearLayout gridLastRow;
+
+    void appendGridRows(List<JSONObject> nodes, int from, int to, int columns, int cellWidth, View[] firstRow) {
+        LinearLayout row = from % columns == 0 ? null : gridLastRow;
+        for (int index = from; index < to; index++) {
+            JSONObject node = nodes.get(index);
+            if (index % columns == 0 || row == null) {
                 row = new LinearLayout(this);
                 row.setGravity(Gravity.TOP);
                 row.setClipChildren(false);
                 row.setPadding(d(16), 0, d(16), d(14));
-                if (!nodes.isEmpty()) row.setTag("alphabet-anchor:" + alphabetInitial(displayTitle(node)));
+                row.setTag("alphabet-anchor:" + alphabetInitial(displayTitle(node)));
                 content.addView(row, new LinearLayout.LayoutParams(-1, -2));
+                if (firstRow[0] == null) firstRow[0] = row;
             }
             View card = posterCard(node);
             char initial = alphabetInitial(displayTitle(node));
@@ -4877,8 +5023,8 @@ public class MainActivity extends Activity {
             LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(cellWidth, -2);
             p.setMargins(d(4), 0, d(4), 0);
             row.addView(card, p);
-            count++;
         }
+        gridLastRow = row;
     }
 
     void openNode(JSONObject node) {
@@ -8903,6 +9049,16 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams introSoundHintParams = new LinearLayout.LayoutParams(-1, -2);
         introSoundHintParams.topMargin = d(5);
         introCard.addView(introSoundHint, introSoundHintParams);
+        Switch introEnabledSwitch = new Switch(this);
+        introEnabledSwitch.setText(t("Mostrar la animación de inicio"));
+        introEnabledSwitch.setTextColor(Color.WHITE);
+        introEnabledSwitch.setButtonTintList(ColorStateList.valueOf(0xFFFF6B73));
+        introEnabledSwitch.setChecked(prefs.getBoolean("intro_enabled", !isTelevision()));
+        LinearLayout.LayoutParams introEnabledParams = new LinearLayout.LayoutParams(-1, d(48));
+        introEnabledParams.topMargin = d(7);
+        introCard.addView(introEnabledSwitch, introEnabledParams);
+        introEnabledSwitch.setOnCheckedChangeListener((button, checked) ->
+                prefs.edit().putBoolean("intro_enabled", checked).apply());
         Switch introSoundSwitch = new Switch(this);
         introSoundSwitch.setText(t("Sonido del intro"));
         introSoundSwitch.setTextColor(Color.WHITE);
@@ -9800,9 +9956,24 @@ public class MainActivity extends Activity {
                                     new LinearLayout.LayoutParams(-1, -2);
                             episodesPanelParams.topMargin = d(4);
                             detailsColumn.addView(episodesPanel, episodesPanelParams);
+                            int lastSeasonHeader = -1;
                             for (int j = 0; j < telegramDownloads.length(); j++) {
                                 JSONObject candidate = telegramDownloads.optJSONObject(j);
                                 if (candidate == null) continue;
+                                int candidateSeason = candidate.optInt("season_number");
+                                if (candidateSeason > 0 && candidateSeason != lastSeasonHeader) {
+                                    lastSeasonHeader = candidateSeason;
+                                    int seasonCount = 0;
+                                    for (int k = 0; k < telegramDownloads.length(); k++) {
+                                        JSONObject other = telegramDownloads.optJSONObject(k);
+                                        if (other != null && other.optInt("season_number") == candidateSeason)
+                                            seasonCount++;
+                                    }
+                                    TextView seasonHeader = label(t("Temporada") + " " + candidateSeason
+                                            + " · " + seasonCount, 12, Color.WHITE, true);
+                                    seasonHeader.setPadding(d(4), d(8), 0, d(2));
+                                    episodesPanel.addView(seasonHeader);
+                                }
                                 LinearLayout episodeRow = new LinearLayout(this);
                                 episodeRow.setGravity(Gravity.CENTER_VERTICAL);
                                 episodeRow.setPadding(d(8), d(3), d(4), d(3));
@@ -10095,9 +10266,24 @@ public class MainActivity extends Activity {
                         refreshContentRequestDownloadIndicators(activeState);
                         return;
                     }
+                    // Lista con scroll propio (hasta 90 vídeos) sin alargar toda la pantalla.
+                    ScrollView listScroll = new ScrollView(this);
+                    listScroll.setVerticalScrollBarEnabled(true);
+                    listScroll.setScrollbarFadingEnabled(false);
+                    listScroll.setNestedScrollingEnabled(true);
+                    LinearLayout listBox = new LinearLayout(this);
+                    listBox.setOrientation(LinearLayout.VERTICAL);
+                    listScroll.addView(listBox, new ViewGroup.LayoutParams(-1, -2));
+                    listScroll.setOnTouchListener((v, event) -> {
+                        v.getParent().requestDisallowInterceptTouchEvent(true);
+                        return false;
+                    });
+                    int maxListHeight = Math.min(d(420),
+                            getResources().getDisplayMetrics().heightPixels * 6 / 10);
+                    card.addView(listScroll, new LinearLayout.LayoutParams(-1, maxListHeight));
                     for (int i = 0; i < items.length(); i++) {
                         JSONObject item = items.optJSONObject(i);
-                        if (item != null) addManualTelegramRow(card, item);
+                        if (item != null) addManualTelegramRow(listBox, item);
                     }
                     refreshContentRequestDownloadIndicators(activeState);
                 });
@@ -11318,6 +11504,9 @@ public class MainActivity extends Activity {
         intent.putExtra("playback_session_id", playbackSessionId);
         intent.putExtra("playback_api_base", server);
         intent.putExtra("playback_api_token", clientApiToken());
+        long now = System.currentTimeMillis();
+        if (now - lastPlayerLaunchMs < 2500L) return; // doble pulsación del mando: un solo reproductor
+        lastPlayerLaunchMs = now;
         playerLaunched = true;
         startActivity(intent);
     }
@@ -11398,7 +11587,7 @@ public class MainActivity extends Activity {
         if (hasResumedOnce) {
             returnedFromPlayer = playerLaunched;
             playerLaunched = false;
-            if (returnedFromPlayer) ignoreBackUntilMs = System.currentTimeMillis() + 1200L;
+            if (returnedFromPlayer) ignoreBackUntilMs = System.currentTimeMillis() + 600L;
             playerReturnRefreshed = processPlayerReturn();
             if (returnedFromPlayer && showingDetail && !playerReturnRefreshed) refreshCurrentScreen();
             String activeId = activeProfileId();
@@ -11413,7 +11602,8 @@ public class MainActivity extends Activity {
         if (prefs != null && page != null && "home".equals(selectedSection)
                 && !showingDetail && !showingAdmin && content != null
                 && movies.size() + series.size() > 0
-                && !(returnedFromPlayer && playerReturnRefreshed)) {
+                && returnedFromPlayer
+                && !playerReturnRefreshed) {
             int scrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
             renderHome();
             if (contentScroller != null) contentScroller.post(() -> contentScroller.scrollTo(0, scrollY));
@@ -11512,7 +11702,7 @@ public class MainActivity extends Activity {
 
     @Override public void onBackPressed() {
         if (System.currentTimeMillis() < ignoreBackUntilMs) return;
-        if (introShowing) return;
+        if (introShowing) { finishIntro(); return; }
         if (clientApiToken().isEmpty()) {
             finishAndRemoveTask();
             return;
@@ -11626,6 +11816,13 @@ public class MainActivity extends Activity {
                 JSONObject parent = breadcrumbs.get(breadcrumbs.size() - 1);
                 showCollectionContents(parent);
             }
+            return;
+        }
+        // Ya estamos en Inicio: en vez de reconstruir toda la pantalla, dejamos la app en segundo plano
+        // (se reanuda al instante, sin intro ni recarga).
+        if ("home".equals(selectedSection) && backButton != null
+                && backButton.getVisibility() == View.GONE && !showingProfiles) {
+            moveTaskToBack(true);
             return;
         }
         loadHome();

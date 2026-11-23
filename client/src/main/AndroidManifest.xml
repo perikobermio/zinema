@@ -7,6 +7,8 @@
 
     <application
         android:allowBackup="false"
+        android:largeHeap="true"
+        android:hardwareAccelerated="true"
         android:icon="@drawable/ic_launcher_brand"
         android:banner="@drawable/zinema_tv_banner"
         android:label="Zinema"
@@ -21,10 +23,12 @@
             android:name=".PlayerActivity"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:exported="false"
+            android:launchMode="singleTop"
             android:screenOrientation="landscape" />
         <activity
             android:name=".MainActivity"
-            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode|screenLayout|smallestScreenSize|density|locale|layoutDirection"
+            android:launchMode="singleTask"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

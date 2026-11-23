@@ -3277,8 +3277,8 @@ def create_content_request(request: ContentRequestCreate,
                     or request.items or request.content_type is not None):
                 raise HTTPException(status_code=422, detail="A series catalog item is required")
             series = connection.execute(
-                """SELECT id, kind, title, metadata_title, year, tmdb_id, tmdb_episodes_json,
-                          poster_file
+                """SELECT id, kind, title, metadata_title, original_title, year, tmdb_id,
+                          tmdb_episodes_json, poster_file
                    FROM catalog_nodes WHERE id=? AND available=1""",
                 (request.catalog_node_id,),
             ).fetchone()
@@ -3330,6 +3330,7 @@ def create_content_request(request: ContentRequestCreate,
                 "missing_seasons": missing_seasons,
                 "missing_episode_count": missing_episode_count,
                 "poster_url": poster_url,
+                "original_title": series["original_title"] or "",
             }
             if request.season_number is not None:
                 details["season_number"] = request.season_number
@@ -3450,6 +3451,7 @@ def create_content_request(request: ContentRequestCreate,
                     "overview": candidate.get("overview", ""),
                     "season_count": len(candidate.get("seasons", [])),
                     "poster_path": candidate.get("poster_path"),
+                    "original_title": candidate.get("original_title", ""),
                 }
                 records.append({
                     "request_type": request.request_type,
@@ -3548,8 +3550,13 @@ def _request_telegram_downloads(request: dict[str, object],
     details = request.get("details") or {}
     if not isinstance(details, dict):
         details = {}
-    required_tokens = _download_match_tokens(request.get("title"))
-    if not required_tokens:
+    # Telegram files are usually named with the original (English) title while the
+    # request title is the Spanish TMDb one ("Juego de tronos" vs "Game of Thrones").
+    token_sets = [tokens for tokens in (
+        _download_match_tokens(request.get("title")),
+        _download_match_tokens(details.get("original_title")),
+    ) if tokens]
+    if not token_sets:
         return []
     request_type = str(request.get("request_type") or "")
     content_type = str(request.get("content_type") or "")
@@ -3572,8 +3579,11 @@ def _request_telegram_downloads(request: dict[str, object],
             filename, str(item.get("title") or ""), str(item.get("caption") or ""),
         )))
         haystack_set = set(haystack)
-        overlap = sum(1 for token in required_tokens if token in haystack_set)
-        if overlap / len(required_tokens) < (0.75 if len(required_tokens) > 1 else 1.0):
+        if not any(
+            sum(1 for token in tokens if token in haystack_set) / len(tokens)
+            >= (0.75 if len(tokens) > 1 else 1.0)
+            for tokens in token_sets
+        ):
             continue
 
         item_season = int(item["season_number"]) if item.get("season_number") is not None else None
@@ -3607,7 +3617,42 @@ def _request_telegram_downloads(request: dict[str, object],
             "season_number": item_season,
             "episode_number": item_episode,
         })
+    matches.sort(key=lambda match: (match["season_number"] or 0, match["episode_number"] or 0,
+                                    match["message_id"]))
     return matches
+
+
+ORIGINAL_TITLE_LOOKUP_FAILED: set[str] = set()
+
+
+def _backfill_request_original_titles() -> None:
+    """Older TMDb requests lack the original title, so Telegram files named in English never match."""
+    if not TMDB_CONFIGURED:
+        return
+    with closing(database()) as connection:
+        rows = connection.execute(
+            """SELECT id, content_type, tmdb_id, details_json FROM content_requests
+               WHERE source='tmdb' AND tmdb_id IS NOT NULL AND status IN ('pending','sending','approved')"""
+        ).fetchall()
+        for row in rows:
+            try:
+                details = json.loads(row["details_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if "original_title" in details or row["id"] in ORIGINAL_TITLE_LOOKUP_FAILED:
+                continue
+            try:
+                candidate = get_candidate_details(
+                    row["content_type"], int(row["tmdb_id"]),
+                    TMDB_ACCESS_TOKEN, TMDB_LANGUAGE, TMDB_KEY,
+                )
+            except Exception:  # noqa: BLE001 - retry after the next restart
+                ORIGINAL_TITLE_LOOKUP_FAILED.add(row["id"])
+                continue
+            details["original_title"] = candidate.get("original_title", "")
+            connection.execute("UPDATE content_requests SET details_json=? WHERE id=?",
+                               (json.dumps(details, ensure_ascii=False), row["id"]))
+        connection.commit()
 
 
 def _requested_telegram_message_ids(media: list[dict[str, object]]) -> set[int]:
@@ -3636,7 +3681,7 @@ def _manual_telegram_downloads(media: list[dict[str, object]]) -> list[dict[str,
     requested_ids = _requested_telegram_message_ids(media)
     # The scanner returns newest first; each video gets its own row.
     standalone = [item for item in media
-                  if int(item.get("message_id") or 0) not in requested_ids][:30]
+                  if int(item.get("message_id") or 0) not in requested_ids][:90]
     downloads: list[dict[str, object]] = []
     for item in standalone:
         filename = str(item.get("filename") or item.get("title") or "Telegram media")
@@ -3747,6 +3792,7 @@ def _manual_telegram_downloads(media: list[dict[str, object]]) -> list[dict[str,
 
 @app.get("/api/v1/admin/content-requests", dependencies=[Depends(require_admin)])
 def list_content_requests() -> list[dict[str, object]]:
+    _backfill_request_original_titles()
     with closing(database()) as connection:
         rows = connection.execute(
             """SELECT * FROM content_requests
