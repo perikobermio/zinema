@@ -3681,7 +3681,7 @@ def _manual_telegram_downloads(media: list[dict[str, object]]) -> list[dict[str,
     requested_ids = _requested_telegram_message_ids(media)
     # The scanner returns newest first; each video gets its own row.
     standalone = [item for item in media
-                  if int(item.get("message_id") or 0) not in requested_ids][:90]
+                  if int(item.get("message_id") or 0) not in requested_ids][:150]
     downloads: list[dict[str, object]] = []
     for item in standalone:
         filename = str(item.get("filename") or item.get("title") or "Telegram media")
