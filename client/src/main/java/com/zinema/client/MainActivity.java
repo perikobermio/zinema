@@ -935,20 +935,21 @@ public class MainActivity extends Activity {
         });
     }
 
+    static final int TV_DIM_WINDOW = 9;
+
     void setTvFocusSiblingsDimmed(View focusedView, boolean focused) {
-        if (!focused) {
-            restoreTvFocusSiblingAlphas();
-            return;
-        }
         restoreTvFocusSiblingAlphas();
-        if (!(focusedView.getParent() instanceof ViewGroup)) return;
+        if (!focused || !(focusedView.getParent() instanceof ViewGroup)) return;
         ViewGroup siblings = (ViewGroup) focusedView.getParent();
-        for (int i = 0; i < siblings.getChildCount(); i++) {
+        // Las filas de Inicio pueden tener cientos de tarjetas: solo se atenúan las cercanas (las visibles).
+        int focusedIndex = siblings.indexOfChild(focusedView);
+        int from = Math.max(0, focusedIndex - TV_DIM_WINDOW);
+        int to = Math.min(siblings.getChildCount() - 1, focusedIndex + TV_DIM_WINDOW);
+        for (int i = from; i <= to; i++) {
             View sibling = siblings.getChildAt(i);
             if (sibling == focusedView) continue;
             float alpha = sibling.getAlpha();
             tvFocusOriginalAlphas.put(sibling, alpha);
-            sibling.animate().cancel();
             sibling.setAlpha(alpha * 0.58f);
         }
     }
@@ -957,7 +958,6 @@ public class MainActivity extends Activity {
         for (Map.Entry<View, Float> entry : tvFocusOriginalAlphas.entrySet()) {
             View sibling = entry.getKey();
             if (sibling == null) continue;
-            sibling.animate().cancel();
             sibling.setAlpha(entry.getValue());
         }
         tvFocusOriginalAlphas.clear();
@@ -4126,7 +4126,10 @@ public class MainActivity extends Activity {
     }
 
     View posterCard(JSONObject node, boolean lazyPosters, boolean showSeriesFlag) {
-        LinearLayout card = new LinearLayout(this);
+        // Sin renderizado superpuesto: el alpha del atenuado TV no crea una capa offscreen por tarjeta.
+        LinearLayout card = new LinearLayout(this) {
+            @Override public boolean hasOverlappingRendering() { return false; }
+        };
         card.setOrientation(LinearLayout.VERTICAL);
         boolean placeholder = node.optBoolean("is_placeholder");
         card.setFocusable(!placeholder);
