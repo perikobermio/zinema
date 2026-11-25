@@ -39,6 +39,7 @@ import android.util.Base64;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.graphics.Rect;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
@@ -168,6 +169,7 @@ public class MainActivity extends Activity {
     static final long CATALOG_CACHE_TTL_MS = 30000L;
     static final long IMAGE_DISK_CACHE_MAX_BYTES = 160L * 1024L * 1024L;
     final ExecutorService io = Executors.newFixedThreadPool(4);
+    final ExecutorService startupStatusIo = Executors.newFixedThreadPool(2);
     // Imágenes en su propio pool (LIFO: lo último que se pide es lo que está en pantalla) para que
     // decenas de carátulas no bloqueen las llamadas a la API ni el botón Atrás.
     final ExecutorService imageIo = newImageExecutor();
@@ -176,23 +178,21 @@ public class MainActivity extends Activity {
     boolean deferredScanListenerInstalled;
     final Handler adminSyncHandler = new Handler(Looper.getMainLooper());
     final Handler nasDownloadHandler = new Handler(Looper.getMainLooper());
-    final Handler downloadProgressHandler = new Handler(Looper.getMainLooper());
     final Handler contentRequestSearchHandler = new Handler(Looper.getMainLooper());
     final Handler incomingDownloadStatusHandler = new Handler(Looper.getMainLooper());
-    final Handler playbackCapacityHandler = new Handler(Looper.getMainLooper());
     Runnable contentRequestSearchTask;
     Runnable adminSyncPollTask;
     Runnable incomingCatalogSyncPollTask;
     Runnable nasDownloadPollTask;
     Runnable serverUpdatePollTask;
-    Runnable catalogDownloadStatusTask;
     Runnable incomingDownloadStatusTask;
-    Runnable playbackCapacityTask;
-    boolean catalogDownloadStatusRequestRunning;
     boolean catalogDownloadStatusLoaded;
     boolean incomingDownloadStatusRequestRunning;
-    boolean playbackCapacityRequestRunning;
     boolean playbackCapacityLoaded;
+    boolean startupDownloadStatusRequestStarted;
+    boolean playbackCapacityRequestStarted;
+    boolean playbackControlStateKnown;
+    boolean playbackControlsWereEnabled = true;
     JSONObject playbackCapacity = new JSONObject();
     String incomingStatusRefreshedDownloadId = "";
     JSONObject catalogDownloadStatus = new JSONObject();
@@ -215,12 +215,21 @@ public class MainActivity extends Activity {
     final Set<ImageView> lazyImageScrollWatchers = Collections.newSetFromMap(new WeakHashMap<>());
     final Map<String, List<JSONObject>> catalogCache = new HashMap<>();
     final Map<String, Long> catalogCacheUpdatedAt = new HashMap<>();
+    final Map<String, JSONObject> catalogNodeCache = Collections.synchronizedMap(new HashMap<>());
+    final Map<String, List<JSONObject>> searchResultCache = Collections.synchronizedMap(new HashMap<>());
     final Map<String, RecommendationRowState> recommendationRows = new HashMap<>();
     SharedPreferences prefs;
     FrameLayout frame;
+    FrameLayout homeLoadingOverlay;
     LinearLayout page;
     LinearLayout content;
     ScrollView contentScroller;
+    ScrollView homeContentScrollerCache;
+    LinearLayout homeContentViewCache;
+    String homeViewCacheProfileId = "";
+    String homeViewCacheLanguage = "";
+    boolean homeRestoreRequested;
+    boolean homeViewRestoredInShell;
     LinearLayout playbackCapacityBanner;
     TextView backButton;
     View brandButton;
@@ -273,7 +282,6 @@ public class MainActivity extends Activity {
     List<JSONObject> startupHomeCatalog = new ArrayList<>();
     List<JSONObject> homeCatalog = new ArrayList<>();
     List<JSONObject> mostViewedCatalog = new ArrayList<>();
-    JSONObject startupDownloadStatus;
     JSONArray startupRemoteProfiles;
     String startupPrefetchError;
     volatile JSONArray incomingFilesCache;
@@ -298,6 +306,9 @@ public class MainActivity extends Activity {
     int lastPromptedUpdateCode;
     List<JSONObject> movies = new ArrayList<>();
     List<JSONObject> series = new ArrayList<>();
+    boolean catalogSnapshotLoaded;
+    int homeGenreBuildToken;
+    long lastUserInteractionMs;
     final Map<String, String> posterByStream = new HashMap<>();
     final Map<String, Set<String>> selectedGenresByLibrary = new HashMap<>();
     final Set<String> kidAllowedSeasonIds = new HashSet<>();
@@ -428,6 +439,9 @@ public class MainActivity extends Activity {
         clearCatalogCache();
         movies.clear();
         series.clear();
+        homeCatalog.clear();
+        mostViewedCatalog.clear();
+        catalogSnapshotLoaded = false;
         startupPrefetchStarted = false;
         startupPrefetchPending = false;
         startupPrefetchReady = false;
@@ -457,6 +471,11 @@ public class MainActivity extends Activity {
         return super.onKeyDown(keyCode, event);
     }
 
+    @Override public void onUserInteraction() {
+        super.onUserInteraction();
+        lastUserInteractionMs = System.currentTimeMillis();
+    }
+
     @Override public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) hideSystemBars();
@@ -464,6 +483,7 @@ public class MainActivity extends Activity {
 
     void showIntro() {
         introShowing = true;
+        fetchStartupDownloadStatus();
         // En TV el WebView de la intro cuesta memoria y segundos de arranque: se omite por defecto.
         if (!prefs.getBoolean("intro_enabled", !isTelevision())) {
             finishIntro();
@@ -516,10 +536,7 @@ public class MainActivity extends Activity {
             introWebView = null;
         }
         if (clientApiToken().isEmpty()) showLoginScreen();
-        else {
-            buildShell("Inicio");
-            loadHome();
-        }
+        else loadHome();
     }
 
     void startStartupPrefetch() {
@@ -541,8 +558,6 @@ public class MainActivity extends Activity {
                         () -> getArray("/api/v1/catalog?library=series"));
                 java.util.concurrent.Future<JSONArray> homeFuture = io.submit(
                         () -> getArray("/api/v1/catalog/home"));
-                java.util.concurrent.Future<JSONObject> downloadFuture = io.submit(
-                        () -> getJson("/api/v1/download-status"));
                 java.util.concurrent.Future<JSONArray> profilesFuture = readProfiles().isEmpty()
                         ? io.submit(() -> getAuthorizedProfileArray("/api/v1/profiles")) : null;
                 JSONArray movieRows = movieFuture.get();
@@ -553,8 +568,6 @@ public class MainActivity extends Activity {
                 seriesList = toList(seriesRows);
                 try { homeList = toList(homeFuture.get()); }
                 catch (Exception ignored) { homeList = rootPlayableItems(movieList, seriesList); }
-                try { startupDownloadStatus = downloadFuture.get(); }
-                catch (Exception ignored) { startupDownloadStatus = null; }
                 sortNewestFirst(movieList);
                 sortNewestFirst(seriesList);
             } catch (Exception e) {
@@ -576,7 +589,6 @@ public class MainActivity extends Activity {
         List<JSONObject> movieList;
         List<JSONObject> seriesList;
         List<JSONObject> homeCatalogList;
-        JSONObject downloadStatus;
         JSONArray remoteProfiles;
         String error;
         synchronized (this) {
@@ -589,14 +601,11 @@ public class MainActivity extends Activity {
                 if (startupPrefetchError == null && startupMovies != null && startupSeries != null) {
                     final List<JSONObject> newMovies = startupMovies, newSeries = startupSeries;
                     final List<JSONObject> newHome = startupHomeCatalog;
-                    if (startupDownloadStatus != null) {
-                        catalogDownloadStatus = startupDownloadStatus;
-                        catalogDownloadStatusLoaded = true;
-                    }
                     movies = newMovies;
                     series = newSeries;
                     homeCatalog = newHome == null ? rootPlayableItems(movies, series) : newHome;
                     mostViewedCatalog = mostViewedNodes(homeCatalog);
+                    catalogSnapshotLoaded = true;
                     putCatalogList("movies", null, movies);
                     putCatalogList("series", null, series);
                     writeCatalogDisk("home", homeCatalog);
@@ -615,7 +624,6 @@ public class MainActivity extends Activity {
             movieList = startupMovies;
             seriesList = startupSeries;
             homeCatalogList = startupHomeCatalog;
-            downloadStatus = startupDownloadStatus;
             remoteProfiles = startupRemoteProfiles;
             error = startupPrefetchError;
         }
@@ -642,10 +650,7 @@ public class MainActivity extends Activity {
         series = seriesList == null ? new ArrayList<>() : seriesList;
         homeCatalog = homeCatalogList == null ? rootPlayableItems(movies, series) : homeCatalogList;
         mostViewedCatalog = mostViewedNodes(homeCatalog);
-        if (downloadStatus != null) {
-            catalogDownloadStatus = downloadStatus;
-            catalogDownloadStatusLoaded = true;
-        }
+        catalogSnapshotLoaded = error == null;
         if (remoteProfiles != null) mergeRemoteProfiles(remoteProfiles);
         putCatalogList("movies", null, movies);
         putCatalogList("series", null, series);
@@ -683,6 +688,15 @@ public class MainActivity extends Activity {
     }
 
     void buildShell(String title) {
+        hideHomeLoadingOverlay();
+        homeGenreBuildToken++;
+        homeViewRestoredInShell = false;
+        boolean restoreHomeView = homeRestoreRequested && homeContentScrollerCache != null
+                && homeContentViewCache != null
+                && activeProfileId().equals(homeViewCacheProfileId)
+                && prefs.getString("language", "es").equals(homeViewCacheLanguage);
+        homeRestoreRequested = false;
+        homeViewRestoredInShell = restoreHomeView;
         frame = new FrameLayout(this);
         boolean kidTheme = isActiveKidProfile() && !showingAdmin;
         GradientDrawable appBackground = new GradientDrawable(
@@ -787,29 +801,35 @@ public class MainActivity extends Activity {
         playbackCapacityBanner.setVisibility(View.GONE);
         page.addView(playbackCapacityBanner, new LinearLayout.LayoutParams(-1, -2));
 
-        contentScroller = new ScrollView(this);
-        contentScroller.setFillViewport(true);
-        contentScroller.setVerticalScrollBarEnabled(false);
-        GradientDrawable sectionBackground = new GradientDrawable(
-                GradientDrawable.Orientation.LEFT_RIGHT,
-                kidTheme
-                        ? new int[]{0xD91B4670, 0xD943347A, 0xD92D6874}
-                        : new int[]{0xFF19243A, 0xFF131925, 0xFF211923});
-        contentScroller.setBackground(sectionBackground);
-        contentScroller.setClipChildren(false);
-        contentScroller.setClipToPadding(false);
-        content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-        content.setClipChildren(false);
-        content.setClipToPadding(false);
-        content.setPadding(0, 0, 0, d(28));
-        contentScroller.addView(content);
-        contentScroller.setOnScrollChangeListener((View view, int x, int y, int oldX, int oldY) ->
-                scheduleLazyScan());
+        if (restoreHomeView) {
+            ViewParent oldParent = homeContentScrollerCache.getParent();
+            if (oldParent instanceof ViewGroup) ((ViewGroup) oldParent).removeView(homeContentScrollerCache);
+            contentScroller = homeContentScrollerCache;
+            content = homeContentViewCache;
+        } else {
+            contentScroller = new ScrollView(this);
+            contentScroller.setFillViewport(true);
+            contentScroller.setVerticalScrollBarEnabled(false);
+            GradientDrawable sectionBackground = new GradientDrawable(
+                    GradientDrawable.Orientation.LEFT_RIGHT,
+                    kidTheme
+                            ? new int[]{0xD91B4670, 0xD943347A, 0xD92D6874}
+                            : new int[]{0xFF19243A, 0xFF131925, 0xFF211923});
+            contentScroller.setBackground(sectionBackground);
+            contentScroller.setClipChildren(false);
+            contentScroller.setClipToPadding(false);
+            content = new LinearLayout(this);
+            content.setOrientation(LinearLayout.VERTICAL);
+            content.setClipChildren(false);
+            content.setClipToPadding(false);
+            content.setPadding(0, 0, 0, d(28));
+            contentScroller.addView(content);
+            contentScroller.setOnScrollChangeListener((View view, int x, int y, int oldX, int oldY) ->
+                    scheduleLazyScan());
+        }
         page.addView(contentScroller, new LinearLayout.LayoutParams(-1, 0, 1));
         setContentView(frame);
         refreshPlaybackCapacityUi();
-        startPlaybackCapacityPolling();
         frame.post(() -> {
             loadVisibleLazyRows();
             if (showingAdmin) {
@@ -1005,6 +1025,40 @@ public class MainActivity extends Activity {
         content.addView(box, new LinearLayout.LayoutParams(-1, d(320)));
     }
 
+    void showHomeLoadingOverlay() {
+        hideHomeLoadingOverlay();
+        if (frame == null) return;
+        FrameLayout overlay = new FrameLayout(this);
+        overlay.setClickable(true);
+        overlay.setFocusable(true);
+        FrameLayout area = new FrameLayout(this);
+        area.setBackgroundColor(0xF2090A0D);
+        FrameLayout.LayoutParams areaParams = new FrameLayout.LayoutParams(-1, -1);
+        areaParams.topMargin = d(116);
+        overlay.addView(area, areaParams);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER);
+        ProgressBar progress = new ProgressBar(this);
+        box.addView(progress);
+        TextView text = label(t("Cargando Inicio…"), 15, MUTED, false);
+        text.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(-1, -2);
+        textParams.topMargin = d(16);
+        box.addView(text, textParams);
+        area.addView(box, new FrameLayout.LayoutParams(-1, -1));
+        overlay.setElevation(d(24));
+        frame.addView(overlay, new FrameLayout.LayoutParams(-1, -1));
+        homeLoadingOverlay = overlay;
+    }
+
+    void hideHomeLoadingOverlay() {
+        if (homeLoadingOverlay == null) return;
+        if (homeLoadingOverlay.getParent() instanceof ViewGroup)
+            ((ViewGroup) homeLoadingOverlay.getParent()).removeView(homeLoadingOverlay);
+        homeLoadingOverlay = null;
+    }
+
     boolean canStartPlayback() {
         return !playbackCapacityLoaded || isAccountAdmin()
                 || playbackCapacity.optBoolean("can_play", true);
@@ -1012,7 +1066,10 @@ public class MainActivity extends Activity {
 
     void refreshPlaybackCapacityUi() {
         boolean canPlay = canStartPlayback();
-        setPlaybackControlsEnabled(content, canPlay);
+        if (!canPlay || (playbackControlStateKnown && playbackControlsWereEnabled != canPlay))
+            setPlaybackControlsEnabled(content, canPlay);
+        playbackControlStateKnown = true;
+        playbackControlsWereEnabled = canPlay;
         if (playbackCapacityBanner == null) return;
         playbackCapacityBanner.removeAllViews();
         if (showingAdmin || showingProfiles || !playbackCapacityLoaded || isAccountAdmin()) {
@@ -1060,36 +1117,41 @@ public class MainActivity extends Activity {
         }
     }
 
-    void startPlaybackCapacityPolling() {
-        if (clientApiToken().isEmpty() || showingAdmin || showingProfiles || !activityResumed
-                || playbackCapacityRequestRunning) return;
-        if (playbackCapacityTask != null) playbackCapacityHandler.removeCallbacks(playbackCapacityTask);
-        playbackCapacityRequestRunning = true;
-        io.execute(() -> {
+    void fetchStartupDownloadStatus() {
+        if (startupDownloadStatusRequestStarted || clientApiToken().isEmpty()) return;
+        startupDownloadStatusRequestStarted = true;
+        startupStatusIo.execute(() -> {
             JSONObject result = null;
-            try { result = getJson("/api/v1/playback-capacity"); }
+            try { result = getJson("/api/v1/download-status"); }
             catch (Exception ignored) { }
             JSONObject status = result;
-            runOnUiThread(() -> {
-                playbackCapacityRequestRunning = false;
-                if (status != null) {
-                    playbackCapacity = status;
-                    playbackCapacityLoaded = true;
-                    refreshPlaybackCapacityUi();
-                }
-                if (activityResumed && !showingAdmin && !showingProfiles) {
-                    playbackCapacityTask = this::startPlaybackCapacityPolling;
-                    playbackCapacityHandler.postDelayed(playbackCapacityTask, 5 * 60 * 1000L);
-                }
+            if (status != null) runOnUiThread(() -> {
+                boolean previousActive = "starting".equals(catalogDownloadStatus.optString("status"))
+                        || "running".equals(catalogDownloadStatus.optString("status"));
+                catalogDownloadStatus = status;
+                catalogDownloadStatusLoaded = true;
+                boolean currentActive = "starting".equals(status.optString("status"))
+                        || "running".equals(status.optString("status"));
+                if (!introShowing && isCatalogDownloadScreenVisible()
+                        && (previousActive || currentActive)) refreshVisibleDownloadPosters(content);
             });
         });
     }
 
-    void stopPlaybackCapacityPolling() {
-        if (playbackCapacityTask != null) {
-            playbackCapacityHandler.removeCallbacks(playbackCapacityTask);
-            playbackCapacityTask = null;
-        }
+    void fetchPlaybackCapacityAfterHome() {
+        if (playbackCapacityRequestStarted || clientApiToken().isEmpty()) return;
+        playbackCapacityRequestStarted = true;
+        startupStatusIo.execute(() -> {
+            JSONObject result = null;
+            try { result = getJson("/api/v1/playback-capacity"); }
+            catch (Exception ignored) { }
+            JSONObject status = result;
+            if (status != null) runOnUiThread(() -> {
+                playbackCapacity = status;
+                playbackCapacityLoaded = true;
+                if (page != null && !showingAdmin && !showingProfiles) refreshPlaybackCapacityUi();
+            });
+        });
     }
 
     JSONObject getJson(String path) throws Exception {
@@ -1282,12 +1344,32 @@ public class MainActivity extends Activity {
         selectedSection = "home";
         breadcrumbs.clear();
         breadcrumbScrollPositions.clear();
+        homeRestoreRequested = true;
         buildShell("Inicio");
+        if (homeViewRestoredInShell) {
+            fetchPlaybackCapacityAfterHome();
+            return;
+        }
+        showHomeLoadingOverlay();
+        LinearLayout loadingContent = content;
+        loadingContent.postDelayed(() -> {
+            if (loadingContent == content && "home".equals(selectedSection)
+                    && !showingAdmin && !showingProfiles) loadHomeContent();
+        }, 40L);
+    }
+
+    void loadHomeContent() {
         List<JSONObject> cachedMovies = getCachedCatalogList("movies", null);
         List<JSONObject> cachedSeries = getCachedCatalogList("series", null);
+        boolean missingCachedList = cachedMovies == null || cachedSeries == null;
+        if (missingCachedList && catalogSnapshotLoaded) {
+            if (cachedMovies == null) cachedMovies = new ArrayList<>(movies);
+            if (cachedSeries == null) cachedSeries = new ArrayList<>(series);
+        }
         if (cachedMovies != null && cachedSeries != null) {
             movies = cachedMovies;
             series = cachedSeries;
+            catalogSnapshotLoaded = true;
             if (catalogServedFromDisk) {
                 catalogServedFromDisk = false;
                 List<JSONObject> diskHome = readCatalogDisk("home");
@@ -1302,6 +1384,9 @@ public class MainActivity extends Activity {
                 return;
             }
             renderHome();
+            // Show the in-memory snapshot immediately if a version check cleared a list cache.
+            // Refresh all home data in the background so the other rows catch up without a loader.
+            if (missingCachedList) fetchHomeFromServer();
             return;
         }
         showLoading("Conectando con tu biblioteca…");
@@ -2495,6 +2580,9 @@ public class MainActivity extends Activity {
         clearCatalogCache();
         movies.clear();
         series.clear();
+        homeCatalog.clear();
+        mostViewedCatalog.clear();
+        catalogSnapshotLoaded = false;
         catalogVersion = "";
         showingDetail = false;
         showingProfiles = false;
@@ -2890,6 +2978,7 @@ public class MainActivity extends Activity {
     }
 
     void fetchHomeFromServer() {
+        final boolean hadSnapshot = catalogSnapshotLoaded;
         io.execute(() -> {
             try {
                 java.util.concurrent.Future<JSONArray> movieFuture = io.submit(
@@ -2914,15 +3003,21 @@ public class MainActivity extends Activity {
                     series = seriesList;
                     homeCatalog = resolvedHomeCatalog;
                     mostViewedCatalog = resolvedMostViewed;
+                    catalogSnapshotLoaded = true;
                     putCatalogList("movies", null, movieList);
                     putCatalogList("series", null, seriesList);
                     writeCatalogDisk("home", resolvedHomeCatalog);
                     catalogVersion = "";
                     lastCatalogVersionCheckMs = System.currentTimeMillis();
-                    renderHome();
+                    if (!hadSnapshot && !showingAdmin && !showingDetail && !showingProfiles && !libraryMode
+                            && "home".equals(selectedSection)) renderHome();
                 });
             } catch (Exception e) {
-                runOnUiThread(() -> renderError(e.getMessage()));
+                runOnUiThread(() -> {
+                    if (!catalogSnapshotLoaded && !showingAdmin && !showingDetail
+                            && !showingProfiles && !libraryMode && "home".equals(selectedSection))
+                        renderError(e.getMessage());
+                });
             }
         });
     }
@@ -3077,9 +3172,21 @@ public class MainActivity extends Activity {
     }
 
     void clearCatalogCache() {
+        homeContentScrollerCache = null;
+        homeContentViewCache = null;
         catalogCache.clear();
         catalogCacheUpdatedAt.clear();
+        catalogNodeCache.clear();
+        searchResultCache.clear();
         wipeCatalogDisk();
+    }
+
+    JSONObject getCatalogNode(String nodeId) throws Exception {
+        JSONObject cached = catalogNodeCache.get(nodeId);
+        if (cached != null) return new JSONObject(cached.toString());
+        JSONObject node = getJson("/api/v1/catalog/" + enc(nodeId));
+        catalogNodeCache.put(nodeId, new JSONObject(node.toString()));
+        return node;
     }
 
     String fetchCatalogVersionSafely() {
@@ -3149,65 +3256,8 @@ public class MainActivity extends Activity {
                 || "series".equals(selectedSection))));
     }
 
-    void startCatalogDownloadStatusPolling() {
-        if (!isCatalogDownloadScreenVisible() || catalogDownloadStatusTask != null
-                || catalogDownloadStatusRequestRunning) return;
-        if (catalogDownloadStatusLoaded) {
-            refreshVisibleDownloadPosters(content);
-            boolean active = "starting".equals(catalogDownloadStatus.optString("status"))
-                    || "running".equals(catalogDownloadStatus.optString("status"));
-            if (active) scheduleCatalogDownloadStatusPolling(2000L);
-            return;
-        }
-        requestCatalogDownloadStatus();
-    }
-
     void invalidateCatalogDownloadStatus() {
-        catalogDownloadStatusLoaded = false;
-        stopCatalogDownloadStatusPolling();
-    }
-
-    void requestCatalogDownloadStatus() {
-        if (!isCatalogDownloadScreenVisible() || catalogDownloadStatusRequestRunning) return;
-        catalogDownloadStatusRequestRunning = true;
-        io.execute(() -> {
-            JSONObject state = null;
-            try {
-                state = getJson("/api/v1/download-status");
-            } catch (Exception ignored) { }
-            JSONObject result = state;
-            runOnUiThread(() -> {
-                catalogDownloadStatusRequestRunning = false;
-                if (!isCatalogDownloadScreenVisible()) return;
-                if (result != null) {
-                    catalogDownloadStatus = result;
-                    catalogDownloadStatusLoaded = true;
-                    refreshVisibleDownloadPosters(content);
-                }
-                boolean active = result != null && ("starting".equals(result.optString("status"))
-                        || "running".equals(result.optString("status")));
-                if (active) scheduleCatalogDownloadStatusPolling(2000L);
-                else stopCatalogDownloadStatusPolling();
-            });
-        });
-    }
-
-    void stopCatalogDownloadStatusPolling() {
-        if (catalogDownloadStatusTask != null) {
-            downloadProgressHandler.removeCallbacks(catalogDownloadStatusTask);
-            catalogDownloadStatusTask = null;
-        }
-    }
-
-    void scheduleCatalogDownloadStatusPolling(long delayMs) {
-        if (!isCatalogDownloadScreenVisible()) return;
-        if (catalogDownloadStatusTask != null)
-            downloadProgressHandler.removeCallbacks(catalogDownloadStatusTask);
-        catalogDownloadStatusTask = () -> {
-            catalogDownloadStatusTask = null;
-            requestCatalogDownloadStatus();
-        };
-        downloadProgressHandler.postDelayed(catalogDownloadStatusTask, delayMs);
+        // Status snapshots are intentionally fetched once during startup only.
     }
 
     String collectionSubtitle(List<JSONObject> items) {
@@ -3224,6 +3274,8 @@ public class MainActivity extends Activity {
     }
 
     void renderHome() {
+        homeContentScrollerCache = null;
+        homeContentViewCache = null;
         refreshProfileChip();
         content.removeAllViews();
         List<JSONObject> resume = readContinueWatching();
@@ -3301,25 +3353,12 @@ public class MainActivity extends Activity {
         Collections.sort(viewedItems, (left, right) -> Integer.compare(
                 right.optInt("view_count"), left.optInt("view_count")));
         if (!viewedItems.isEmpty()) addRow(t("Más vistos"), viewedItems.subList(0,
-                Math.min(15, viewedItems.size())), true);
+                Math.min(10, viewedItems.size())), true);
         if (newestItems.size() > 15) newestItems = new ArrayList<>(newestItems.subList(0, 15));
         addRow("Lo más nuevo", newestItems);
         sortPendingHomeItems(pendingItems);
         addRow("Pendientes de añadir", pendingItems);
-        for (String genre : homeGenres(catalogItems)) {
-            List<JSONObject> genreItems = new ArrayList<>();
-            for (JSONObject node : catalogItems) {
-                JSONArray genres = node.optJSONArray("genres");
-                if (genres == null) continue;
-                for (int i = 0; i < genres.length(); i++) {
-                    if (normalizeGenre(genre).equals(normalizeGenre(genres.optString(i, "")))) {
-                        genreItems.add(node);
-                        break;
-                    }
-                }
-            }
-            addGenreRow(genre, genreItems);
-        }
+        appendHomeGenreRows(homeGenres(catalogItems), catalogItems);
         refreshPlaybackCapacityUi();
         if (visibleMovies.isEmpty() && visibleSeries.isEmpty()) {
             TextView empty = label("Tu biblioteca está vacía. Sincroniza el catálogo en el servidor.", 16, MUTED, false);
@@ -3328,7 +3367,61 @@ public class MainActivity extends Activity {
         }
         restoreListingScrollIfPending();
         restorePendingFocus();
-        startCatalogDownloadStatusPolling();
+        fetchPlaybackCapacityAfterHome();
+    }
+
+    void appendHomeGenreRows(List<String> genres, List<JSONObject> catalogItems) {
+        if (genres == null || genres.isEmpty()) {
+            rememberHomeView();
+            hideHomeLoadingOverlay();
+            return;
+        }
+        final int token = ++homeGenreBuildToken;
+        final LinearLayout target = content;
+        target.post(new Runnable() {
+            int nextGenre;
+
+            @Override public void run() {
+                if (token != homeGenreBuildToken || target != content || isFinishing()
+                        || showingDetail || showingAdmin || showingProfiles || libraryMode
+                        || !"home".equals(selectedSection)) {
+                    if (token == homeGenreBuildToken) hideHomeLoadingOverlay();
+                    return;
+                }
+                long quietForMs = System.currentTimeMillis() - lastUserInteractionMs;
+                if (homeLoadingOverlay == null && lastUserInteractionMs > 0 && quietForMs < 300L) {
+                    target.postDelayed(this, 300L - quietForMs);
+                    return;
+                }
+                String genre = genres.get(nextGenre++);
+                List<JSONObject> genreItems = new ArrayList<>();
+                for (JSONObject node : catalogItems) {
+                    JSONArray nodeGenres = node.optJSONArray("genres");
+                    if (nodeGenres == null) continue;
+                    for (int i = 0; i < nodeGenres.length(); i++) {
+                        if (normalizeGenre(genre).equals(normalizeGenre(nodeGenres.optString(i, "")))) {
+                            genreItems.add(node);
+                            break;
+                        }
+                    }
+                }
+                addGenreRow(genre, genreItems);
+                if (nextGenre < genres.size()) {
+                    target.postDelayed(this, homeLoadingOverlay != null ? 16L : 40L);
+                } else {
+                    rememberHomeView();
+                    hideHomeLoadingOverlay();
+                }
+            }
+        });
+    }
+
+    void rememberHomeView() {
+        if (contentScroller == null || content == null || !"home".equals(selectedSection)) return;
+        homeContentScrollerCache = contentScroller;
+        homeContentViewCache = content;
+        homeViewCacheProfileId = activeProfileId();
+        homeViewCacheLanguage = prefs.getString("language", "es");
     }
 
     void collectPendingHomeItems(JSONObject node, String parentSeriesTitle,
@@ -4797,7 +4890,8 @@ public class MainActivity extends Activity {
         if (!horizontal.getGlobalVisibleRect(visible) || horizontal.getChildCount() == 0) return;
         ViewGroup cards = (ViewGroup) horizontal.getChildAt(0);
         int cardStep = cards.getChildCount() == 0 ? d(154) : cards.getChildAt(0).getWidth() + d(10);
-        int end = horizontal.getScrollX() + horizontal.getWidth() + cardStep * 3;
+        // Keep the image queue close to the viewport so scrolling stays responsive on TV.
+        int end = horizontal.getScrollX() + horizontal.getWidth() + cardStep;
         for (int i = 0; i < cards.getChildCount(); i++) {
             View card = cards.getChildAt(i);
             if (card.getRight() >= horizontal.getScrollX() && card.getLeft() <= end) {
@@ -4901,9 +4995,7 @@ public class MainActivity extends Activity {
         }
         restoreListingScrollIfPending();
         restorePendingFocus();
-        refreshVisibleDownloadPosters(content);
         refreshPlaybackCapacityUi();
-        startCatalogDownloadStatusPolling();
     }
 
     void toggleAlphabet() {
@@ -5194,7 +5286,7 @@ public class MainActivity extends Activity {
             if (backButton != null) backButton.setVisibility(View.VISIBLE);
             io.execute(() -> {
                 try {
-                    JSONObject full = getJson("/api/v1/catalog/" + enc(node.optString("id")));
+                    JSONObject full = getCatalogNode(node.optString("id"));
                     runOnUiThread(() -> renderDetail(full));
                 } catch (Exception e) { runOnUiThread(() -> renderError(e.getMessage())); }
             });
@@ -6392,7 +6484,7 @@ public class MainActivity extends Activity {
         if ("detail".equals(returnScreen) && !returnDetailId.isEmpty()) {
             io.execute(() -> {
                 try {
-                    JSONObject node = getJson("/api/v1/catalog/" + enc(returnDetailId));
+                    JSONObject node = getCatalogNode(returnDetailId);
                     runOnUiThread(() -> {
                         renderDetail(node);
                         if (contentScroller != null) contentScroller.post(
@@ -6408,7 +6500,7 @@ public class MainActivity extends Activity {
         if ("seasons".equals(returnScreen) && !returnDetailId.isEmpty()) {
             io.execute(() -> {
                 try {
-                    JSONObject series = getJson("/api/v1/catalog/" + enc(returnDetailId));
+                    JSONObject series = getCatalogNode(returnDetailId);
                     runOnUiThread(() -> {
                         showingSeasons = true;
                         seasonsSeriesId = returnDetailId;
@@ -6789,7 +6881,7 @@ public class MainActivity extends Activity {
         showLoading(t("Cargando temporada…"));
         io.execute(() -> {
             try {
-                JSONObject fullSeason = getJson("/api/v1/catalog/" + enc(id));
+                JSONObject fullSeason = getCatalogNode(id);
                 runOnUiThread(() -> renderDetail(fullSeason));
             } catch (Exception e) { runOnUiThread(() -> renderError(e.getMessage())); }
         });
@@ -6809,7 +6901,7 @@ public class MainActivity extends Activity {
         if ("detail".equals(screen) && !detailId.isEmpty()) {
             io.execute(() -> {
                 try {
-                    JSONObject node = getJson("/api/v1/catalog/" + enc(detailId));
+                    JSONObject node = getCatalogNode(detailId);
                     runOnUiThread(() -> renderDetail(node));
                 } catch (Exception e) { runOnUiThread(this::loadHome); }
             });
@@ -7517,6 +7609,7 @@ public class MainActivity extends Activity {
             case "No hay títulos que coincidan con los géneros seleccionados.":
                 return "Ez dago hautatutako generoekin bat datorren izenbururik.";
             case "Cargando catálogo…": return "Katalogoa kargatzen…";
+            case "Cargando Inicio…": return "Hasiera kargatzen…";
             case "Cargando perfiles…": return "Profilak kargatzen…";
             case "Sincronizando perfiles…": return "Profilak sinkronizatzen…";
             case "Cargando ficha…": return "Fitxa kargatzen…";
@@ -8479,22 +8572,34 @@ public class MainActivity extends Activity {
         if (query.trim().isEmpty()) return;
         lastSearchQuery = query;
         ((InputMethodManager) getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(content.getWindowToken(), 0);
+        List<JSONObject> cached = searchResultCache.get(query.trim().toLowerCase(java.util.Locale.ROOT));
+        if (cached != null) {
+            renderSearchResults(query, cached);
+            return;
+        }
         showLoading("Buscando…");
         io.execute(() -> {
             try {
                 JSONArray results = getArray("/api/v1/search?q=" + enc(query.trim()) + "&limit=100");
+                List<JSONObject> resultRows = toList(results);
+                searchResultCache.put(query.trim().toLowerCase(java.util.Locale.ROOT),
+                        new ArrayList<>(resultRows));
                 runOnUiThread(() -> {
-                    List<JSONObject> visibleResults = filterKidCatalog(toList(results));
-                    content.removeAllViews();
-                    addSectionHeader("Resultados", visibleResults.size() + " encontrados");
-                    for (JSONObject result : visibleResults) addSearchResult(result);
-                    if (visibleResults.isEmpty()) addEmpty(isActiveKidProfile()
-                            ? t("No hay contenido infantil para esta búsqueda.")
-                            : "No encontramos resultados para “" + query + "”.");
-                    restoreListingScrollIfPending();
+                    renderSearchResults(query, resultRows);
                 });
             } catch (Exception e) { runOnUiThread(() -> renderError(e.getMessage())); }
         });
+    }
+
+    void renderSearchResults(String query, List<JSONObject> results) {
+        List<JSONObject> visibleResults = filterKidCatalog(results);
+        content.removeAllViews();
+        addSectionHeader("Resultados", visibleResults.size() + " encontrados");
+        for (JSONObject result : visibleResults) addSearchResult(result);
+        if (visibleResults.isEmpty()) addEmpty(isActiveKidProfile()
+                ? t("No hay contenido infantil para esta búsqueda.")
+                : "No encontramos resultados para “" + query + "”.");
+        restoreListingScrollIfPending();
     }
 
     void addSearchResult(JSONObject result) {
@@ -8904,6 +9009,8 @@ public class MainActivity extends Activity {
                     movies = updatedMovies;
                     series = updatedSeries;
                     homeCatalog = homeSnapshot;
+                    mostViewedCatalog = mostViewedNodes(homeSnapshot);
+                    catalogSnapshotLoaded = true;
                     putCatalogList("movies", null, movies);
                     putCatalogList("series", null, series);
                     writeCatalogDisk("home", homeSnapshot);
@@ -8979,7 +9086,6 @@ public class MainActivity extends Activity {
             return;
         }
         leaveStartupHomeWait();
-        stopPlaybackCapacityPolling();
         stopIncomingDownloadStatusPolling();
         if (!showingAdmin) adminReturnDetailId = showingDetail ? detailNodeId : "";
         showingAdmin = true;
@@ -9000,7 +9106,6 @@ public class MainActivity extends Activity {
             return;
         }
         leaveStartupHomeWait();
-        stopPlaybackCapacityPolling();
         if (!showingAdmin) adminReturnDetailId = showingDetail ? detailNodeId : "";
         showingAdmin = true;
         showingDownloadManagement = true;
@@ -9011,7 +9116,6 @@ public class MainActivity extends Activity {
 
     void showLoginScreen() {
         leaveStartupHomeWait();
-        stopPlaybackCapacityPolling();
         showingAdmin = false;
         showingDownloadManagement = false;
         showingProfiles = false;
@@ -11130,6 +11234,7 @@ public class MainActivity extends Activity {
     }
 
     void renderError(String error) {
+        hideHomeLoadingOverlay();
         content.removeAllViews();
         TextView title = label("No se pudo conectar", 23, Color.WHITE, true);
         title.setPadding(d(22), d(48), d(22), d(8));
@@ -11617,7 +11722,6 @@ public class MainActivity extends Activity {
                     if (error.contains("HTTP 409")) {
                         Toast.makeText(this, t("Todas las plazas están ocupadas. Espera a que se libere una."),
                                 Toast.LENGTH_LONG).show();
-                        startPlaybackCapacityPolling();
                     } else Toast.makeText(this,
                             t("No se pudo preparar el vídeo: ") + error, Toast.LENGTH_LONG).show();
                 });
@@ -11718,9 +11822,6 @@ public class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         activityResumed = true;
-        boolean returnedFromPlayer = false;
-        boolean playerReturnRefreshed = false;
-        startPlaybackCapacityPolling();
         checkForClientUpdate(false);
         if (installAfterPermission && Build.VERSION.SDK_INT >= 26 && getPackageManager().canRequestPackageInstalls()) {
             installAfterPermission = false;
@@ -11728,11 +11829,12 @@ public class MainActivity extends Activity {
             if (apk.isFile()) startApkInstall(apk);
         }
         if (hasResumedOnce) {
-            returnedFromPlayer = playerLaunched;
+            boolean returnedFromPlayer = playerLaunched;
             playerLaunched = false;
             if (returnedFromPlayer) ignoreBackUntilMs = System.currentTimeMillis() + 600L;
-            playerReturnRefreshed = processPlayerReturn();
-            if (returnedFromPlayer && showingDetail && !playerReturnRefreshed) refreshCurrentScreen();
+            // MainActivity remains alive underneath VLC. Keep its existing views on a normal
+            // Back return; processPlayerReturn refreshes only when playback completed.
+            processPlayerReturn();
             String activeId = activeProfileId();
             if (!activeId.isEmpty() && prefs.getBoolean(profileStateDirtyKey(activeId), false)) {
                 scheduleProfileStateSync();
@@ -11742,30 +11844,16 @@ public class MainActivity extends Activity {
                     synchronizeProfilesFromServer(false);
             }
         } else hasResumedOnce = true;
-        if (prefs != null && page != null && "home".equals(selectedSection)
-                && !showingDetail && !showingAdmin && content != null
-                && movies.size() + series.size() > 0
-                && returnedFromPlayer
-                && !playerReturnRefreshed) {
-            int scrollY = contentScroller == null ? 0 : contentScroller.getScrollY();
-            renderHome();
-            if (contentScroller != null) contentScroller.post(() -> contentScroller.scrollTo(0, scrollY));
-        } else if (prefs != null && libraryMode && !showingDetail && !showingAdmin && !metadataEditorMode) {
+        if (prefs != null && libraryMode && !showingDetail && !showingAdmin && !metadataEditorMode) {
             if (breadcrumbs.isEmpty()) maybeRefreshCatalogListing(currentLibrary, null);
             else maybeRefreshCatalogListing(currentLibrary,
                     breadcrumbs.get(breadcrumbs.size() - 1).optString("id"));
         }
-        startCatalogDownloadStatusPolling();
         if (isDownloadManagementVisible()) pollIncomingDownloadStatus();
     }
 
     @Override protected void onPause() {
         activityResumed = false;
-        stopPlaybackCapacityPolling();
-        if (catalogDownloadStatusTask != null) {
-            downloadProgressHandler.removeCallbacks(catalogDownloadStatusTask);
-            catalogDownloadStatusTask = null;
-        }
         stopIncomingDownloadStatusPolling();
         super.onPause();
     }
@@ -11868,7 +11956,7 @@ public class MainActivity extends Activity {
                 buildShell("Inicio");
                 io.execute(() -> {
                     try {
-                        JSONObject node = getJson("/api/v1/catalog/" + enc(returnDetailId));
+                        JSONObject node = getCatalogNode(returnDetailId);
                         runOnUiThread(() -> renderDetail(node));
                     } catch (Exception e) { runOnUiThread(this::loadHome); }
                 });
@@ -11903,7 +11991,7 @@ public class MainActivity extends Activity {
             showLoading(t("Cargando temporadas…"));
             io.execute(() -> {
                 try {
-                    JSONObject series = getJson("/api/v1/catalog/" + enc(parentId));
+                    JSONObject series = getCatalogNode(parentId);
                     runOnUiThread(() -> {
                         if (showingSeasons && parentId.equals(seasonsSeriesId)) renderSeasonsWindow(series);
                     });
